@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PersonalityRAG</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div id="login" class="login-overlay">
+    <form id="login-form" class="login-card">
+      <div class="brand-mark">P</div>
+      <h1>PersonalityRAG</h1>
+      <p data-i18n="loginHint">输入 launcher 输出或 config/config.json 中的 API 密钥。</p>
+      <input id="api-key" type="password" autocomplete="current-password" placeholder="prag_...">
+      <button class="primary" type="submit" data-i18n="login">登录</button>
+      <div id="login-error" class="error"></div>
+    </form>
+  </div>
+
+  <div id="app" class="app hidden">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">P</div>
+        <div><strong>PersonalityRAG</strong><small>v0.1.0</small></div>
+      </div>
+      <button id="sidebar-current-library" class="sidebar-library hidden" type="button">
+        <span data-i18n="currentLibrary">当前记忆库</span>
+        <strong id="sidebar-library-name">—</strong>
+        <small id="sidebar-library-id">—</small>
+        <em id="sidebar-library-provider">—</em>
+      </button>
+      <nav>
+        <button class="nav active" data-page="libraries"><span>◫</span><b data-i18n="libraries">记忆库</b></button>
+        <button class="nav" data-page="providers"><span>⌘</span><b data-i18n="providers">模型提供商</b></button>
+        <button class="nav" data-page="graph"><span>✦</span><b data-i18n="graph">知识图谱</b></button>
+        <button class="nav" data-page="memory"><span>▣</span><b data-i18n="memory">记忆管理</b></button>
+        <button class="nav" data-page="recall"><span>⌕</span><b data-i18n="recall">召回测试</b></button>
+        <button class="nav" data-page="system"><span>⚙</span><b data-i18n="system">系统概览</b></button>
+        <button class="nav" data-page="settings"><span>◉</span><b data-i18n="settings">基础设置</b></button>
+        <button class="nav" data-page="logs"><span>☷</span><b data-i18n="logs">日志与任务列表</b></button>
+      </nav>
+      <div class="sidebar-bottom">
+        <button id="theme-toggle" class="nav"><span>☼</span><b data-i18n="theme">切换主题</b></button>
+        <select id="language" aria-label="language">
+          <option value="zh">中文</option>
+          <option value="en">English</option>
+          <option value="ru">Русский</option>
+        </select>
+        <small class="license-note">AGPL-3.0 · 基于 LivingMemory v2.3.5</small>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div>
+          <p class="eyebrow" data-i18n="serviceEyebrow">人格记忆服务</p>
+          <h1 id="page-title">知识图谱</h1>
+        </div>
+        <div class="top-actions">
+          <button id="library-context" class="context-chip hidden" type="button"></button>
+          <span id="service-state" class="pill success" data-i18n="online">在线</span>
+          <button id="logout" class="ghost" data-i18n="logout">退出</button>
+        </div>
+      </header>
+
+      <section id="page-libraries" class="page active">
+        <div class="page-heading">
+          <div>
+            <h2 data-i18n="libraryManagement">记忆库管理</h2>
+            <p data-i18n="libraryManagementHint">每个记忆库拥有独立数据库、索引、缓存和模型绑定。</p>
+          </div>
+          <div class="row-actions">
+            <button id="libraries-refresh" class="ghost" data-i18n="refresh">刷新</button>
+            <button id="library-create" class="primary" data-i18n="createLibrary">新增记忆库</button>
+          </div>
+        </div>
+        <div id="library-cards" class="card-grid"></div>
+      </section>
+
+      <section id="page-providers" class="page">
+        <div class="page-heading">
+          <div>
+            <h2 data-i18n="providerManagement">模型提供商</h2>
+            <p data-i18n="providerManagementHint">统一管理可供不同记忆库绑定的 Embedding Provider。</p>
+          </div>
+          <div class="row-actions">
+            <button id="providers-refresh" class="ghost" data-i18n="refresh">刷新</button>
+            <button id="provider-create" class="primary" data-i18n="createProvider">新增模型提供商</button>
+          </div>
+        </div>
+        <div id="provider-cards" class="card-grid provider-grid"></div>
+      </section>
+
+      <section id="page-graph" class="page">
+        <div class="page-heading">
+          <div>
+            <h2 data-i18n="graph">知识图谱</h2>
+            <p data-i18n="graphPageHint">查看当前记忆库的关系网络，可手动刷新最新导入或重建后的图谱。</p>
+          </div>
+          <button id="graph-refresh" class="ghost" data-i18n="refresh">刷新</button>
+        </div>
+        <div id="graph-stats" class="stats four"></div>
+        <div class="panel graph-panel">
+          <div class="toolbar">
+            <input id="graph-query" data-i18n-placeholder="graphQuery" placeholder="输入人物、主题、事实或整句">
+            <input id="graph-memory-id" type="number" data-i18n-placeholder="memoryId" placeholder="记忆 ID">
+            <input id="graph-session" data-i18n-placeholder="sessionOptional" placeholder="session_id（可选）">
+            <button id="graph-search" class="primary" data-i18n="searchGraph">检索图谱</button>
+            <button id="graph-overview" class="ghost" data-i18n="overview">最近概览</button>
+          </div>
+          <div id="graph-canvas" class="graph-canvas"><div class="empty" data-i18n="loading">加载中…</div></div>
+          <div id="graph-legend" class="legend"></div>
+        </div>
+      </section>
+
+      <section id="page-memory" class="page">
+        <div class="panel">
+          <div class="toolbar memory-toolbar">
+            <input id="memory-keyword" data-i18n-placeholder="memorySearch" placeholder="搜索正文、元数据或 ID">
+            <input id="memory-persona" data-i18n-placeholder="personaOptional" placeholder="persona_id（可选）">
+            <select id="memory-sort">
+              <option value="created_desc" data-i18n="sortNewest">最新优先</option>
+              <option value="created_asc" data-i18n="sortOldest">最早优先</option>
+              <option value="importance_desc" data-i18n="sortImportanceDesc">重要性从高到低</option>
+              <option value="importance_asc" data-i18n="sortImportanceAsc">重要性从低到高</option>
+            </select>
+            <button id="memory-refresh" class="ghost" data-i18n="refresh">刷新</button>
+            <button id="memory-create" class="primary" data-i18n="createMemory">新增记忆</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th data-i18n="content">内容</th>
+                  <th data-i18n="persona">人格</th>
+                  <th data-i18n="importance">重要性</th>
+                  <th data-i18n="status">状态</th>
+                  <th data-i18n="actions">操作</th>
+                </tr>
+              </thead>
+              <tbody id="memory-rows"></tbody>
+            </table>
+          </div>
+          <div class="pagination">
+            <button id="memory-prev" class="ghost" data-i18n="previousPage">上一页</button>
+            <span id="memory-page-info"></span>
+            <button id="memory-next" class="ghost" data-i18n="nextPage">下一页</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="page-recall" class="page">
+        <div class="page-heading">
+          <div>
+            <h2 data-i18n="recall">召回测试</h2>
+            <p data-i18n="recallPageHint">用当前记忆库执行混合召回，刷新会重新运行上一次查询。</p>
+          </div>
+          <button id="recall-refresh" class="ghost" data-i18n="refresh">刷新</button>
+        </div>
+        <div class="panel recall-form">
+          <textarea id="recall-query" rows="4" data-i18n-placeholder="recallQuery" placeholder="输入要回忆的问题、人物、关系或事件"></textarea>
+          <div class="toolbar">
+            <label><span data-i18n="topKLabel">召回条数</span><input id="recall-k" type="number" min="1" max="50" value="10"></label>
+            <input id="recall-persona" data-i18n-placeholder="personaOptional" placeholder="persona_id（可选）">
+            <input id="recall-session" data-i18n-placeholder="sessionRecallOptional" placeholder="session_id（当前配置不启用过滤）">
+            <button id="run-recall" class="primary" data-i18n="runRecall">运行召回</button>
+          </div>
+        </div>
+        <div id="recall-summary" class="recall-summary"></div>
+        <div id="recall-results" class="result-list"></div>
+      </section>
+
+      <section id="page-system" class="page">
+        <div class="page-heading">
+          <div>
+            <h2 data-i18n="system">系统概览</h2>
+            <p data-i18n="systemPageHint">查看当前记忆库统计、索引代次、备份与完整性状态。</p>
+          </div>
+          <button id="system-refresh" class="ghost" data-i18n="refresh">刷新</button>
+        </div>
+        <div id="system-stats" class="stats six"></div>
+        <div class="system-grid">
+          <div class="panel">
+            <div class="panel-title">
+              <h2 data-i18n="currentProviderBinding">当前模型绑定</h2>
+              <div class="row-actions">
+                <button id="go-providers" class="ghost" data-i18n="manageProviders">管理 Provider</button>
+                <button id="change-provider" class="primary" data-i18n="changeProvider">切换并重建</button>
+              </div>
+            </div>
+            <pre id="provider-status" data-i18n="loading">加载中…</pre>
+          </div>
+          <div class="panel">
+            <div class="panel-title">
+              <h2 data-i18n="indexGeneration">索引代次</h2>
+              <button id="rebuild-index" class="primary" data-i18n="rebuild">完全重建</button>
+            </div>
+            <pre id="index-status" data-i18n="loading">加载中…</pre>
+            <div id="job-progress" class="progress hidden"><div></div><span></span></div>
+          </div>
+          <div class="panel">
+            <h2 data-i18n="importanceDistribution">重要性分布</h2>
+            <div id="importance-chart" class="bars"></div>
+          </div>
+          <div class="panel">
+            <h2 data-i18n="atomTypes">原子类型</h2>
+            <div id="atom-chart" class="bars"></div>
+          </div>
+          <div class="panel wide">
+            <div class="panel-title">
+              <h2 data-i18n="backups">备份与迁移归档</h2>
+              <button id="integrity-check" class="ghost" data-i18n="integrity">完整性检查</button>
+            </div>
+            <div id="backup-list" class="backup-list"></div>
+            <pre id="integrity-result" class="hidden"></pre>
+          </div>
+        </div>
+      </section>
+
+      <section id="page-settings" class="page">
+        <div class="page-heading">
+          <div>
+            <h2 data-i18n="settingsTitle">基础设置</h2>
+            <p data-i18n="settingsHint">管理 WebUI 登录方式和访问端口。端口修改会在下次启动生效；API Token 仍可作为脚本 Bearer 凭据。</p>
+          </div>
+          <button id="settings-refresh" class="ghost" data-i18n="refresh">刷新</button>
+        </div>
+        <form id="settings-form" class="panel settings-panel">
+          <div class="settings-grid">
+            <label><span data-i18n="currentAccessUrl">当前 WebUI 地址</span><input id="settings-access-url" readonly></label>
+            <label><span data-i18n="configuredPort">配置端口</span><input id="settings-port" type="number" min="1" max="65535"></label>
+            <label><span data-i18n="actualPort">本次实际端口</span><input id="settings-actual-port" readonly></label>
+            <label><span data-i18n="loginMode">登录方式</span><input id="settings-login-mode" readonly></label>
+            <label><span data-i18n="newLoginPassword">新登录密码</span><input id="settings-password" type="password" autocomplete="new-password" data-i18n-placeholder="passwordKeepPlaceholder" placeholder="留空保持不变"></label>
+            <label class="switch-row"><span data-i18n="clearLoginPassword">清除登录密码，恢复 API Token 登录</span><input id="settings-clear-password" type="checkbox"></label>
+          </div>
+          <p id="settings-note" class="form-help"></p>
+          <footer>
+            <button class="primary" type="submit" data-i18n="saveSettings">保存基础设置</button>
+          </footer>
+        </form>
+      </section>
+
+      <section id="page-logs" class="page">
+        <div class="page-heading">
+          <div>
+            <h2 data-i18n="logsTitle">日志与任务列表</h2>
+            <p data-i18n="logsHint">实时记录检索、写入、迁移、索引重建和模型连接等关键行为；本地文件会自动轮转限制大小。</p>
+          </div>
+          <button id="logs-refresh" class="ghost" data-i18n="refresh">刷新</button>
+        </div>
+        <div class="panel task-panel">
+          <div class="panel-title">
+            <div>
+              <h2 data-i18n="taskListTitle">任务列表</h2>
+              <p data-i18n="taskListHint">索引重建、记忆库复制和记忆导入会排队执行，同一时间只运行一个任务。</p>
+            </div>
+            <div class="task-tabs">
+              <button id="tasks-active-tab" class="log-filter active" type="button" data-task-scope="active" data-i18n="activeTasks">进行中</button>
+              <button id="tasks-finished-tab" class="log-filter" type="button" data-task-scope="finished" data-i18n="finishedTasks">已结束任务</button>
+            </div>
+          </div>
+          <div id="task-list" class="task-list"></div>
+        </div>
+        <div class="panel log-panel">
+          <div class="log-toolbar">
+            <div class="log-filter-group">
+              <button class="log-filter active" type="button" data-log-level="DEBUG">Debug</button>
+              <button class="log-filter active" type="button" data-log-level="INFO">Info</button>
+              <button class="log-filter active" type="button" data-log-level="WARN">Warn</button>
+              <button class="log-filter active" type="button" data-log-level="ERROR">Error</button>
+            </div>
+            <div class="log-toolbar-actions">
+              <label class="switch-text">
+                <span id="log-auto-scroll-label" data-i18n="logAutoScrollOn">自动滚动已开启</span>
+                <span class="switch"><input id="log-auto-scroll" type="checkbox" checked><i></i></span>
+              </label>
+              <div id="log-meta" class="log-meta" data-i18n="logsRealtime">实时日志</div>
+              <button id="logs-clear" class="ghost" type="button" data-i18n="clearLogs">清空实时日志</button>
+            </div>
+          </div>
+          <div id="log-console" class="log-console" aria-live="polite"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="modal" class="modal-overlay hidden">
+    <form id="memory-form" class="modal">
+      <header><h2 id="modal-title">记忆详情</h2><button id="modal-close" type="button" class="icon">×</button></header>
+      <input id="form-id" type="hidden">
+      <label><span data-i18n="content">内容</span><textarea id="form-content" rows="6" required></textarea></label>
+      <div class="form-grid">
+        <label><span data-i18n="personaField">人格 ID</span><input id="form-persona"></label>
+        <label><span data-i18n="sessionField">会话 ID</span><input id="form-session"></label>
+        <label><span data-i18n="importanceField">重要性</span><input id="form-importance" type="number" min="0" max="1" step="0.05" value="0.5"></label>
+        <label><span data-i18n="statusField">状态</span><select id="form-status"><option value="active" data-i18n="statusActive">正常</option><option value="archived" data-i18n="statusArchived">归档</option><option value="deleted" data-i18n="statusDeleted">删除</option></select></label>
+        <label><span data-i18n="memoryTypeField">记忆类型</span><input id="form-type" value="GENERAL"></label>
+        <label><span data-i18n="topicsField">主题</span><input id="form-topics" data-i18n-placeholder="commaSeparated" placeholder="逗号分隔"></label>
+        <label><span data-i18n="participantsField">参与者</span><input id="form-participants" data-i18n-placeholder="commaSeparated" placeholder="逗号分隔"></label>
+        <label><span data-i18n="factsField">关键事实</span><input id="form-facts" data-i18n-placeholder="commaSeparated" placeholder="逗号分隔"></label>
+      </div>
+      <footer>
+        <button id="modal-cancel" type="button" class="ghost" data-i18n="cancel">取消</button>
+        <button class="primary" data-i18n="save">保存并重建索引</button>
+      </footer>
+    </form>
+  </div>
+
+  <div id="library-modal" class="modal-overlay hidden">
+    <form id="library-form" class="modal compact-modal">
+      <header><h2 id="library-modal-title" data-i18n="createLibrary">新增记忆库</h2><button type="button" class="icon modal-dismiss">×</button></header>
+      <input id="library-original-id" type="hidden">
+      <div class="form-grid">
+        <label><span data-i18n="libraryId">记忆库 ID</span><input id="library-id" required placeholder="例如 role_memory"></label>
+        <label><span data-i18n="displayName">显示名称</span><input id="library-name" required placeholder="例如 贝雷特"></label>
+        <label><span data-i18n="defaultPersonaOptional">默认人格 ID（可选）</span><input id="library-persona" placeholder="仅用于预填，不限制库内人格"></label>
+        <label id="library-provider-field"><span data-i18n="providerManagement">模型提供商</span><select id="library-provider" required></select></label>
+      </div>
+      <p class="form-help" data-i18n="providerSwitchEditHint">编辑时可选择新的模型提供商；若发生变化，保存后会对该记忆库启动全量索引重建。</p>
+      <label><span data-i18n="description">描述</span><textarea id="library-description" rows="3"></textarea></label>
+      <footer>
+        <button type="button" class="ghost modal-dismiss" data-i18n="cancel">取消</button>
+        <button class="primary" data-i18n="savePlain">保存</button>
+      </footer>
+    </form>
+  </div>
+
+  <div id="provider-type-modal" class="modal-overlay hidden">
+    <div class="modal provider-type-modal">
+      <header><h2 data-i18n="selectProviderType">选择模型提供商类型</h2><button type="button" class="icon modal-dismiss">×</button></header>
+      <div id="provider-type-cards" class="provider-type-grid"></div>
+      <footer><button type="button" class="ghost modal-dismiss" data-i18n="cancel">取消</button></footer>
+    </div>
+  </div>
+
+  <div id="provider-modal" class="modal-overlay hidden">
+    <form id="provider-form" class="modal provider-modal">
+      <header><h2 id="provider-modal-title">编辑模型提供商</h2><button type="button" class="icon modal-dismiss">×</button></header>
+      <div id="provider-hint" class="info-banner"></div>
+      <input id="provider-original-id" type="hidden">
+      <input id="provider-type" type="hidden">
+      <div class="provider-form-rows">
+        <label><span>Provider ID</span><input id="provider-id" required></label>
+        <label><span data-i18n="displayName">显示名称</span><input id="provider-name" required></label>
+        <label class="switch-row"><span data-i18n="enabled">启用</span><input id="provider-enabled" type="checkbox"></label>
+        <label id="provider-api-key-row"><span data-i18n="apiKey">API Key</span><input id="provider-api-key" type="password" autocomplete="new-password" data-i18n-placeholder="keepSecretPlaceholder" placeholder="留空保持原值"></label>
+        <label id="provider-clear-key-row" class="switch-row"><span data-i18n="clearApiKey">清除已有 API Key</span><input id="provider-clear-key" type="checkbox"></label>
+        <label><span data-i18n="apiBaseUrl">API Base URL</span><input id="provider-api-base" required></label>
+        <label><span data-i18n="embeddingModel">嵌入模型</span><input id="provider-model" required></label>
+        <label>
+          <span data-i18n="embeddingDimension">嵌入维度</span>
+          <div class="inline-field"><input id="provider-dimensions" type="number" min="0"><button id="provider-detect-dimension" class="ghost" type="button" data-i18n="autoDetect">自动检测</button></div>
+          <small data-i18n="dimensionHelp">0 表示自动检测。vLLM 不会把此值作为 dimensions 参数发送。</small>
+        </label>
+        <label><span data-i18n="timeoutSeconds">超时时间（秒）</span><input id="provider-timeout" type="number" min="1"></label>
+        <label><span data-i18n="proxyAddress">代理地址</span><input id="provider-proxy" data-i18n-placeholder="proxyPlaceholder" placeholder="例如 http://127.0.0.1:7890"></label>
+        <label><span data-i18n="batchSize">批量大小</span><input id="provider-batch" type="number" min="1"></label>
+        <label><span data-i18n="concurrency">并发数</span><input id="provider-concurrency" type="number" min="1"></label>
+        <label><span data-i18n="maxRetries">最大重试次数</span><input id="provider-retries" type="number" min="1"></label>
+      </div>
+      <pre id="provider-test-result" class="hidden"></pre>
+      <footer>
+        <button id="provider-draft-test" type="button" class="ghost" data-i18n="testConfig">测试配置</button>
+        <button type="button" class="ghost modal-dismiss" data-i18n="cancel">取消</button>
+        <button class="primary" data-i18n="savePlain">保存</button>
+      </footer>
+    </form>
+  </div>
+
+  <div id="provider-switch-modal" class="modal-overlay hidden">
+    <form id="provider-switch-form" class="modal compact-modal">
+      <header><h2 data-i18n="switchProviderTitle">切换模型并重建索引</h2><button type="button" class="icon modal-dismiss">×</button></header>
+      <p data-i18n="switchProviderHint">重建期间继续使用当前索引；新索引完整验证通过后才会原子切换。</p>
+      <label><span data-i18n="targetProvider">目标模型提供商</span><select id="provider-switch-select" required></select></label>
+      <footer>
+        <button type="button" class="ghost modal-dismiss" data-i18n="cancel">取消</button>
+        <button class="primary" data-i18n="startFullRebuild">开始完整重建</button>
+      </footer>
+    </form>
+  </div>
+  <div id="import-modal" class="modal-overlay hidden">
+    <form id="import-form" class="modal compact-modal">
+      <header><h2 id="import-modal-title" data-i18n="importMemory">导入记忆</h2><button type="button" class="icon modal-dismiss">×</button></header>
+      <p data-i18n="importMemoryHint">仅空记忆库可导入 LivingMemory 的 livingmemory.db；导入后会自动重建索引。</p>
+      <input id="import-library-id" type="hidden">
+      <label id="import-drop-zone" class="drop-zone">
+        <span data-i18n="dropLivingMemoryDb">拖入 livingmemory.db，或点击选择文件</span>
+        <input id="import-file" type="file" accept=".db" required>
+      </label>
+      <div id="import-file-name" class="subtle"></div>
+      <footer>
+        <button type="button" class="ghost modal-dismiss" data-i18n="cancel">取消</button>
+        <button class="primary" data-i18n="startImport">开始导入</button>
+      </footer>
+    </form>
+  </div>
+  <div id="confirm-modal" class="modal-overlay hidden">
+    <div class="modal compact-modal confirm-modal">
+      <header><h2 id="confirm-title">请确认</h2><button type="button" class="icon" id="confirm-close">×</button></header>
+      <p id="confirm-message"></p>
+      <footer>
+        <button type="button" class="ghost" id="confirm-cancel" data-i18n="cancel">取消</button>
+        <button type="button" class="primary" id="confirm-ok" data-i18n="confirmAction">确认</button>
+      </footer>
+    </div>
+  </div>
+  <div id="toast" class="toast"></div>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

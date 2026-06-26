@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+config/config.json
+config/config.test.json
+data/
+rehearsal_data/
+logs/
+*.log
+*.db-wal
+*.db-shm
+*.db-journal
+*.index
+browser-test-profile/
+import_uploads/
+reports/

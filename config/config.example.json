@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "host": "127.0.0.1",
+  "port": 8765,
+  "api_key": "",
+  "session_secret": "",
+  "webui_password_hash": "",
+  "provider": {
+    "id": "vllm_embedding",
+    "display_name": "本机 bge-m3",
+    "type": "vllm_embedding",
+    "enabled": true,
+    "api_base": "http://127.0.0.1:8001/v1",
+    "api_key": "",
+    "model": "BAAI/bge-m3",
+    "dimensions": 1024,
+    "timeout_seconds": 30,
+    "proxy": "",
+    "batch_size": 64,
+    "concurrency": 2,
+    "max_retries": 5
+  },
+  "recall": {
+    "top_k": 10,
+    "rrf_k": 60,
+    "decay_rate": 0.0,
+    "score_alpha": 0.5,
+    "score_beta": 0.25,
+    "score_gamma": 0.25,
+    "mmr_lambda": 0.7,
+    "document_route_weight": 0.65,
+    "graph_route_weight": 0.35,
+    "cross_route_bonus": 0.08,
+    "graph_expansion_limit": 24,
+    "graph_expansion_hops": 1,
+    "graph_second_hop_weight": 0.4,
+    "dynamic_route_weighting": true,
+    "use_persona_filtering": true,
+    "use_session_filtering": false,
+    "search_cache_ttl_seconds": 45.0,
+    "search_cache_max_size": 256
+  },
+  "maintenance": {
+    "atom_maintenance_interval_hours": 24.0,
+    "atom_forget_delay_days": 7.0,
+    "atom_purge_delay_days": 30.0,
+    "auto_cleanup_enabled": true,
+    "cleanup_days_threshold": 30,
+    "cleanup_importance_threshold": 0.3,
+    "backup_enabled": true,
+    "backup_keep_days": 7
+  },
+  "logging": {
+    "file_max_bytes": 10485760,
+    "file_backup_count": 3,
+    "buffer_max_entries": 2000,
+    "buffer_max_bytes": 4194304,
+    "line_max_chars": 32768
+  }
+}
