@@ -38,6 +38,9 @@ class DeterministicProvider(EmbeddingProvider):
     async def list_models(self):
         return [{"id": "deterministic"}]
 
+    async def detect_context_length(self):
+        return {"max_context_tokens": 4096, "max_context_tokens_source": "auto:fake"}
+
     async def test_connection(self):
         return {
             "available": True,
@@ -195,4 +198,3 @@ async def test_failed_rebuild_keeps_previous_generation_active(tmp_path: Path):
     with pytest.raises(RuntimeError, match="intentional rebuild failure"):
         await failing.rebuild()
     assert (tmp_path / "indexes" / "CURRENT").read_text().strip() == current_before
-

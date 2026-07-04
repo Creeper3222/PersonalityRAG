@@ -1,9 +1,12 @@
 {
   "version": 1,
   "host": "127.0.0.1",
+  "access_base_url": "http://127.0.0.1",
   "port": 8765,
+  "access_port": 8766,
   "api_key": "",
   "session_secret": "",
+  "library_psk_secret": "",
   "webui_password_hash": "",
   "provider": {
     "id": "vllm_embedding",

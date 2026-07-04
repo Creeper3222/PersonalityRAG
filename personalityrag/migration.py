@@ -143,10 +143,19 @@ def validate_livingmemory_db_file(path: Path) -> dict[str, Any]:
                 return 0
             return int(con.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
 
+        db_version = None
+        if "db_version" in tables:
+            row = con.execute(
+                "SELECT version FROM db_version ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if row is not None:
+                db_version = int(row[0])
+
         return {
             "path": str(path),
             "sha256": sha256_file(path),
             "integrity": integrity,
+            "db_version": db_version,
             "tables": sorted(tables),
             "counts": {
                 "total_memories": count("documents"),

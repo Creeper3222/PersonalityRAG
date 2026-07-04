@@ -35,6 +35,9 @@ class FakeProvider(EmbeddingProvider):
     async def list_models(self):
         return [{"id": "fake"}]
 
+    async def detect_context_length(self):
+        return {"max_context_tokens": 4096, "max_context_tokens_source": "auto:fake"}
+
     async def test_connection(self):
         return {
             "available": True,
@@ -87,3 +90,27 @@ async def test_write_rebuild_recall_and_delete(tmp_path: Path):
     assert await storage.delete_memories([first]) == 1
     assert await storage.get_document(first) is None
 
+
+@pytest.mark.asyncio
+async def test_graph_keyword_batches_large_token_lists(tmp_path: Path):
+    storage = Storage(tmp_path)
+    await storage.initialize()
+    text = TextProcessor()
+    graph = GraphBuilder()
+    await storage.create_memory(
+        {
+            "content": "long graph token batching smoke",
+            "topics": ["RocketCatShell"],
+            "participants": ["beileite"],
+            "key_facts": ["RocketCatShell graph token batching works"],
+        },
+        text.tokenize,
+        graph.build,
+    )
+    provider = FakeProvider()
+    indexes = IndexManager(tmp_path, storage, provider, "fake")
+    await indexes.initialize()
+    engine = RetrievalEngine(storage, indexes, text, RecallConfig())
+    query = " ".join([f"token{i}" for i in range(700)] + ["RocketCatShell"])
+    results = await engine._graph_keyword(query, 5, None, None)
+    assert isinstance(results, list)

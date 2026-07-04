@@ -40,6 +40,12 @@ class FakeProvider(EmbeddingProvider):
     async def list_models(self):
         return [{"id": self.config.model}]
 
+    async def detect_context_length(self):
+        return {
+            "max_context_tokens": self.config.max_context_tokens or 4096,
+            "max_context_tokens_source": "auto:fake",
+        }
+
     async def test_connection(self):
         return {
             "available": True,

@@ -3,9 +3,10 @@
 PersonalityRAG v0.1.0 is based on and adapts core storage, retrieval,
 graph-memory, atom lifecycle, migration and dashboard ideas and code from:
 
-- **LivingMemory / astrbot_plugin_livingmemory v2.3.5**
+- **LivingMemory / astrbot_plugin_livingmemory**
+- Compatibility target: **LivingMemory database schema v8**
 - Original author: **lxfight**
-- Copyright © lxfight and contributors
+- Copyright (c) lxfight and contributors
 - Repository: <https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory>
 - License: GNU Affero General Public License v3.0
 

@@ -6,6 +6,37 @@ import secrets
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
+
+
+DEFAULT_ACCESS_BASE_URL = "http://127.0.0.1"
+
+
+def normalize_access_base_url(value: str | None) -> str:
+    raw = (value or DEFAULT_ACCESS_BASE_URL).strip().rstrip("/")
+    if not raw:
+        return DEFAULT_ACCESS_BASE_URL
+    parsed = urlsplit(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("access_base_url must be an http(s) URL host")
+    if parsed.username or parsed.password:
+        raise ValueError("access_base_url must not include credentials")
+    try:
+        explicit_port = parsed.port is not None
+    except ValueError as exc:
+        raise ValueError("access_base_url has an invalid port") from exc
+    if explicit_port:
+        raise ValueError("access_base_url must not include a port")
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise ValueError("access_base_url must not include a path, query, or fragment")
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"{parsed.scheme}://{host}"
+
+
+def build_access_url(base_url: str, port: int) -> str:
+    return f"{normalize_access_base_url(base_url)}:{port}/"
 
 
 @dataclass(slots=True)
@@ -18,11 +49,19 @@ class ProviderConfig:
     api_key: str = "vllm"
     model: str = "BAAI/bge-m3"
     dimensions: int = 1024
+    max_context_tokens: int = 0
+    max_context_tokens_source: str = ""
     timeout_seconds: int = 30
     proxy: str = ""
     batch_size: int = 64
     concurrency: int = 2
     max_retries: int = 5
+    api_suffix: str = ""
+    return_documents: bool = False
+    instruct: str = ""
+    model_endpoint: str = ""
+    truncate: str = ""
+    launch_model_if_not_running: bool = False
 
 
 @dataclass(slots=True)
@@ -73,9 +112,12 @@ class LoggingConfig:
 class AppConfig:
     version: int = 1
     host: str = "127.0.0.1"
+    access_base_url: str = DEFAULT_ACCESS_BASE_URL
     port: int = 8765
+    access_port: int = 8766
     api_key: str = field(default_factory=lambda: f"prag_{secrets.token_urlsafe(32)}")
     session_secret: str = field(default_factory=lambda: secrets.token_urlsafe(48))
+    library_psk_secret: str = field(default_factory=lambda: secrets.token_urlsafe(48))
     webui_password_hash: str = ""
     provider: ProviderConfig = field(default_factory=ProviderConfig)
     recall: RecallConfig = field(default_factory=RecallConfig)
@@ -106,9 +148,12 @@ def load_config(path: Path) -> AppConfig:
         in {
             "version",
             "host",
+            "access_base_url",
             "port",
+            "access_port",
             "api_key",
             "session_secret",
+            "library_psk_secret",
             "webui_password_hash",
         }
     }
@@ -128,6 +173,9 @@ def load_config(path: Path) -> AppConfig:
         config.api_key = f"prag_{secrets.token_urlsafe(32)}"
     if not config.session_secret:
         config.session_secret = secrets.token_urlsafe(48)
+    if not config.library_psk_secret:
+        config.library_psk_secret = secrets.token_urlsafe(48)
+    config.access_base_url = normalize_access_base_url(config.access_base_url)
     save_config(path, config)
     return config
 

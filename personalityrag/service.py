@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import math
 import shutil
@@ -15,8 +16,8 @@ from .jobs import JobManager
 from .logger import logger
 from .migration import LivingMemoryMigrator, sqlite_backup
 from .control import ProviderRevision
-from .providers import build_provider, provider_config_hash
-from .retrieval import RetrievalEngine
+from .providers import build_provider, build_rerank_provider, provider_config_hash
+from .retrieval import RetrievalEngine, SearchResult
 from .storage import Storage
 from .text import TextProcessor
 
@@ -30,6 +31,7 @@ class PersonalityRAGService:
         *,
         library_id: str = "",
         provider_revision: ProviderRevision | None = None,
+        rerank_provider_revision: ProviderRevision | None = None,
         system_path: Path | None = None,
     ):
         self.root = root
@@ -43,10 +45,16 @@ class PersonalityRAGService:
             config_sha256=provider_config_hash(config.provider),
             created_at=time.time(),
         )
+        self.rerank_provider_revision = rerank_provider_revision
         self.storage = Storage(self.data_dir, system_path=system_path)
         self.text = TextProcessor(self.data_dir / "stopwords")
         self.graph_builder = GraphBuilder()
         self.provider = build_provider(self.provider_revision.config)
+        self.reranker = (
+            build_rerank_provider(self.rerank_provider_revision.config)
+            if self.rerank_provider_revision
+            else None
+        )
         self.indexes = IndexManager(
             self.data_dir,
             self.storage,
@@ -65,6 +73,7 @@ class PersonalityRAGService:
         self._maintenance_task: asyncio.Task | None = None
         self._mutation_lock = asyncio.Lock()
         self._retired_providers: list[Any] = []
+        self._retired_rerankers: list[Any] = []
 
     async def initialize(self) -> None:
         logger.info(
@@ -114,8 +123,14 @@ class PersonalityRAGService:
             await asyncio.gather(
                 self._maintenance_task, return_exceptions=True
             )
-        providers = [self.provider, *self._retired_providers]
+        providers = [
+            self.provider,
+            *self._retired_providers,
+            *([self.reranker] if self.reranker else []),
+            *self._retired_rerankers,
+        ]
         self._retired_providers.clear()
+        self._retired_rerankers.clear()
         closed: set[int] = set()
         for provider in providers:
             identity = id(provider)
@@ -123,6 +138,86 @@ class PersonalityRAGService:
                 continue
             closed.add(identity)
             await provider.close()
+
+    async def set_rerank_provider(
+        self, provider_revision: ProviderRevision | None
+    ) -> None:
+        candidate = (
+            build_rerank_provider(provider_revision.config)
+            if provider_revision
+            else None
+        )
+        old = self.reranker
+        self.reranker = candidate
+        self.rerank_provider_revision = provider_revision
+        if old is not None and old is not candidate:
+            self._retired_rerankers.append(old)
+        logger.info(
+            "Rerank Provider 已切换：library_id=%s provider=%s",
+            self.library_id,
+            provider_revision.provider_id if provider_revision else "",
+        )
+
+    async def apply_rerank(
+        self, query: str, candidates: list[SearchResult], k: int
+    ) -> tuple[list[SearchResult], dict[str, Any]]:
+        if not self.reranker or not self.rerank_provider_revision or not candidates:
+            return candidates[:k], {
+                "requested": False,
+                "applied": False,
+                "provider_id": "",
+                "provider_type": "",
+            }
+        provider_id = self.rerank_provider_revision.provider_id
+        provider_type = self.rerank_provider_revision.config.type
+        rerank_rows = await self.reranker.rerank(
+            query,
+            [item.content for item in candidates],
+            k,
+        )
+        ordered: list[SearchResult] = []
+        used_indexes: set[int] = set()
+        for row in rerank_rows:
+            if row.index < 0 or row.index >= len(candidates) or row.index in used_indexes:
+                continue
+            used_indexes.add(row.index)
+            item = copy.deepcopy(candidates[row.index])
+            item.score_breakdown = {
+                **item.score_breakdown,
+                "rerank_score": round(float(row.relevance_score), 6),
+                "original_rank": row.index + 1,
+                "original_score": round(float(item.final_score), 6),
+                "rerank_provider_id": provider_id,
+                "rerank_provider_type": provider_type,
+            }
+            item.final_score = float(row.relevance_score)
+            ordered.append(item)
+            if len(ordered) >= k:
+                break
+        if len(ordered) < k:
+            for index, candidate in enumerate(candidates):
+                if index in used_indexes:
+                    continue
+                item = copy.deepcopy(candidate)
+                item.score_breakdown = {
+                    **item.score_breakdown,
+                    "original_rank": index + 1,
+                    "original_score": round(float(item.final_score), 6),
+                    "rerank_provider_id": provider_id,
+                    "rerank_provider_type": provider_type,
+                    "rerank_missing": True,
+                }
+                ordered.append(item)
+                if len(ordered) >= k:
+                    break
+        return ordered[:k], {
+            "requested": True,
+            "applied": bool(rerank_rows),
+            "provider_id": provider_id,
+            "provider_type": provider_type,
+            "candidate_count": len(candidates),
+            "returned": len(ordered[:k]),
+        }
 
     async def rebuild_indexes(self, progress=None) -> dict[str, Any]:
         async with self._mutation_lock:
@@ -208,22 +303,36 @@ class PersonalityRAGService:
         )
         return {"fts": fts, "manifest": manifest}
 
-    async def create_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def create_memory(
+        self,
+        payload: dict[str, Any],
+        *,
+        rebuild: bool = True,
+        progress=None,
+    ) -> dict[str, Any]:
         async with self._mutation_lock:
             memory_id = await self.storage.create_memory(
                 payload,
                 self.text.tokenize,
                 self.graph_builder.build,
             )
-            logger.info("记忆已写入数据库，开始重建索引：library_id=%s memory_id=%s", self.library_id, memory_id)
-            await self._rebuild_indexes_unlocked()
+            if rebuild:
+                logger.info("记忆已写入数据库，开始重建索引：library_id=%s memory_id=%s", self.library_id, memory_id)
+                await self._rebuild_indexes_unlocked(progress)
+            else:
+                logger.info("记忆已写入数据库，等待任务队列重建索引：library_id=%s memory_id=%s", self.library_id, memory_id)
             self.retrieval.invalidate()
             return (await self.storage.get_document(memory_id)) or {
                 "id": memory_id
             }
 
     async def update_memory(
-        self, memory_id: int, payload: dict[str, Any]
+        self,
+        memory_id: int,
+        payload: dict[str, Any],
+        *,
+        rebuild: bool = True,
+        progress=None,
     ) -> dict[str, Any] | None:
         async with self._mutation_lock:
             success = await self.storage.update_memory(
@@ -234,17 +343,29 @@ class PersonalityRAGService:
             )
             if not success:
                 return None
-            logger.info("记忆已更新数据库，开始重建索引：library_id=%s memory_id=%s", self.library_id, memory_id)
-            await self._rebuild_indexes_unlocked()
+            if rebuild:
+                logger.info("记忆已更新数据库，开始重建索引：library_id=%s memory_id=%s", self.library_id, memory_id)
+                await self._rebuild_indexes_unlocked(progress)
+            else:
+                logger.info("记忆已更新数据库，等待任务队列重建索引：library_id=%s memory_id=%s", self.library_id, memory_id)
             self.retrieval.invalidate()
             return await self.storage.get_document(memory_id)
 
-    async def delete_memories(self, memory_ids: list[int]) -> int:
+    async def delete_memories(
+        self,
+        memory_ids: list[int],
+        *,
+        rebuild: bool = True,
+        progress=None,
+    ) -> int:
         async with self._mutation_lock:
             deleted = await self.storage.delete_memories(memory_ids)
             if deleted:
-                logger.warning("记忆已删除，开始重建索引：library_id=%s deleted=%s", self.library_id, deleted)
-                await self._rebuild_indexes_unlocked()
+                if rebuild:
+                    logger.warning("记忆已删除，开始重建索引：library_id=%s deleted=%s", self.library_id, deleted)
+                    await self._rebuild_indexes_unlocked(progress)
+                else:
+                    logger.warning("记忆已删除，等待任务队列重建索引：library_id=%s deleted=%s", self.library_id, deleted)
                 self.retrieval.invalidate()
             return deleted
 
@@ -297,6 +418,7 @@ class PersonalityRAGService:
                     "memories": [],
                 }
             entry_placeholders = ",".join("?" for _ in entry_ids)
+            entry_node_map: dict[int, list[int]] = {}
             node_rows = await (
                 await db.execute(
                     f"""SELECT DISTINCT n.id,n.node_key,n.node_type,n.node_value,
@@ -306,8 +428,18 @@ class PersonalityRAGService:
                     (*entry_ids, limit_nodes),
                 )
             ).fetchall()
+            entry_node_rows = await (
+                await db.execute(
+                    f"""SELECT entry_id,node_id FROM graph_entry_nodes
+                    WHERE entry_id IN ({entry_placeholders})""",
+                    (*entry_ids,),
+                )
+            ).fetchall()
+            for row in entry_node_rows:
+                entry_node_map.setdefault(int(row["entry_id"]), []).append(int(row["node_id"]))
             node_ids = [int(row["id"]) for row in node_rows]
             edge_rows = []
+            node_stats: dict[int, dict[str, Any]] = {}
             if node_ids:
                 node_placeholders = ",".join("?" for _ in node_ids)
                 edge_rows = await (
@@ -319,6 +451,33 @@ class PersonalityRAGService:
                         (*node_ids, *node_ids, limit_edges),
                     )
                 ).fetchall()
+                entry_stat_rows = await (
+                    await db.execute(
+                        f"""SELECT gen.node_id AS node_id,
+                        COUNT(DISTINCT gen.entry_id) AS entry_count,
+                        COUNT(DISTINCT ge.source_memory_id) AS memory_count
+                        FROM graph_entry_nodes gen
+                        JOIN graph_entries ge ON ge.id=gen.entry_id
+                        WHERE gen.node_id IN ({node_placeholders})
+                        GROUP BY gen.node_id""",
+                        (*node_ids,),
+                    )
+                ).fetchall()
+                for row in entry_stat_rows:
+                    node_stats[int(row["node_id"])] = {
+                        "entry_count": int(row["entry_count"] or 0),
+                        "memory_count": int(row["memory_count"] or 0),
+                    }
+                for row in edge_rows:
+                    source_id = int(row["source_node_id"])
+                    target_id = int(row["target_node_id"])
+                    edge_weight = float(row["weight"] or 0)
+                    source_stats = node_stats.setdefault(source_id, {})
+                    source_stats["degree"] = int(source_stats.get("degree", 0)) + 1
+                    source_stats["weight"] = float(source_stats.get("weight", 0.0)) + edge_weight
+                    target_stats = node_stats.setdefault(target_id, {})
+                    target_stats["degree"] = int(target_stats.get("degree", 0)) + 1
+                    target_stats["weight"] = float(target_stats.get("weight", 0.0)) + edge_weight
         memories = [
             item
             for memory_id in selected_memory_ids
@@ -332,6 +491,10 @@ class PersonalityRAGService:
                     "type": row["node_type"],
                     "label": row["node_value"],
                     "canonical_value": row["canonical_value"],
+                    "memory_count": int(node_stats.get(int(row["id"]), {}).get("memory_count", 0)),
+                    "degree": int(node_stats.get(int(row["id"]), {}).get("degree", 0)),
+                    "entry_count": int(node_stats.get(int(row["id"]), {}).get("entry_count", 0)),
+                    "weight": float(node_stats.get(int(row["id"]), {}).get("weight", 0)),
                 }
                 for row in node_rows
             ],
@@ -355,6 +518,7 @@ class PersonalityRAGService:
                     "entry_type": row["entry_type"],
                     "relation_type": row["relation_type"],
                     "content": row["content"],
+                    "node_ids": entry_node_map.get(int(row["id"]), []),
                 }
                 for row in entry_rows
             ],

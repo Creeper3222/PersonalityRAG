@@ -5,6 +5,8 @@ import hashlib
 import json
 import math
 import os
+import shutil
+import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -16,6 +18,89 @@ import numpy as np
 
 from .providers import EmbeddingProvider
 from .storage import Storage
+
+
+DEFAULT_DOCUMENT_EMBED_CHARS = 4000
+DEFAULT_QUERY_EMBED_CHARS = 2000
+CONTEXT_CHAR_SAFETY_RATIO = 0.9
+MIN_CONTEXT_CLIP_CHARS = 64
+
+
+def _embedding_char_limit(provider: EmbeddingProvider, default_limit: int) -> int:
+    config = getattr(provider, "config", None)
+    tokens = int(getattr(config, "max_context_tokens", 0) or 0)
+    if tokens <= 0:
+        return default_limit
+    safe_chars = max(MIN_CONTEXT_CLIP_CHARS, int(tokens * CONTEXT_CHAR_SAFETY_RATIO))
+    return max(1, min(default_limit, safe_chars))
+
+
+def _clip_for_embedding(
+    text: Any,
+    provider: EmbeddingProvider,
+    default_limit: int,
+) -> str:
+    return str(text or "")[: _embedding_char_limit(provider, default_limit)]
+
+
+def _path_is_ascii(path: Path) -> bool:
+    try:
+        str(path).encode("ascii")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def _faiss_needs_path_bridge(path: Path) -> bool:
+    return os.name == "nt" and not _path_is_ascii(path)
+
+
+def _safe_faiss_temp_dir() -> Path:
+    candidates = [Path(tempfile.gettempdir())]
+    system_root = os.environ.get("SystemRoot")
+    if system_root:
+        candidates.append(Path(system_root) / "Temp")
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            if _path_is_ascii(candidate):
+                return candidate
+        except Exception:
+            continue
+    return candidates[0]
+
+
+def _read_faiss_index(path: Path) -> faiss.Index:
+    if not _faiss_needs_path_bridge(path):
+        return faiss.read_index(str(path))
+    temp_dir = _safe_faiss_temp_dir()
+    fd, temp_name = tempfile.mkstemp(
+        prefix="personalityrag-faiss-", suffix=".index", dir=temp_dir
+    )
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        shutil.copyfile(path, temp_path)
+        return faiss.read_index(str(temp_path))
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _write_faiss_index(index: faiss.Index, path: Path) -> None:
+    if not _faiss_needs_path_bridge(path):
+        faiss.write_index(index, str(path))
+        return
+    temp_dir = _safe_faiss_temp_dir()
+    fd, temp_name = tempfile.mkstemp(
+        prefix="personalityrag-faiss-", suffix=".index", dir=temp_dir
+    )
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        faiss.write_index(index, str(temp_path))
+        shutil.copyfile(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 @dataclass(slots=True)
@@ -99,8 +184,8 @@ class IndexManager:
             generation = self.current_file.read_text(encoding="utf-8").strip()
             path = self.root / generation
             try:
-                document_index = faiss.read_index(str(path / "documents.index"))
-                graph_index = faiss.read_index(str(path / "graph.index"))
+                document_index = _read_faiss_index(path / "documents.index")
+                graph_index = _read_faiss_index(path / "graph.index")
                 manifest = json.loads(
                     (path / "manifest.json").read_text(encoding="utf-8")
                 )
@@ -150,7 +235,12 @@ class IndexManager:
         if not samples:
             return
         vectors = np.asarray(
-            await provider.get_embeddings([text[:4000] for _, text in samples]),
+            await provider.get_embeddings(
+                [
+                    _clip_for_embedding(text, provider, DEFAULT_DOCUMENT_EMBED_CHARS)
+                    for _, text in samples
+                ],
+            ),
             dtype=np.float32,
         )
         if vectors.ndim != 2:
@@ -220,6 +310,7 @@ class IndexManager:
                         expected_rows=len(chunk_ids),
                         dimension=dimension,
                     )
+                    faiss.normalize_L2(matrix)
                     return (
                         matrix,
                         np.asarray(chunk_ids, dtype=np.int64),
@@ -255,7 +346,14 @@ class IndexManager:
             async for batch in self.storage.iter_documents(batch_size=500):
                 ids = [int(item["id"]) for item in batch]
                 await embed_chunks(
-                    [str(item["text"])[:4000] for item in batch],
+                    [
+                        _clip_for_embedding(
+                            item["text"],
+                            candidate,
+                            DEFAULT_DOCUMENT_EMBED_CHARS,
+                        )
+                        for item in batch
+                    ],
                     ids,
                     doc_index,
                 )
@@ -265,7 +363,14 @@ class IndexManager:
             async for batch in self.storage.iter_graph_entries(batch_size=500):
                 ids = [int(item["id"]) for item in batch]
                 await embed_chunks(
-                    [str(item["content"])[:4000] for item in batch],
+                    [
+                        _clip_for_embedding(
+                            item["content"],
+                            candidate,
+                            DEFAULT_DOCUMENT_EMBED_CHARS,
+                        )
+                        for item in batch
+                    ],
                     ids,
                     graph_index,
                 )
@@ -347,8 +452,8 @@ class IndexManager:
                     0.0 if norm_count == 0 else norm_sum / norm_count, 8
                 ),
             )
-            faiss.write_index(doc_index, str(temp_dir / "documents.index"))
-            faiss.write_index(graph_index, str(temp_dir / "graph.index"))
+            _write_faiss_index(doc_index, temp_dir / "documents.index")
+            _write_faiss_index(graph_index, temp_dir / "graph.index")
             (temp_dir / "manifest.json").write_text(
                 json.dumps(asdict(manifest), ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -383,7 +488,15 @@ class IndexManager:
         if snapshot is None or snapshot.document_index.ntotal == 0:
             return []
         vector = np.asarray(
-            [await snapshot.provider.get_embedding(query[:2000])],
+            [
+                await snapshot.provider.get_embedding(
+                    _clip_for_embedding(
+                        query,
+                        snapshot.provider,
+                        DEFAULT_QUERY_EMBED_CHARS,
+                    ),
+                )
+            ],
             dtype=np.float32,
         )
         faiss.normalize_L2(vector)
@@ -401,7 +514,15 @@ class IndexManager:
         if snapshot is None or snapshot.graph_index.ntotal == 0:
             return []
         vector = np.asarray(
-            [await snapshot.provider.get_embedding(query[:2000])],
+            [
+                await snapshot.provider.get_embedding(
+                    _clip_for_embedding(
+                        query,
+                        snapshot.provider,
+                        DEFAULT_QUERY_EMBED_CHARS,
+                    ),
+                )
+            ],
             dtype=np.float32,
         )
         faiss.normalize_L2(vector)

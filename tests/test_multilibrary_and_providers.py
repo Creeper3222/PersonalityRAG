@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from personalityrag.config import AppConfig, ProviderConfig
+from personalityrag.compat import LIVINGMEMORY_DATABASE_VERSION
 from personalityrag.control import ControlStore
 from personalityrag.graph import GraphBuilder
 from personalityrag.indexes import IndexManager
@@ -47,6 +48,12 @@ class FakeProvider(EmbeddingProvider):
 
     async def list_models(self):
         return [{"id": self.config.model}]
+
+    async def detect_context_length(self):
+        return {
+            "max_context_tokens": self.config.max_context_tokens or 4096,
+            "max_context_tokens_source": "auto:fake",
+        }
 
     async def test_connection(self):
         return {
@@ -110,6 +117,75 @@ async def test_vllm_resolves_served_model_and_never_sends_dimensions():
     assert len(await provider.get_embedding("hello")) == 3
     assert requests[0]["model"] == "bge-m3"
     assert "dimensions" not in requests[0]
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_vllm_detects_context_length_from_models():
+    async def handler(request: httpx.Request):
+        assert request.url.path == "/v1/models"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "bge-m3",
+                        "root": "BAAI/bge-m3",
+                        "max_model_len": 8192,
+                    }
+                ]
+            },
+        )
+
+    provider = VLLMEmbeddingProvider(
+        ProviderConfig(id="vllm", type="vllm_embedding", model="BAAI/bge-m3")
+    )
+    await provider._client.aclose()
+    provider._client = httpx.AsyncClient(
+        base_url="http://test/v1",
+        transport=httpx.MockTransport(handler),
+    )
+    detected = await provider.detect_context_length()
+    assert detected["max_context_tokens"] == 8192
+    assert "max_model_len" in detected["max_context_tokens_source"]
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_ollama_detects_context_length_from_show():
+    async def handler(request: httpx.Request):
+        assert request.url.path == "/api/show"
+        return httpx.Response(
+            200,
+            json={"model_info": {"bge.context_length": 8192}},
+        )
+
+    provider = OllamaEmbeddingProvider(
+        ProviderConfig(id="ollama", type="ollama_embedding", model="bge-m3")
+    )
+    await provider._client.aclose()
+    provider._client = httpx.AsyncClient(
+        base_url="http://test",
+        transport=httpx.MockTransport(handler),
+    )
+    detected = await provider.detect_context_length()
+    assert detected["max_context_tokens"] == 8192
+    assert "/api/show" in detected["max_context_tokens_source"]
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_openai_uses_known_embedding_context_length_table():
+    provider = OpenAIEmbeddingProvider(
+        ProviderConfig(
+            id="openai",
+            type="openai_embedding",
+            model="text-embedding-3-small",
+        )
+    )
+    detected = await provider.detect_context_length()
+    assert detected["max_context_tokens"] == 8192
+    assert "known-model-table" in detected["max_context_tokens_source"]
     await provider.close()
 
 
@@ -185,6 +261,118 @@ async def test_ollama_lists_models_and_embeds_batches():
 
 
 @pytest.mark.asyncio
+async def test_manager_detects_context_length_only_on_provider_create_or_endpoint_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    calls: list[str] = []
+
+    class CountingProvider(FakeProvider):
+        async def detect_context_length(self):
+            calls.append(self.config.api_base)
+            tokens = 2222 if "new-endpoint" in self.config.api_base else 1111
+            return {
+                "max_context_tokens": tokens,
+                "max_context_tokens_source": "auto:counting",
+            }
+
+    monkeypatch.setattr(
+        "personalityrag.libraries.build_provider",
+        lambda config: CountingProvider(config),
+    )
+    manager = LibraryManager(tmp_path / "PersonalityRAG", AppConfig())
+    await manager.initialize()
+    try:
+        created = await manager.create_provider(
+            {
+                "id": "ctx_provider",
+                "display_name": "Context Provider",
+                "type": "vllm_embedding",
+                "enabled": True,
+                "api_base": "http://old-endpoint/v1",
+                "model": "fixture-model",
+                "dimensions": 8,
+            }
+        )
+        assert created["max_context_tokens"] == 1111
+        assert calls == ["http://old-endpoint/v1"]
+
+        renamed = await manager.update_provider(
+            "ctx_provider", {"display_name": "Renamed Context Provider"}
+        )
+        assert renamed["max_context_tokens"] == 1111
+        assert calls == ["http://old-endpoint/v1"]
+
+        changed = await manager.update_provider(
+            "ctx_provider", {"api_base": "http://new-endpoint/v1"}
+        )
+        assert changed["max_context_tokens"] == 2222
+        assert calls == ["http://old-endpoint/v1", "http://new-endpoint/v1"]
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_manager_manual_context_probe_for_saved_provider_keeps_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    calls: list[tuple[str, str, str]] = []
+
+    class SecretAwareProvider(FakeProvider):
+        async def detect_context_length(self):
+            calls.append(
+                (
+                    self.config.api_key,
+                    self.config.api_base,
+                    self.config.model,
+                )
+            )
+            return {
+                "max_context_tokens": 8192,
+                "max_context_tokens_source": "auto:secret-aware",
+            }
+
+    monkeypatch.setattr(
+        "personalityrag.libraries.build_provider",
+        lambda config: SecretAwareProvider(config),
+    )
+    manager = LibraryManager(tmp_path / "PersonalityRAG", AppConfig())
+    await manager.initialize()
+    try:
+        await manager.create_provider(
+            {
+                "id": "remote_ctx_provider",
+                "display_name": "Remote Context Provider",
+                "type": "openai_embedding",
+                "enabled": True,
+                "api_base": "https://old-endpoint.example/v1",
+                "api_key": "top-secret",
+                "model": "text-embedding-3-small",
+                "dimensions": 8,
+            }
+        )
+        calls.clear()
+
+        detected = await manager.detect_context_length(
+            {
+                "api_base": "https://new-endpoint.example/v1",
+                "model": "text-embedding-3-large",
+            },
+            provider_id="remote_ctx_provider",
+        )
+
+        assert detected["max_context_tokens"] == 8192
+        assert calls == [
+            (
+                "top-secret",
+                "https://new-endpoint.example/v1",
+                "text-embedding-3-large",
+            )
+        ]
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_provider_revision_mask_and_usage_protection(tmp_path: Path):
     control = ControlStore(tmp_path / "system.db")
     seed = ProviderConfig(api_key="secret-value")
@@ -196,12 +384,13 @@ async def test_provider_revision_mask_and_usage_protection(tmp_path: Path):
     updated = await control.update_provider(
         seed.id, {"display_name": "新名称", "api_key": ""}
     )
-    assert updated.revision == 2
+    assert updated.revision == 1
     assert updated.config.api_key == "secret-value"
+    assert updated.config.display_name != seed.display_name
     cleared = await control.update_provider(
         seed.id, {"clear_api_key": True}
     )
-    assert cleared.revision == 3
+    assert cleared.revision == 2
     assert cleared.config.api_key == ""
     await control.ensure_default_library(
         library_id="default",
@@ -213,6 +402,152 @@ async def test_provider_revision_mask_and_usage_protection(tmp_path: Path):
         await control.update_provider(seed.id, {"enabled": False})
     with pytest.raises(ValueError, match="不能删除"):
         await control.delete_provider(seed.id)
+
+
+@pytest.mark.asyncio
+async def test_provider_usage_ignores_display_only_revision_drift(tmp_path: Path):
+    control = ControlStore(tmp_path / "system.db")
+    seed = ProviderConfig(api_key="secret-value")
+    await control.initialize(seed)
+    await control.ensure_default_library(
+        library_id="default",
+        name="Default",
+        provider_id=seed.id,
+        provider_revision=1,
+    )
+
+    renamed = await control.update_provider(seed.id, {"display_name": "Renamed"})
+    assert renamed.revision == 1
+    usage = await control.provider_usage(seed.id)
+    assert usage[0]["needs_rebuild"] is False
+
+    changed = await control.update_provider(
+        seed.id, {"api_base": "http://127.0.0.1:18001/v1"}
+    )
+    assert changed.revision == 2
+    usage = await control.provider_usage(seed.id)
+    assert usage[0]["needs_rebuild"] is True
+
+
+@pytest.mark.asyncio
+async def test_provider_usage_ignores_max_context_metadata_drift(tmp_path: Path):
+    control = ControlStore(tmp_path / "system.db")
+    seed = ProviderConfig(api_key="secret-value")
+    await control.initialize(seed)
+    await control.ensure_default_library(
+        library_id="default",
+        name="Default",
+        provider_id=seed.id,
+        provider_revision=1,
+    )
+
+    updated = await control.update_provider(
+        seed.id,
+        {
+            "max_context_tokens": 8192,
+            "max_context_tokens_source": "auto:vllm_embedding:models.max_model_len",
+        },
+    )
+    assert updated.revision == 1
+    assert updated.config.max_context_tokens == 8192
+    usage = await control.provider_usage(seed.id)
+    assert usage[0]["needs_rebuild"] is False
+
+
+@pytest.mark.asyncio
+async def test_debug_provider_revision_patch_recomputes_hash_without_rebuild(
+    tmp_path: Path,
+):
+    control = ControlStore(tmp_path / "system.db")
+    seed = ProviderConfig(api_key="secret-value")
+    await control.initialize(seed)
+    await control.ensure_default_library(
+        library_id="default",
+        name="Default",
+        provider_id=seed.id,
+        provider_revision=1,
+    )
+
+    summary = await control.debug_patch_provider_revision(
+        seed.id,
+        1,
+        {
+            "max_context_tokens": 8192,
+            "max_context_tokens_source": "auto:vllm_embedding:models.max_model_len",
+        },
+    )
+
+    assert summary["latest_revision"] == 1
+    assert summary["revisions"][0]["config"]["max_context_tokens"] == 8192
+    assert summary["usage"][0]["needs_rebuild"] is False
+
+
+@pytest.mark.asyncio
+async def test_debug_provider_revision_reset_can_restore_latest_revision(
+    tmp_path: Path,
+):
+    control = ControlStore(tmp_path / "system.db")
+    seed = ProviderConfig(api_key="secret-value")
+    await control.initialize(seed)
+    await control.ensure_default_library(
+        library_id="default",
+        name="Default",
+        provider_id=seed.id,
+        provider_revision=1,
+    )
+    changed = await control.update_provider(
+        seed.id,
+        {"api_base": "http://127.0.0.1:18001/v1"},
+    )
+    assert changed.revision == 2
+    usage = await control.provider_usage(seed.id)
+    assert usage[0]["needs_rebuild"] is True
+
+    summary = await control.debug_reset_provider_revisions(
+        seed.id,
+        latest_revision=1,
+        delete_revisions_after_latest=True,
+    )
+
+    assert summary["latest_revision"] == 1
+    assert [item["revision"] for item in summary["revisions"]] == [1]
+    assert summary["usage"][0]["provider_revision"] == 1
+    assert summary["usage"][0]["needs_rebuild"] is False
+
+
+@pytest.mark.asyncio
+async def test_provider_id_change_is_blocked_while_library_uses_it(tmp_path: Path):
+    control = ControlStore(tmp_path / "system.db")
+    seed = ProviderConfig(id="seed_provider")
+    await control.initialize(seed)
+    await control.ensure_default_library(
+        library_id="default",
+        name="Default",
+        provider_id=seed.id,
+        provider_revision=1,
+    )
+
+    with pytest.raises(ValueError, match="Provider ID"):
+        await control.update_provider(seed.id, {"id": "seed_locked"})
+
+
+@pytest.mark.asyncio
+async def test_provider_id_can_change_when_unused(tmp_path: Path):
+    control = ControlStore(tmp_path / "system.db")
+    seed = ProviderConfig(id="seed_provider", display_name="Seed Provider")
+    await control.initialize(seed)
+
+    renamed = await control.update_provider(seed.id, {"id": "renamed_provider"})
+
+    assert renamed.provider_id == "renamed_provider"
+    assert renamed.config.id == "renamed_provider"
+    assert renamed.revision == 2
+    assert await control.get_provider(seed.id) is None
+    historical = await control.get_provider("renamed_provider", revision=1)
+    assert historical is not None
+    assert historical.config.id == "renamed_provider"
+    listed = await control.list_providers()
+    assert [item["id"] for item in listed] == ["renamed_provider"]
 
 
 @pytest.mark.asyncio
@@ -240,6 +575,101 @@ async def test_provider_copy_delete_reuses_released_id_and_numbers(tmp_path: Pat
     await control.delete_provider(reused.provider_id)
     await control.delete_provider(second.provider_id)
     await control.delete_provider(third.provider_id)
+
+
+@pytest.mark.asyncio
+async def test_provider_kind_filtering_and_rerank_usage_protection(tmp_path: Path):
+    control = ControlStore(tmp_path / "system.db")
+    seed = ProviderConfig(id="embedding_provider")
+    await control.initialize(seed)
+    rerank = await control.create_provider(
+        {
+            "id": "rerank_provider",
+            "display_name": "Rerank Provider",
+            "type": "vllm_rerank",
+            "enabled": True,
+            "api_base": "http://127.0.0.1:8002",
+            "api_suffix": "/v1/rerank",
+            "model": "BAAI/bge-reranker-v2-m3",
+            "dimensions": 0,
+            "batch_size": 1,
+            "concurrency": 1,
+        }
+    )
+    embedding = await control.get_provider(seed.id)
+    assert embedding is not None
+    await control.create_library(
+        {
+            "id": "rerank_bound",
+            "name": "Rerank Bound",
+            "provider_id": seed.id,
+            "rerank_provider_id": rerank.provider_id,
+        },
+        embedding,
+    )
+
+    assert [item["id"] for item in await control.list_providers("embedding")] == [
+        seed.id
+    ]
+    assert [item["id"] for item in await control.list_providers("rerank")] == [
+        rerank.provider_id
+    ]
+    assert all(
+        item["provider_kind"] == "rerank"
+        for item in control.provider_types("rerank")
+    )
+    usage = await control.provider_usage(rerank.provider_id)
+    assert usage[0]["usage_kind"] == "rerank"
+    with pytest.raises(ValueError, match="Provider ID"):
+        await control.update_provider(rerank.provider_id, {"id": "renamed_rerank"})
+    with pytest.raises(ValueError, match="不能删除"):
+        await control.delete_provider(rerank.provider_id)
+
+
+@pytest.mark.asyncio
+async def test_library_rerank_binding_does_not_queue_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "PersonalityRAG"
+    provider_config = ProviderConfig(dimensions=8)
+    monkeypatch.setattr(
+        "personalityrag.service.build_provider",
+        lambda config: FakeProvider(config),
+    )
+    monkeypatch.setattr(
+        "personalityrag.libraries.build_provider",
+        lambda config: FakeProvider(config),
+    )
+    manager = LibraryManager(root, AppConfig(provider=provider_config))
+    await manager.initialize()
+    try:
+        runtime = await manager.get_runtime("beileite")
+        generation_before = runtime.indexes.status()["generation"]
+        await manager.create_provider(
+            {
+                "id": "local_rerank",
+                "display_name": "Local Rerank",
+                "type": "vllm_rerank",
+                "enabled": True,
+                "api_base": "http://127.0.0.1:8002",
+                "api_suffix": "/v1/rerank",
+                "model": "BAAI/bge-reranker-v2-m3",
+                "dimensions": 0,
+                "batch_size": 1,
+                "concurrency": 1,
+            }
+        )
+        updated = await manager.update_library(
+            "beileite", {"rerank_provider_id": "local_rerank"}
+        )
+        assert updated["rerank_provider_id"] == "local_rerank"
+        assert runtime.indexes.status()["generation"] == generation_before
+        assert runtime.rerank_provider_revision is not None
+        assert runtime.rerank_provider_revision.provider_id == "local_rerank"
+        assert manager.jobs is not None
+        assert await manager.jobs.list(scope="all") == []
+    finally:
+        await manager.close()
 
 
 @pytest.mark.asyncio
@@ -303,6 +733,14 @@ async def test_legacy_data_migrates_to_beileite_and_libraries_are_isolated(
         assert second["indexes"]["generation"] is None
         assert second["indexes"]["document_vectors"] == 0
         assert second["indexes"]["graph_vectors"] == 0
+        assert (
+            second["metadata"]["livingmemory_database_version"]
+            == LIVINGMEMORY_DATABASE_VERSION
+        )
+        assert (
+            second["compatibility"]["livingmemory_database_version"]
+            == LIVINGMEMORY_DATABASE_VERSION
+        )
         second_runtime = await manager.get_runtime(second["id"])
         await second_runtime.create_memory(
             {

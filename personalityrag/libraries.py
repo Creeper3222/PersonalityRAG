@@ -18,17 +18,26 @@ from .config import (
     ProviderConfig,
     RecallConfig,
 )
+from .compat import LIVINGMEMORY_DATABASE_VERSION
 from .control import ControlStore, LibraryRecord, ProviderRevision
 from .jobs import JobManager
 from .logger import logger
 from .migration import sqlite_backup, validate_livingmemory_db_file
-from .providers import build_provider, config_from_dict
+from .providers import (
+    build_provider,
+    build_rerank_provider,
+    config_from_dict,
+    provider_kind,
+)
 from .service import PersonalityRAGService
 from .storage import Storage
 
 
 DEFAULT_LIBRARY_ID = "beileite"
 DEFAULT_LIBRARY_NAME = "贝雷特"
+COMPATIBILITY_PAYLOAD = {
+    "livingmemory_database_version": LIVINGMEMORY_DATABASE_VERSION,
+}
 LEGACY_ITEMS = (
     "livingmemory.db",
     "conversations.db",
@@ -305,6 +314,17 @@ class LibraryManager:
                 raise RuntimeError(
                     f"记忆库 {library_id} 绑定的 Provider revision 不存在"
                 )
+            rerank_provider = None
+            if library.rerank_provider_id:
+                rerank_provider = await self.control.get_provider(
+                    library.rerank_provider_id
+                )
+                if not rerank_provider:
+                    logger.warning(
+                        "记忆库绑定的 Rerank Provider 不存在，将跳过重排：library_id=%s provider=%s",
+                        library_id,
+                        library.rerank_provider_id,
+                    )
             runtime_config = replace(
                 self.config,
                 recall=RecallConfig(
@@ -326,6 +346,7 @@ class LibraryManager:
                 self.data_dir / "libraries" / library_id,
                 library_id=library_id,
                 provider_revision=provider,
+                rerank_provider_revision=rerank_provider,
                 system_path=self.system_path,
             )
             await runtime.initialize()
@@ -342,6 +363,11 @@ class LibraryManager:
         for record in await self.control.list_libraries():
             provider = await self.control.get_provider(
                 record.provider_id, record.provider_revision
+            )
+            rerank_provider = (
+                await self.control.get_provider(record.rerank_provider_id)
+                if record.rerank_provider_id
+                else None
             )
             runtime = self.runtimes.get(record.id)
             if runtime is not None:
@@ -362,6 +388,10 @@ class LibraryManager:
                     "stats": stats,
                     "indexes": indexes,
                     "provider": provider.public() if provider else None,
+                    "rerank_provider": (
+                        rerank_provider.public() if rerank_provider else None
+                    ),
+                    "compatibility": dict(COMPATIBILITY_PAYLOAD),
                 }
             )
         return result
@@ -406,6 +436,11 @@ class LibraryManager:
         provider = await self.control.get_provider(
             record.provider_id, record.provider_revision
         )
+        rerank_provider = (
+            await self.control.get_provider(record.rerank_provider_id)
+            if record.rerank_provider_id
+            else None
+        )
         stats = await runtime.storage.statistics()
         return {
             **record.public(),
@@ -414,15 +449,31 @@ class LibraryManager:
                 stats, runtime.indexes.status()
             ),
             "provider": provider.public() if provider else None,
+            "rerank_provider": rerank_provider.public() if rerank_provider else None,
+            "compatibility": dict(COMPATIBILITY_PAYLOAD),
         }
 
     async def create_library(self, payload: dict[str, Any]) -> dict[str, Any]:
         provider_id = str(payload.get("provider_id") or "").strip()
         provider = await self.control.get_provider(provider_id)
+        if provider and provider_kind(provider.config.type) != "embedding":
+            raise ValueError("记忆库必须绑定 Embedding Provider")
         if not provider:
             raise ValueError("指定的 Provider 不存在")
         if not provider.config.enabled:
             raise ValueError("指定的 Provider 未启用")
+        rerank_provider_id = str(payload.get("rerank_provider_id") or "").strip()
+        if rerank_provider_id:
+            rerank_provider = await self.control.get_provider(rerank_provider_id)
+            if not rerank_provider:
+                raise ValueError("指定的 Rerank Provider 不存在")
+            if provider_kind(rerank_provider.config.type) != "rerank":
+                raise ValueError("Rerank 绑定必须选择 Rerank Provider")
+            if not rerank_provider.config.enabled:
+                raise ValueError("指定的 Rerank Provider 未启用")
+            payload["rerank_provider_id"] = rerank_provider_id
+        else:
+            payload["rerank_provider_id"] = ""
         payload = {
             **payload,
             "recall_settings": payload.get("recall_settings")
@@ -454,12 +505,94 @@ class LibraryManager:
     async def update_library(
         self, library_id: str, payload: dict[str, Any]
     ) -> dict[str, Any]:
-        await self.control.update_library(library_id, payload)
-        if "recall_settings" in payload or "maintenance_settings" in payload:
-            runtime = self.runtimes.pop(library_id, None)
-            if runtime is not None:
-                await runtime.close()
-        return await self.library_detail(library_id)
+        record = await self.control.get_library(library_id)
+        if not record:
+            raise KeyError(library_id)
+        next_library_id = str(payload.get("id", record.id) or "").strip() or record.id
+        rename_requested = next_library_id != record.id
+        requested_provider_id = str(payload.pop("provider_id", "") or "").strip()
+        if requested_provider_id and requested_provider_id != record.provider_id:
+            provider = await self.control.get_provider(requested_provider_id)
+            if not provider:
+                raise ValueError("指定的 Embedding Provider 不存在")
+            if provider_kind(provider.config.type) != "embedding":
+                raise ValueError("记忆库必须绑定 Embedding Provider")
+            if not provider.config.enabled:
+                raise ValueError("指定的 Embedding Provider 未启用")
+        if "rerank_provider_id" in payload:
+            rerank_provider_id = str(payload.get("rerank_provider_id") or "").strip()
+            if rerank_provider_id:
+                rerank_provider = await self.control.get_provider(rerank_provider_id)
+                if not rerank_provider:
+                    raise ValueError("指定的 Rerank Provider 不存在")
+                if provider_kind(rerank_provider.config.type) != "rerank":
+                    raise ValueError("Rerank 绑定必须选择 Rerank Provider")
+                if not rerank_provider.config.enabled:
+                    raise ValueError("指定的 Rerank Provider 未启用")
+                payload["rerank_provider_id"] = rerank_provider_id
+            else:
+                payload["rerank_provider_id"] = ""
+        rerank_changed = (
+            "rerank_provider_id" in payload
+            and str(payload.get("rerank_provider_id") or "")
+            != str(record.rerank_provider_id or "")
+        )
+        settings_changed = (
+            "recall_settings" in payload
+            or "maintenance_settings" in payload
+        )
+        reload_runtime = (
+            rename_requested
+            or settings_changed
+        )
+        if rename_requested:
+            if record.is_default:
+                raise ValueError("默认记忆库 ID 不能修改")
+            if await self.control.has_running_jobs(record.id):
+                raise ValueError("记忆库存在进行中的任务，暂时不能修改 ID")
+            if await self._library_copy_target_reserved(next_library_id):
+                raise ValueError(f"记忆库 ID 已存在：{next_library_id}")
+        runtime = self.runtimes.pop(record.id, None) if reload_runtime else None
+        if runtime is not None:
+            await runtime.close()
+        if rename_requested:
+            source_dir = self.data_dir / "libraries" / record.id
+            target_dir = self.data_dir / "libraries" / next_library_id
+            if not source_dir.exists():
+                raise ValueError(f"记忆库目录不存在，无法修改 ID：{source_dir}")
+            moved = False
+            try:
+                source_dir.replace(target_dir)
+                moved = True
+                self._rewrite_library_manifests(target_dir, next_library_id)
+                await self.control.update_library(record.id, payload)
+            except Exception:
+                if moved and target_dir.exists():
+                    try:
+                        self._rewrite_library_manifests(target_dir, record.id)
+                    except Exception:
+                        logger.exception(
+                            "记忆库改名回滚时重写 manifest 失败：source=%s target=%s",
+                            record.id,
+                            next_library_id,
+                        )
+                    if not source_dir.exists():
+                        target_dir.replace(source_dir)
+                raise
+        else:
+            await self.control.update_library(record.id, payload)
+            if rerank_changed and not reload_runtime:
+                runtime = self.runtimes.get(record.id)
+                if runtime is not None:
+                    provider = (
+                        await self.control.get_provider(
+                            str(payload.get("rerank_provider_id") or "")
+                        )
+                        if payload.get("rerank_provider_id")
+                        else None
+                    )
+                    await runtime.set_rerank_provider(provider)
+        return await self.library_detail(next_library_id)
 
     async def set_default(self, library_id: str) -> dict[str, Any]:
         await self.control.set_default_library(library_id)
@@ -499,7 +632,7 @@ class LibraryManager:
             await asyncio.to_thread(self._copy_library_directory, source_dir, tmp_dir)
             if progress:
                 await progress(0.72, "正在重写副本索引 manifest")
-            self._rewrite_copied_manifests(tmp_dir, target_id)
+            self._rewrite_library_manifests(tmp_dir, target_id)
             if progress:
                 await progress(0.82, "正在提交副本目录")
             tmp_dir.replace(target_dir)
@@ -511,8 +644,10 @@ class LibraryManager:
                     "name": target_name,
                     "description": source.description,
                     "default_persona_id": source.default_persona_id,
+                    "rerank_provider_id": source.rerank_provider_id,
                     "recall_settings": source.recall_settings,
                     "maintenance_settings": source.maintenance_settings,
+                    "metadata": source.metadata,
                 },
                 provider,
             )
@@ -536,6 +671,7 @@ class LibraryManager:
                 "stats": await Storage(target_dir, system_path=self.system_path).statistics(),
                 "indexes": self._offline_index_status(target_dir, record),
                 "provider": provider.public(),
+                "compatibility": dict(COMPATIBILITY_PAYLOAD),
             }
         except Exception:
             logger.exception("复制记忆库失败，正在清理副本：source=%s target=%s", source.id, target_id)
@@ -592,7 +728,7 @@ class LibraryManager:
             tmp_db.replace(target_db)
 
     @staticmethod
-    def _rewrite_copied_manifests(library_dir: Path, library_id: str) -> None:
+    def _rewrite_library_manifests(library_dir: Path, library_id: str) -> None:
         index_root = library_dir / "indexes"
         if not index_root.exists():
             return
@@ -641,7 +777,7 @@ class LibraryManager:
             source_db,
         )
         if progress:
-            await progress(0.05, "已验证 LivingMemory 核心数据库")
+            await progress(0.02, "已验证 LivingMemory 核心数据库")
         runtime = await self.get_runtime(library_id)
         if not await self.library_is_empty(library_id):
             raise ValueError("只有全新空记忆库可以导入 livingmemory.db")
@@ -664,7 +800,7 @@ class LibraryManager:
         )
         try:
             if progress:
-                await progress(0.12, "正在归档上传的 livingmemory.db")
+                await progress(0.04, "正在归档上传的 livingmemory.db")
             await asyncio.to_thread(
                 sqlite_backup,
                 source_db,
@@ -673,7 +809,7 @@ class LibraryManager:
             if target_db.exists():
                 await asyncio.to_thread(sqlite_backup, target_db, rollback_db)
             if progress:
-                await progress(0.22, "正在替换目标空库核心数据库")
+                await progress(0.06, "正在替换目标空库核心数据库")
             await runtime.close()
             self.runtimes.pop(library_id, None)
             for suffix in ("-wal", "-shm"):
@@ -683,18 +819,26 @@ class LibraryManager:
             await asyncio.to_thread(sqlite_backup, source_db, tmp_db)
             tmp_db.replace(target_db)
             if progress:
-                await progress(0.35, "正在初始化兼容表与 FTS")
+                await progress(0.08, "正在初始化兼容表与 FTS")
             runtime = await self.get_runtime(library_id)
             await runtime.storage.initialize()
             runtime.text = runtime.text.__class__(runtime.data_dir / "stopwords")
             runtime.retrieval.text = runtime.text
             if progress:
-                await progress(0.42, "正在重建导入库索引")
+                await progress(0.10, "正在重建导入库索引")
             async def rebuild_progress(value: float, message: str) -> None:
                 if progress:
-                    await progress(0.42 + max(0.0, min(1.0, value)) * 0.56, message)
+                    await progress(0.10 + max(0.0, min(1.0, value)) * 0.89, message)
 
             rebuild = await self.rebuild_library(library_id, None, rebuild_progress)
+            await self.control.update_library_metadata(
+                library_id,
+                {
+                    "livingmemory_database_version": source_report.get(
+                        "db_version"
+                    )
+                },
+            )
             stats = await runtime.storage.statistics()
             report = {
                 "run_id": run_id,
@@ -818,6 +962,8 @@ class LibraryManager:
         provider = await self.control.get_provider(
             provider_id or record.provider_id
         )
+        if provider and provider_kind(provider.config.type) != "embedding":
+            raise ValueError("索引重建必须使用 Embedding Provider")
         if not provider:
             raise ValueError("Provider 不存在")
         if not provider.config.enabled:
@@ -842,12 +988,132 @@ class LibraryManager:
         return result
 
     async def create_provider(self, payload: dict[str, Any]) -> dict[str, Any]:
+        payload = await self._with_context_length_metadata(payload, force=True)
         return (await self.control.create_provider(payload)).public()
 
     async def update_provider(
         self, provider_id: str, payload: dict[str, Any]
     ) -> dict[str, Any]:
-        return (await self.control.update_provider(provider_id, payload)).public()
+        current = await self.control.get_provider(provider_id)
+        if current:
+            payload = await self._with_context_length_metadata(
+                payload,
+                current=current,
+                force=False,
+            )
+        record = await self.control.update_provider(provider_id, payload)
+        if provider_kind(record.config.type) == "rerank":
+            for usage in await self.control.provider_usage(record.provider_id):
+                if usage.get("usage_kind") != "rerank":
+                    continue
+                runtime = self.runtimes.get(str(usage.get("library_id") or ""))
+                if runtime is not None:
+                    await runtime.set_rerank_provider(record)
+        return record.public()
+
+    async def _with_context_length_metadata(
+        self,
+        payload: dict[str, Any],
+        *,
+        current: ProviderRevision | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        draft = dict(payload)
+        base = current.config if current else None
+        clear_api_key = bool(draft.get("clear_api_key", False))
+        config = config_from_dict(
+            draft,
+            base=base,
+            keep_secret=bool(base) and not clear_api_key,
+        )
+        if provider_kind(config.type) != "embedding":
+            draft["max_context_tokens"] = 0
+            draft["max_context_tokens_source"] = ""
+            return draft
+        changed = (
+            force
+            or not base
+            or config.type != base.type
+            or config.api_base != base.api_base
+            or config.model != base.model
+        )
+        if changed:
+            detected = await self._detect_context_length(config)
+            if detected.get("max_context_tokens"):
+                draft["max_context_tokens"] = int(detected["max_context_tokens"])
+                draft["max_context_tokens_source"] = str(
+                    detected.get("max_context_tokens_source") or ""
+                )
+                return draft
+            source = str(
+                draft.get("max_context_tokens_source")
+                or config.max_context_tokens_source
+                or ""
+            )
+            if source.startswith("auto:"):
+                draft["max_context_tokens"] = 0
+                draft["max_context_tokens_source"] = ""
+            elif int(draft.get("max_context_tokens") or config.max_context_tokens or 0) > 0:
+                draft["max_context_tokens"] = int(
+                    draft.get("max_context_tokens") or config.max_context_tokens
+                )
+                draft["max_context_tokens_source"] = "manual"
+            else:
+                draft["max_context_tokens"] = 0
+                draft["max_context_tokens_source"] = ""
+            return draft
+        if int(config.max_context_tokens or 0) > 0 and not str(
+            config.max_context_tokens_source or ""
+        ).startswith("auto:"):
+            draft["max_context_tokens_source"] = "manual"
+        elif int(config.max_context_tokens or 0) <= 0:
+            draft["max_context_tokens_source"] = ""
+        return draft
+
+    async def _detect_context_length(self, config: ProviderConfig) -> dict[str, Any]:
+        provider = build_provider(
+            replace(config, max_context_tokens=0, max_context_tokens_source="")
+        )
+        try:
+            result = await provider.detect_context_length()
+            if result.get("max_context_tokens"):
+                logger.info(
+                    "模型上下文长度检测成功：provider=%s model=%s tokens=%s source=%s",
+                    config.id,
+                    config.model,
+                    result.get("max_context_tokens"),
+                    result.get("max_context_tokens_source") or "",
+                )
+            return result
+        except Exception as exc:
+            logger.info(
+                "模型上下文长度检测跳过：provider=%s model=%s err=%s",
+                config.id,
+                config.model,
+                exc,
+            )
+            return {"max_context_tokens": 0, "max_context_tokens_source": ""}
+        finally:
+            await provider.close()
+
+    async def detect_context_length(
+        self,
+        payload: dict[str, Any],
+        provider_id: str | None = None,
+    ) -> dict[str, Any]:
+        draft = dict(payload)
+        draft["max_context_tokens"] = 0
+        draft["max_context_tokens_source"] = ""
+        current = await self.control.get_provider(provider_id) if provider_id else None
+        clear_api_key = bool(draft.get("clear_api_key", False))
+        config = config_from_dict(
+            draft,
+            base=current.config if current else None,
+            keep_secret=bool(current) and not clear_api_key,
+        )
+        if provider_kind(config.type) != "embedding":
+            raise ValueError("Rerank Provider does not support max context length detection")
+        return await self._detect_context_length(config)
 
     async def copy_provider(
         self, provider_id: str, new_id: str | None
@@ -864,7 +1130,11 @@ class LibraryManager:
         if not record:
             raise KeyError(provider_id)
         logger.info("创建临时 Provider 客户端用于测试：provider=%s revision=%s", provider_id, revision or record.revision)
-        provider = build_provider(record.config)
+        provider = (
+            build_rerank_provider(record.config)
+            if provider_kind(record.config.type) == "rerank"
+            else build_provider(record.config)
+        )
         try:
             return await provider.test_connection()
         finally:
@@ -874,7 +1144,12 @@ class LibraryManager:
         self, payload: dict[str, Any]
     ) -> dict[str, Any]:
         logger.info("创建临时草稿 Provider 客户端用于测试：provider=%s type=%s", payload.get("id"), payload.get("type"))
-        provider = build_provider(config_from_dict(payload))
+        config = config_from_dict(payload)
+        provider = (
+            build_rerank_provider(config)
+            if provider_kind(config.type) == "rerank"
+            else build_provider(config)
+        )
         try:
             return await provider.test_connection()
         finally:
@@ -883,7 +1158,10 @@ class LibraryManager:
     async def detect_dimension(self, payload: dict[str, Any]) -> dict[str, Any]:
         draft = dict(payload)
         draft["dimensions"] = 0
-        provider = build_provider(config_from_dict(draft))
+        config = config_from_dict(draft)
+        if provider_kind(config.type) != "embedding":
+            raise ValueError("Rerank Provider 不支持维度检测")
+        provider = build_provider(config)
         try:
             vector = await provider.get_embedding("PersonalityRAG 维度检测")
             return {"dimensions": len(vector)}

@@ -254,6 +254,357 @@ class Storage:
         finally:
             await db.close()
 
+    @staticmethod
+    def _conversation_message_row(row: aiosqlite.Row) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "session_id": row["session_id"],
+            "role": row["role"],
+            "content": row["content"],
+            "sender_id": row["sender_id"],
+            "sender_name": row["sender_name"],
+            "group_id": row["group_id"],
+            "platform": row["platform"],
+            "timestamp": float(row["timestamp"]),
+            "metadata": normalize_metadata(row["metadata"]),
+        }
+
+    @staticmethod
+    def _conversation_session_row(row: aiosqlite.Row) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "session_id": row["session_id"],
+            "platform": row["platform"],
+            "created_at": float(row["created_at"]),
+            "last_active_at": float(row["last_active_at"]),
+            "message_count": int(row["message_count"] or 0),
+            "participants": json.loads(row["participants"] or "[]"),
+            "metadata": normalize_metadata(row["metadata"]),
+        }
+
+    async def add_conversation_message(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raw_timestamp = payload.get("timestamp")
+        timestamp = float(time.time() if raw_timestamp is None else raw_timestamp)
+        session_id = str(payload["session_id"])
+        role = str(payload["role"])
+        content = str(payload.get("content") or "")
+        platform = str(payload.get("platform") or "astrbot")
+        sender_id = payload.get("sender_id") or session_id
+        sender_id = str(sender_id) if sender_id is not None else ""
+        sender_name = payload.get("sender_name")
+        group_id = payload.get("group_id")
+        metadata = dict(payload.get("metadata") or {})
+        dedup_key = payload.get("dedup_key")
+        if dedup_key:
+            metadata.setdefault("dedup_key", str(dedup_key))
+
+        async with self._write_lock:
+            db = await aiosqlite.connect(self.conversations_path)
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA busy_timeout=10000")
+            try:
+                if dedup_key:
+                    existing = await (
+                        await db.execute(
+                            """
+                            SELECT id, session_id, role, content, sender_id, sender_name,
+                                   group_id, platform, timestamp, metadata
+                            FROM messages
+                            WHERE json_extract(metadata,'$.dedup_key')=?
+                            LIMIT 1
+                            """,
+                            (str(dedup_key),),
+                        )
+                    ).fetchone()
+                    if existing:
+                        session = await self._get_conversation_session(db, session_id)
+                        return {
+                            "message": self._conversation_message_row(existing),
+                            "session": session,
+                            "duplicate": True,
+                        }
+
+                await db.execute(
+                    """
+                    INSERT INTO sessions (
+                        session_id, platform, created_at, last_active_at,
+                        message_count, participants, metadata
+                    )
+                    VALUES (?, ?, ?, ?, 0, '[]', '{}')
+                    ON CONFLICT(session_id) DO NOTHING
+                    """,
+                    (session_id, platform, timestamp, timestamp),
+                )
+                cursor = await db.execute(
+                    """
+                    INSERT INTO messages (
+                        session_id, role, content, sender_id, sender_name,
+                        group_id, platform, timestamp, metadata
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        role,
+                        content,
+                        sender_id,
+                        sender_name,
+                        group_id,
+                        platform,
+                        timestamp,
+                        json.dumps(metadata, ensure_ascii=False),
+                    ),
+                )
+                message_id = int(cursor.lastrowid or 0)
+                await db.execute(
+                    """
+                    UPDATE sessions
+                    SET message_count = (
+                            SELECT COUNT(*) FROM messages WHERE session_id = ?
+                        ),
+                        last_active_at = ?,
+                        participants = CASE
+                            WHEN ? = '' THEN participants
+                            WHEN EXISTS (
+                                SELECT 1
+                                FROM json_each(COALESCE(NULLIF(participants, ''), '[]'))
+                                WHERE value = ?
+                            ) THEN participants
+                            ELSE json_insert(
+                                COALESCE(NULLIF(participants, ''), '[]'),
+                                '$[#]',
+                                ?
+                            )
+                        END
+                    WHERE session_id = ?
+                    """,
+                    (session_id, timestamp, sender_id, sender_id, sender_id, session_id),
+                )
+                await db.commit()
+                row = await (
+                    await db.execute(
+                        """
+                        SELECT id, session_id, role, content, sender_id, sender_name,
+                               group_id, platform, timestamp, metadata
+                        FROM messages WHERE id=?
+                        """,
+                        (message_id,),
+                    )
+                ).fetchone()
+                session = await self._get_conversation_session(db, session_id)
+                return {
+                    "message": self._conversation_message_row(row),
+                    "session": session,
+                    "duplicate": False,
+                }
+            finally:
+                await db.close()
+
+    async def _get_conversation_session(
+        self, db: aiosqlite.Connection, session_id: str
+    ) -> dict[str, Any] | None:
+        row = await (
+            await db.execute(
+                """
+                SELECT id, session_id, platform, created_at, last_active_at,
+                       message_count, participants, metadata
+                FROM sessions WHERE session_id=?
+                """,
+                (session_id,),
+            )
+        ).fetchone()
+        return self._conversation_session_row(row) if row else None
+
+    async def get_conversation(
+        self, session_id: str, *, limit: int = 50
+    ) -> dict[str, Any] | None:
+        db = await aiosqlite.connect(self.conversations_path)
+        db.row_factory = aiosqlite.Row
+        try:
+            session = await self._get_conversation_session(db, session_id)
+            if not session:
+                return None
+            messages = await self.get_conversation_messages(session_id, limit=limit)
+            return {"session": session, "messages": messages}
+        finally:
+            await db.close()
+
+    async def get_conversation_messages(
+        self,
+        session_id: str,
+        *,
+        start_index: int | None = None,
+        end_index: int | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        db = await aiosqlite.connect(self.conversations_path)
+        db.row_factory = aiosqlite.Row
+        try:
+            base = """
+                SELECT id, session_id, role, content, sender_id, sender_name,
+                       group_id, platform, timestamp, metadata
+                FROM messages
+                WHERE session_id = ?
+                ORDER BY timestamp ASC, id ASC
+            """
+            if start_index is not None or end_index is not None:
+                start = max(0, int(start_index or 0))
+                if end_index is None:
+                    count = max(0, int(limit or 50))
+                else:
+                    count = max(0, int(end_index) - start)
+                rows = await (
+                    await db.execute(base + " LIMIT ? OFFSET ?", (session_id, count, start))
+                ).fetchall()
+            elif limit is not None:
+                count = max(0, int(limit))
+                rows = await (
+                    await db.execute(
+                        """
+                        SELECT * FROM (
+                            SELECT id, session_id, role, content, sender_id, sender_name,
+                                   group_id, platform, timestamp, metadata
+                            FROM messages
+                            WHERE session_id = ?
+                            ORDER BY timestamp DESC, id DESC
+                            LIMIT ?
+                        ) ORDER BY timestamp ASC, id ASC
+                        """,
+                        (session_id, count),
+                    )
+                ).fetchall()
+            else:
+                rows = await (await db.execute(base, (session_id,))).fetchall()
+            return [self._conversation_message_row(row) for row in rows]
+        finally:
+            await db.close()
+
+    async def update_conversation_metadata(
+        self, session_id: str, patch: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        async with self._write_lock:
+            db = await aiosqlite.connect(self.conversations_path)
+            db.row_factory = aiosqlite.Row
+            try:
+                session = await self._get_conversation_session(db, session_id)
+                if not session:
+                    return None
+                metadata = dict(session.get("metadata") or {})
+                for key, value in patch.items():
+                    if value is None:
+                        metadata.pop(key, None)
+                    else:
+                        metadata[key] = value
+                await db.execute(
+                    "UPDATE sessions SET metadata=? WHERE session_id=?",
+                    (json.dumps(metadata, ensure_ascii=False), session_id),
+                )
+                await db.commit()
+                return await self._get_conversation_session(db, session_id)
+            finally:
+                await db.close()
+
+    async def clear_conversation(self, session_id: str) -> dict[str, Any]:
+        async with self._write_lock:
+            db = await aiosqlite.connect(self.conversations_path)
+            db.row_factory = aiosqlite.Row
+            try:
+                cursor = await db.execute(
+                    "DELETE FROM messages WHERE session_id=?", (session_id,)
+                )
+                deleted = max(0, cursor.rowcount)
+                await db.execute(
+                    """
+                    UPDATE sessions
+                    SET message_count=0, participants='[]', metadata='{}'
+                    WHERE session_id=?
+                    """,
+                    (session_id,),
+                )
+                await db.commit()
+                return {
+                    "deleted": deleted,
+                    "session": await self._get_conversation_session(db, session_id),
+                }
+            finally:
+                await db.close()
+
+    async def trim_conversation(self, session_id: str, delete_count: int) -> dict[str, Any]:
+        delete_count = max(0, int(delete_count))
+        if delete_count <= 0:
+            return {"deleted": 0, "session": await self.get_conversation(session_id)}
+        async with self._write_lock:
+            db = await aiosqlite.connect(self.conversations_path)
+            db.row_factory = aiosqlite.Row
+            try:
+                session = await self._get_conversation_session(db, session_id)
+                if not session:
+                    return {"deleted": 0, "session": None}
+                metadata = dict(session.get("metadata") or {})
+                try:
+                    last_summarized_index = int(
+                        metadata.get("last_summarized_index", 0) or 0
+                    )
+                except (TypeError, ValueError):
+                    last_summarized_index = 0
+                actual_count = int(
+                    (
+                        await (
+                            await db.execute(
+                                "SELECT COUNT(*) AS value FROM messages WHERE session_id=?",
+                                (session_id,),
+                            )
+                        ).fetchone()
+                    )["value"]
+                    or 0
+                )
+                if last_summarized_index > actual_count:
+                    metadata["last_summarized_index"] = 0
+                    await db.execute(
+                        "UPDATE sessions SET message_count=?, metadata=? WHERE session_id=?",
+                        (
+                            actual_count,
+                            json.dumps(metadata, ensure_ascii=False),
+                            session_id,
+                        ),
+                    )
+                    await db.commit()
+                    return {"deleted": 0, "session": await self._get_conversation_session(db, session_id)}
+                safe_count = min(delete_count, max(0, last_summarized_index))
+                if safe_count <= 0:
+                    return {"deleted": 0, "session": session}
+                cursor = await db.execute(
+                    """
+                    DELETE FROM messages
+                    WHERE id IN (
+                        SELECT id FROM messages
+                        WHERE session_id=?
+                        ORDER BY timestamp ASC, id ASC
+                        LIMIT ?
+                    )
+                    """,
+                    (session_id, safe_count),
+                )
+                deleted = max(0, cursor.rowcount)
+                metadata["last_summarized_index"] = max(
+                    0, last_summarized_index - deleted
+                )
+                await db.execute(
+                    "UPDATE sessions SET message_count=?, metadata=? WHERE session_id=?",
+                    (
+                        max(0, actual_count - deleted),
+                        json.dumps(metadata, ensure_ascii=False),
+                        session_id,
+                    ),
+                )
+                await db.commit()
+                return {
+                    "deleted": deleted,
+                    "session": await self._get_conversation_session(db, session_id),
+                }
+            finally:
+                await db.close()
+
     async def rebuild_fts(self, tokenize) -> dict[str, int]:
         async with self._write_lock, self.connect() as db:
             await db.execute("DELETE FROM livingmemory_memories_fts")
@@ -337,6 +688,7 @@ class Storage:
             "created_desc": "COALESCE(json_extract(metadata,'$.create_time'),0) DESC,id DESC",
             "created_asc": "COALESCE(json_extract(metadata,'$.create_time'),0) ASC,id ASC",
             "updated_desc": "COALESCE(json_extract(metadata,'$.updated_at'),json_extract(metadata,'$.create_time'),0) DESC,id DESC",
+            "type_asc": "COALESCE(json_extract(metadata,'$.memory_type'),'GENERAL') ASC,id DESC",
             "importance_desc": "COALESCE(json_extract(metadata,'$.importance'),0.5) DESC,id DESC",
             "importance_asc": "COALESCE(json_extract(metadata,'$.importance'),0.5) ASC,id ASC",
             "id_desc": "id DESC",
@@ -795,7 +1147,7 @@ class Storage:
                     "SELECT atom_type,COUNT(*) AS value FROM memory_atoms GROUP BY atom_type"
                 )
             ).fetchall()
-        conversation = {"sessions": 0, "messages": 0}
+        conversation = {"sessions": 0, "messages": 0, "pending_messages": 0}
         if self.conversations_path.exists():
             db = await aiosqlite.connect(self.conversations_path)
             db.row_factory = aiosqlite.Row
@@ -805,6 +1157,21 @@ class Storage:
                         await db.execute(f"SELECT COUNT(*) AS value FROM {table}")
                     ).fetchone()
                     conversation[key] = int(row["value"])
+                session_rows = await (
+                    await db.execute("SELECT message_count, metadata FROM sessions")
+                ).fetchall()
+                pending_messages = 0
+                for row in session_rows:
+                    metadata = normalize_metadata(row["metadata"])
+                    message_count = int(row["message_count"] or 0)
+                    try:
+                        last_summarized_index = int(
+                            metadata.get("last_summarized_index") or 0
+                        )
+                    except (TypeError, ValueError):
+                        last_summarized_index = 0
+                    pending_messages += max(0, message_count - last_summarized_index)
+                conversation["pending_messages"] = pending_messages
             finally:
                 await db.close()
         return {

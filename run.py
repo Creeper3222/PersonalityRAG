@@ -4,11 +4,12 @@ import os
 import socket
 import sys
 import webbrowser
+import asyncio
 from pathlib import Path
 
 import uvicorn
 
-from personalityrag.config import load_config
+from personalityrag.config import build_access_url, load_config
 from personalityrag.instance_lock import InstanceLock, SingleInstanceError
 
 
@@ -26,22 +27,81 @@ def port_available(host: str, port: int) -> bool:
     return True
 
 
-def resolve_port(host: str, preferred_port: int, scan_limit: int = 80) -> tuple[int, str]:
-    if port_available(host, preferred_port):
+def resolve_port(
+    host: str,
+    preferred_port: int,
+    scan_limit: int = 80,
+    *,
+    exclude_ports: set[int] | None = None,
+    label: str = "配置端口",
+) -> tuple[int, str]:
+    exclude_ports = exclude_ports or set()
+    if preferred_port not in exclude_ports and port_available(host, preferred_port):
         return preferred_port, ""
     for port in range(preferred_port + 1, preferred_port + scan_limit + 1):
+        if port in exclude_ports:
+            continue
         if port_available(host, port):
             return port, (
-                f"配置端口 {host}:{preferred_port} 已被占用，"
+                f"{label} {host}:{preferred_port} 已被占用或已被本进程其它服务使用，"
                 f"本次启动自动回退到 {host}:{port}；配置文件不会被改写。"
             )
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind((host, 0))
         fallback = int(sock.getsockname()[1])
     return fallback, (
-        f"配置端口 {host}:{preferred_port} 及后续 {scan_limit} 个端口均不可用，"
+        f"{label} {host}:{preferred_port} 及后续 {scan_limit} 个端口均不可用，"
         f"本次启动自动回退到系统分配端口 {host}:{fallback}；配置文件不会被改写。"
     )
+
+
+async def serve_dual_ports(host: str, webui_port: int, access_port: int) -> None:
+    import personalityrag.app as app_module
+
+    webui_server = uvicorn.Server(
+        uvicorn.Config(
+            "personalityrag.app:app",
+            host=host,
+            port=webui_port,
+            reload=False,
+            log_level="info",
+        )
+    )
+    access_server = uvicorn.Server(
+        uvicorn.Config(
+            "personalityrag.app:app",
+            host=host,
+            port=access_port,
+            reload=False,
+            log_level="info",
+            lifespan="off",
+        )
+    )
+    def request_shutdown() -> None:
+        webui_server.should_exit = True
+        access_server.should_exit = True
+
+    app_module.set_process_shutdown_callback(request_shutdown)
+    webui_task = asyncio.create_task(webui_server.serve())
+    try:
+        for _ in range(200):
+            if webui_server.started or webui_task.done():
+                break
+            await asyncio.sleep(0.05)
+        if webui_task.done():
+            webui_task.result()
+        access_task = asyncio.create_task(access_server.serve())
+        done, pending = await asyncio.wait(
+            {webui_task, access_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            task.result()
+    finally:
+        app_module.set_process_shutdown_callback(None)
 
 
 if __name__ == "__main__":
@@ -53,15 +113,31 @@ if __name__ == "__main__":
         raise SystemExit(3) from exc
 
     try:
-        actual_port, fallback_warning = resolve_port(config.host, config.port)
+        actual_port, webui_warning = resolve_port(
+            config.host,
+            config.port,
+            label="WebUI 配置端口",
+        )
+        actual_access_port, access_warning = resolve_port(
+            config.host,
+            config.access_port,
+            exclude_ports={actual_port},
+            label="记忆库接入配置端口",
+        )
         os.environ["PERSONALITYRAG_ACTUAL_PORT"] = str(actual_port)
-        if fallback_warning:
-            os.environ["PERSONALITYRAG_PORT_FALLBACK_WARNING"] = fallback_warning
-            print(f"[PersonalityRAG] WARNING: {fallback_warning}")
+        os.environ["PERSONALITYRAG_ACCESS_ACTUAL_PORT"] = str(actual_access_port)
+        if webui_warning:
+            os.environ["PERSONALITYRAG_WEBUI_PORT_FALLBACK_WARNING"] = webui_warning
+            print(f"[PersonalityRAG] WARNING: {webui_warning}")
+        if access_warning:
+            os.environ["PERSONALITYRAG_ACCESS_PORT_FALLBACK_WARNING"] = access_warning
+            print(f"[PersonalityRAG] WARNING: {access_warning}")
 
-        url = f"http://{config.host}:{actual_port}/"
+        url = build_access_url(config.access_base_url, actual_port)
+        api_url = build_access_url(config.access_base_url, actual_access_port)
         print("[PersonalityRAG] v0.1.0")
         print(f"[PersonalityRAG] WebUI: {url}")
+        print(f"[PersonalityRAG] 记忆库接入: {api_url}")
         if config.webui_password_hash:
             print("[PersonalityRAG] WebUI 登录：使用已设置的登录密码。")
             print("[PersonalityRAG] API key：仍可作为 Bearer Token 用于脚本/API 访问。")
@@ -71,13 +147,8 @@ if __name__ == "__main__":
                 + config.api_key
                 + "（首次登录使用；请妥善保存）"
             )
-        webbrowser.open(url)
-        uvicorn.run(
-            "personalityrag.app:app",
-            host=config.host,
-            port=actual_port,
-            reload=False,
-            log_level="info",
-        )
+        if os.environ.get("PERSONALITYRAG_SUPPRESS_BROWSER") != "1":
+            webbrowser.open(url)
+        asyncio.run(serve_dual_ports(config.host, actual_port, actual_access_port))
     finally:
         lock.release()

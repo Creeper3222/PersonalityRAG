@@ -15,6 +15,9 @@ from .storage import Storage, normalize_metadata
 from .text import TextProcessor
 
 
+_GRAPH_NODE_TOKEN_QUERY_BATCH_SIZE = 200
+
+
 @dataclass(slots=True)
 class SearchResult:
     doc_id: int
@@ -332,7 +335,13 @@ class RetrievalEngine:
         session_id: str | None,
         persona_id: str | None,
     ) -> list[tuple[int, float]]:
-        tokens = self.text.tokenize(query)
+        tokens = list(
+            dict.fromkeys(
+                token.strip()
+                for token in self.text.tokenize(query)
+                if str(token).strip()
+            )
+        )
         if not tokens:
             return []
         fts = " OR ".join(
@@ -373,17 +382,31 @@ class RetrievalEngine:
                     candidates[memory_id] = max(
                         candidates.get(memory_id, 0), score
                     )
-            like = [f"%{token}%" for token in tokens[:12]]
-            if like:
-                clauses = " OR ".join(
-                    ["canonical_value LIKE ?" for _ in like]
-                )
+            rows_by_id: dict[int, Any] = {}
+            node_limit = max(k * 3, 20)
+            for start in range(0, len(tokens), _GRAPH_NODE_TOKEN_QUERY_BATCH_SIZE):
+                batch = tokens[start : start + _GRAPH_NODE_TOKEN_QUERY_BATCH_SIZE]
+                like = [f"%{token}%" for token in batch]
+                if not like:
+                    continue
+                clauses = " OR ".join(["canonical_value LIKE ?" for _ in like])
                 node_rows = await (
                     await db.execute(
-                        f"SELECT id FROM graph_nodes WHERE {clauses} LIMIT ?",
-                        (*like, max(k * 3, 20)),
+                        f"""SELECT id,canonical_value FROM graph_nodes
+                        WHERE {clauses}
+                        ORDER BY length(canonical_value),id LIMIT ?""",
+                        (*like, node_limit),
                     )
                 ).fetchall()
+                for row in node_rows:
+                    rows_by_id.setdefault(int(row["id"]), row)
+                if len(rows_by_id) >= node_limit:
+                    break
+            if rows_by_id:
+                node_rows = sorted(
+                    rows_by_id.values(),
+                    key=lambda row: (len(str(row["canonical_value"] or "")), int(row["id"])),
+                )[:node_limit]
                 node_ids = [int(row["id"]) for row in node_rows]
                 if node_ids:
                     placeholders = ",".join("?" for _ in node_ids)
@@ -599,4 +622,3 @@ class RetrievalEngine:
                     best_index = index
             selected.append(candidates.pop(best_index))
         return selected
-

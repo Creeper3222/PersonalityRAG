@@ -6,7 +6,7 @@ import ipaddress
 import json
 import math
 from abc import ABC, abstractmethod
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 from urllib.parse import urlparse
 
@@ -24,6 +24,8 @@ PROVIDER_TEMPLATES: dict[str, dict[str, Any]] = {
         "api_key": "",
         "model": "text-embedding-3-small",
         "dimensions": 1536,
+        "max_context_tokens": 0,
+        "max_context_tokens_source": "",
         "timeout_seconds": 30,
         "proxy": "",
         "batch_size": 64,
@@ -37,6 +39,8 @@ PROVIDER_TEMPLATES: dict[str, dict[str, Any]] = {
         "api_key": "",
         "model": "nomic-embed-text",
         "dimensions": 768,
+        "max_context_tokens": 0,
+        "max_context_tokens_source": "",
         "timeout_seconds": 60,
         "proxy": "",
         "batch_size": 32,
@@ -50,13 +54,106 @@ PROVIDER_TEMPLATES: dict[str, dict[str, Any]] = {
         "api_key": "",
         "model": "BAAI/bge-m3",
         "dimensions": 1024,
+        "max_context_tokens": 0,
+        "max_context_tokens_source": "",
         "timeout_seconds": 30,
         "proxy": "",
         "batch_size": 64,
         "concurrency": 2,
         "max_retries": 5,
     },
+    "vllm_rerank": {
+        "type": "vllm_rerank",
+        "display_name": "vLLM Rerank",
+        "api_base": "http://127.0.0.1:8002",
+        "api_key": "",
+        "model": "BAAI/bge-reranker-v2-m3",
+        "dimensions": 0,
+        "max_context_tokens": 0,
+        "max_context_tokens_source": "",
+        "timeout_seconds": 30,
+        "proxy": "",
+        "batch_size": 1,
+        "concurrency": 1,
+        "max_retries": 3,
+        "api_suffix": "/v1/rerank",
+    },
+    "xinference_rerank": {
+        "type": "xinference_rerank",
+        "display_name": "Xinference Rerank",
+        "api_base": "http://127.0.0.1:9997",
+        "api_key": "",
+        "model": "BAAI/bge-reranker-base",
+        "dimensions": 0,
+        "max_context_tokens": 0,
+        "max_context_tokens_source": "",
+        "timeout_seconds": 30,
+        "proxy": "",
+        "batch_size": 1,
+        "concurrency": 1,
+        "max_retries": 3,
+        "api_suffix": "/v1/rerank",
+        "launch_model_if_not_running": False,
+    },
+    "bailian_rerank": {
+        "type": "bailian_rerank",
+        "display_name": "阿里云百炼重排序",
+        "api_base": "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank",
+        "api_key": "",
+        "model": "qwen3-rerank",
+        "dimensions": 0,
+        "max_context_tokens": 0,
+        "max_context_tokens_source": "",
+        "timeout_seconds": 30,
+        "proxy": "",
+        "batch_size": 1,
+        "concurrency": 1,
+        "max_retries": 3,
+        "return_documents": False,
+        "instruct": "",
+    },
+    "nvidia_rerank": {
+        "type": "nvidia_rerank",
+        "display_name": "NVIDIA Rerank",
+        "api_base": "https://ai.api.nvidia.com/v1/retrieval",
+        "api_key": "",
+        "model": "nv-rerank-qa-mistral-4b:1",
+        "dimensions": 0,
+        "max_context_tokens": 0,
+        "max_context_tokens_source": "",
+        "timeout_seconds": 30,
+        "proxy": "",
+        "batch_size": 1,
+        "concurrency": 1,
+        "max_retries": 3,
+        "model_endpoint": "/reranking",
+        "truncate": "",
+    },
 }
+
+EMBEDDING_PROVIDER_TYPES = {
+    "openai_embedding",
+    "ollama_embedding",
+    "vllm_embedding",
+    "openai_compatible",
+}
+RERANK_PROVIDER_TYPES = {
+    "vllm_rerank",
+    "xinference_rerank",
+    "bailian_rerank",
+    "nvidia_rerank",
+}
+OPENAI_EMBEDDING_CONTEXT_LENGTHS = {
+    "text-embedding-3-small": 8192,
+    "text-embedding-3-large": 8192,
+    "text-embedding-ada-002": 8192,
+}
+
+
+def provider_kind(provider_type: str) -> str:
+    if provider_type in RERANK_PROVIDER_TYPES:
+        return "rerank"
+    return "embedding"
 
 
 def provider_config_hash(config: ProviderConfig) -> str:
@@ -70,6 +167,7 @@ def masked_config(config: ProviderConfig) -> dict[str, Any]:
     payload = asdict(config)
     payload["api_key"] = "********" if config.api_key else ""
     payload["has_api_key"] = bool(config.api_key)
+    payload["provider_kind"] = provider_kind(config.type)
     return payload
 
 
@@ -84,6 +182,8 @@ def validate_provider_config(config: ProviderConfig) -> None:
         raise ValueError("嵌入模型不能为空")
     if config.dimensions < 0:
         raise ValueError("嵌入维度不能小于 0")
+    if config.max_context_tokens < 0:
+        raise ValueError("max_context_tokens must not be negative")
     if config.timeout_seconds <= 0:
         raise ValueError("超时时间必须大于 0")
     if config.batch_size <= 0 or config.concurrency <= 0:
@@ -127,6 +227,9 @@ class EmbeddingProvider(ABC):
     async def list_models(self) -> list[dict[str, Any]]: ...
 
     @abstractmethod
+    async def detect_context_length(self) -> dict[str, Any]: ...
+
+    @abstractmethod
     async def test_connection(self) -> dict[str, Any]: ...
 
     @abstractmethod
@@ -134,6 +237,17 @@ class EmbeddingProvider(ABC):
 
 
 class HTTPEmbeddingProvider(EmbeddingProvider):
+    CONTEXT_LENGTH_KEYS = (
+        "max_model_len",
+        "max_context_length",
+        "context_length",
+        "max_sequence_length",
+        "max_seq_len",
+        "max_position_embeddings",
+        "n_ctx",
+        "num_ctx",
+    )
+
     def __init__(self, config: ProviderConfig):
         validate_provider_config(config)
         self.config = config
@@ -165,6 +279,63 @@ class HTTPEmbeddingProvider(EmbeddingProvider):
                 "Authorization": f"Bearer {self.config.api_key}"
             }
         return httpx.AsyncClient(**kwargs)
+
+    def _model_matches(self, item: dict[str, Any]) -> bool:
+        configured = self.config.model.strip().casefold()
+        basename = self.config.model.strip().rsplit("/", 1)[-1].casefold()
+        candidates = {
+            str(item.get("id") or "").casefold(),
+            str(item.get("root") or "").casefold(),
+            str(item.get("name") or "").casefold(),
+            str(item.get("model") or "").casefold(),
+        }
+        return configured in candidates or basename in candidates
+
+    @classmethod
+    def _extract_context_length(
+        cls, payload: Any, prefix: str = ""
+    ) -> tuple[int, str] | None:
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                path = f"{prefix}.{key}" if prefix else key
+                normalized_key = key.rsplit(".", 1)[-1]
+                if normalized_key in cls.CONTEXT_LENGTH_KEYS:
+                    try:
+                        number = int(value)
+                    except (TypeError, ValueError):
+                        number = 0
+                    if number > 0:
+                        return number, path
+                nested = cls._extract_context_length(value, path)
+                if nested:
+                    return nested
+        elif isinstance(payload, list):
+            for index, value in enumerate(payload):
+                nested = cls._extract_context_length(value, f"{prefix}[{index}]")
+                if nested:
+                    return nested
+        return None
+
+    async def detect_context_length(self) -> dict[str, Any]:
+        try:
+            for item in await self.list_models():
+                if not isinstance(item, dict) or not self._model_matches(item):
+                    continue
+                detected = self._extract_context_length(item)
+                if detected:
+                    value, source = detected
+                    return {
+                        "max_context_tokens": value,
+                        "max_context_tokens_source": f"auto:{self.config.type}:models.{source}",
+                    }
+        except Exception as exc:
+            logger.info(
+                "Provider context length detection skipped: provider=%s type=%s err=%s",
+                self.config.id,
+                self.config.type,
+                safe_summary(exc, max_chars=160),
+            )
+        return {"max_context_tokens": 0, "max_context_tokens_source": ""}
 
     async def _retry(self, operation):
         last_error: Exception | None = None
@@ -277,6 +448,16 @@ class OpenAIEmbeddingProvider(HTTPEmbeddingProvider):
         response.raise_for_status()
         return list(response.json().get("data") or [])
 
+    async def detect_context_length(self) -> dict[str, Any]:
+        model = self.config.model.strip()
+        value = OPENAI_EMBEDDING_CONTEXT_LENGTHS.get(model)
+        if value:
+            return {
+                "max_context_tokens": value,
+                "max_context_tokens_source": f"auto:{self.config.type}:known-model-table",
+            }
+        return await super().detect_context_length()
+
     async def get_embeddings(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
@@ -317,6 +498,33 @@ class VLLMEmbeddingProvider(HTTPEmbeddingProvider):
         response = await self._client.get("/models")
         response.raise_for_status()
         return list(response.json().get("data") or [])
+
+    async def detect_context_length(self) -> dict[str, Any]:
+        detected = await super().detect_context_length()
+        if detected.get("max_context_tokens"):
+            return detected
+        try:
+            model = await self._resolve_model()
+            root_base = self.api_base.rsplit("/", 1)[0]
+            response = await self._client.post(
+                f"{root_base}/tokenize",
+                json={"model": model, "prompt": "PersonalityRAG context probe"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            value = int(payload.get("max_model_len") or 0)
+            if value > 0:
+                return {
+                    "max_context_tokens": value,
+                    "max_context_tokens_source": f"auto:{self.config.type}:/tokenize.max_model_len",
+                }
+        except Exception as exc:
+            logger.info(
+                "vLLM context length detection via /tokenize skipped: provider=%s err=%s",
+                self.config.id,
+                safe_summary(exc, max_chars=160),
+            )
+        return {"max_context_tokens": 0, "max_context_tokens_source": ""}
 
     async def _resolve_model(self) -> str:
         if self._resolved_model:
@@ -385,6 +593,28 @@ class OllamaEmbeddingProvider(HTTPEmbeddingProvider):
             for item in response.json().get("models") or []
         ]
 
+    async def detect_context_length(self) -> dict[str, Any]:
+        try:
+            response = await self._client.post(
+                "/api/show", json={"model": self.config.model}
+            )
+            response.raise_for_status()
+            payload = response.json()
+            detected = self._extract_context_length(payload)
+            if detected:
+                value, source = detected
+                return {
+                    "max_context_tokens": value,
+                    "max_context_tokens_source": f"auto:{self.config.type}:/api/show.{source}",
+                }
+        except Exception as exc:
+            logger.info(
+                "Ollama context length detection skipped: provider=%s err=%s",
+                self.config.id,
+                safe_summary(exc, max_chars=160),
+            )
+        return await super().detect_context_length()
+
     async def get_embeddings(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
@@ -410,7 +640,360 @@ class OllamaEmbeddingProvider(HTTPEmbeddingProvider):
         await self._client.aclose()
 
 
+@dataclass(slots=True)
+class RerankResult:
+    index: int
+    relevance_score: float
+
+
+class RerankProvider(ABC):
+    config: ProviderConfig
+
+    @abstractmethod
+    async def rerank(
+        self, query: str, documents: list[str], top_n: int | None = None
+    ) -> list[RerankResult]: ...
+
+    @abstractmethod
+    async def test_connection(self) -> dict[str, Any]: ...
+
+    @abstractmethod
+    async def close(self) -> None: ...
+
+
+class HTTPRerankProvider(RerankProvider):
+    def __init__(self, config: ProviderConfig):
+        validate_provider_config(config)
+        if provider_kind(config.type) != "rerank":
+            raise ValueError(f"Provider 类型不是 Rerank: {config.type}")
+        self.config = config
+        self._resolved_model: str | None = None
+
+    def _http_client(self, *, base_url: str) -> httpx.AsyncClient:
+        kwargs: dict[str, Any] = {
+            "base_url": base_url,
+            "timeout": self.config.timeout_seconds,
+            "trust_env": not HTTPEmbeddingProvider._is_local_or_private(base_url),
+        }
+        if self.config.proxy:
+            kwargs["proxy"] = self.config.proxy
+            kwargs["trust_env"] = False
+        if self.config.api_key:
+            kwargs["headers"] = {"Authorization": f"Bearer {self.config.api_key}"}
+        return httpx.AsyncClient(**kwargs)
+
+    async def _retry(self, operation):
+        last_error: Exception | None = None
+        for attempt in range(self.config.max_retries):
+            try:
+                return await operation()
+            except Exception as exc:
+                last_error = exc
+                if attempt + 1 >= self.config.max_retries:
+                    break
+                await asyncio.sleep(min(30.0, 2**attempt))
+        raise RuntimeError(f"Rerank 请求失败: {last_error}") from last_error
+
+    @staticmethod
+    def _normalize_suffix(value: str | None, default: str = "/v1/rerank") -> str:
+        suffix = default if value is None or value == "" else str(value)
+        if suffix and not suffix.startswith("/"):
+            suffix = "/" + suffix
+        return suffix
+
+    @staticmethod
+    def _parse_standard_results(data: dict[str, Any]) -> list[RerankResult]:
+        results = data.get("results") or []
+        parsed: list[RerankResult] = []
+        for fallback_index, item in enumerate(results):
+            try:
+                parsed.append(
+                    RerankResult(
+                        index=int(item.get("index", fallback_index)),
+                        relevance_score=float(
+                            item.get("relevance_score", item.get("score", 0.0))
+                        ),
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+        return parsed
+
+    async def list_models(self) -> list[dict[str, Any]]:
+        return []
+
+    async def test_connection(self) -> dict[str, Any]:
+        try:
+            started = asyncio.get_running_loop().time()
+            try:
+                models = await self.list_models()
+            except Exception:
+                models = []
+            results = await self.rerank(
+                "PersonalityRAG Rerank Provider 测试",
+                ["PersonalityRAG 支持记忆召回重排。", "完全无关的文本。"],
+                2,
+            )
+            elapsed = (asyncio.get_running_loop().time() - started) * 1000
+            if not results:
+                raise RuntimeError("Rerank Provider 返回了空结果")
+            logger.info(
+                "Rerank Provider 连接成功：provider=%s type=%s model=%s resolved=%s elapsed_ms=%.2f",
+                self.config.id,
+                self.config.type,
+                self.config.model,
+                self._resolved_model or self.config.model,
+                elapsed,
+            )
+            return {
+                "available": True,
+                "provider_id": self.config.id,
+                "provider_type": self.config.type,
+                "provider_kind": "rerank",
+                "configured_model": self.config.model,
+                "resolved_model": self._resolved_model or self.config.model,
+                "models": models,
+                "top_score": round(results[0].relevance_score, 6),
+                "elapsed_ms": round(elapsed, 2),
+            }
+        except Exception as exc:
+            logger.warning(
+                "Rerank Provider 连接失败：provider=%s type=%s model=%s err=%s",
+                self.config.id,
+                self.config.type,
+                self.config.model,
+                safe_summary(exc, max_chars=240),
+            )
+            return {
+                "available": False,
+                "provider_id": self.config.id,
+                "provider_type": self.config.type,
+                "provider_kind": "rerank",
+                "configured_model": self.config.model,
+                "resolved_model": self._resolved_model or "",
+                "error": str(exc),
+            }
+
+
+class VLLMRerankProvider(HTTPRerankProvider):
+    def __init__(self, config: ProviderConfig):
+        super().__init__(config)
+        self.api_base = config.api_base.rstrip("/")
+        self.api_suffix = self._normalize_suffix(config.api_suffix)
+        version = self.api_base.rsplit("/", 1)[-1]
+        if version in {"v1", "v4"} and self.api_suffix.startswith(f"/{version}/"):
+            self.api_suffix = self.api_suffix.removeprefix(f"/{version}")
+        self._client = self._http_client(base_url=self.api_base)
+
+    async def list_models(self) -> list[dict[str, Any]]:
+        versioned_base = self.api_base.rsplit("/", 1)[-1] in {"v1", "v4"}
+        paths = ["/models", "/v1/models"] if versioned_base else ["/v1/models", "/models"]
+        last_response: httpx.Response | None = None
+        for path in paths:
+            response = await self._client.get(path)
+            last_response = response
+            if response.status_code != 404:
+                response.raise_for_status()
+                return list(response.json().get("data") or [])
+        if last_response is not None:
+            last_response.raise_for_status()
+        return []
+
+    async def _resolve_model(self) -> str:
+        if self._resolved_model:
+            return self._resolved_model
+        configured = self.config.model.strip()
+        try:
+            models = await self.list_models()
+        except Exception:
+            models = []
+        configured_lower = configured.casefold()
+        basename = configured.rsplit("/", 1)[-1].casefold()
+        for item in models:
+            model_id = str(item.get("id") or "")
+            root = str(item.get("root") or "")
+            if (
+                model_id.casefold() == configured_lower
+                or root.casefold() == configured_lower
+                or model_id.casefold() == basename
+            ):
+                self._resolved_model = model_id
+                return model_id
+        self._resolved_model = configured
+        return self._resolved_model
+
+    async def rerank(
+        self, query: str, documents: list[str], top_n: int | None = None
+    ) -> list[RerankResult]:
+        if not query.strip() or not documents:
+            return []
+        model = await self._resolve_model()
+
+        async def request():
+            payload: dict[str, Any] = {
+                "query": query,
+                "documents": documents,
+                "model": model,
+            }
+            if top_n is not None:
+                payload["top_n"] = top_n
+            response = await self._client.post(self.api_suffix, json=payload)
+            response.raise_for_status()
+            return self._parse_standard_results(response.json())
+
+        return await self._retry(request)
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+
+class XinferenceRerankProvider(VLLMRerankProvider):
+    pass
+
+
+class BailianRerankProvider(HTTPRerankProvider):
+    QWEN3_RERANK_MODEL = "qwen3-rerank"
+
+    def __init__(self, config: ProviderConfig):
+        super().__init__(config)
+        self.api_base = config.api_base.rstrip("/")
+        self._client = self._http_client(base_url=self.api_base)
+        self._resolved_model = config.model
+
+    def _build_payload(
+        self, query: str, documents: list[str], top_n: int | None
+    ) -> dict[str, Any]:
+        normalized_top_n = top_n if top_n is not None and top_n > 0 else None
+        if self.config.model.strip().lower() == self.QWEN3_RERANK_MODEL:
+            payload: dict[str, Any] = {
+                "model": self.config.model,
+                "query": query,
+                "documents": documents,
+            }
+            if normalized_top_n is not None:
+                payload["top_n"] = normalized_top_n
+            if self.config.instruct:
+                payload["instruct"] = self.config.instruct
+            return payload
+        payload_input = {"query": query, "documents": documents}
+        params: dict[str, Any] = {}
+        if normalized_top_n is not None:
+            params["top_n"] = normalized_top_n
+        if self.config.return_documents:
+            params["return_documents"] = True
+        payload = {"model": self.config.model, "input": payload_input}
+        if params:
+            payload["parameters"] = params
+        return payload
+
+    def _parse_results(self, data: dict[str, Any]) -> list[RerankResult]:
+        if "compatible-api" in self.api_base:
+            if data.get("code"):
+                raise RuntimeError(
+                    f"百炼 Rerank API 错误: {data.get('code')} {data.get('message', '')}"
+                )
+            return self._parse_standard_results(data)
+        code = str(data.get("code", "200"))
+        if code != "200":
+            raise RuntimeError(
+                f"百炼 Rerank API 错误: {code} {data.get('message', '')}"
+            )
+        results = (data.get("output") or {}).get("results") or []
+        return self._parse_standard_results({"results": results})
+
+    async def rerank(
+        self, query: str, documents: list[str], top_n: int | None = None
+    ) -> list[RerankResult]:
+        if not query.strip() or not documents:
+            return []
+        documents = documents[:500]
+
+        async def request():
+            response = await self._client.post(
+                "", json=self._build_payload(query, documents, top_n)
+            )
+            response.raise_for_status()
+            return self._parse_results(response.json())
+
+        return await self._retry(request)
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+
+class NvidiaRerankProvider(HTTPRerankProvider):
+    def __init__(self, config: ProviderConfig):
+        super().__init__(config)
+        self.api_base = config.api_base.rstrip("/")
+        self.model_endpoint = self._normalize_suffix(
+            config.model_endpoint or "/reranking", "/reranking"
+        )
+        self._client = self._http_client(base_url=self.api_base)
+        self._resolved_model = config.model
+
+    def _endpoint(self) -> str:
+        model_path = "nvidia"
+        if "/" in self.config.model:
+            model_path = self.config.model.strip("/").replace(".", "_")
+        return f"/{model_path}{self.model_endpoint}"
+
+    def _parse_results(
+        self, data: dict[str, Any], top_n: int | None = None
+    ) -> list[RerankResult]:
+        parsed: list[RerankResult] = []
+        for fallback_index, item in enumerate(data.get("rankings") or []):
+            try:
+                parsed.append(
+                    RerankResult(
+                        index=int(item.get("index", fallback_index)),
+                        relevance_score=float(
+                            item.get("relevance_score", item.get("logit", 0.0))
+                        ),
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+        parsed.sort(key=lambda item: item.relevance_score, reverse=True)
+        return parsed[:top_n] if top_n is not None and top_n > 0 else parsed
+
+    async def rerank(
+        self, query: str, documents: list[str], top_n: int | None = None
+    ) -> list[RerankResult]:
+        if not query.strip() or not documents:
+            return []
+
+        async def request():
+            payload: dict[str, Any] = {
+                "model": self.config.model,
+                "query": {"text": query},
+                "passages": [{"text": doc} for doc in documents],
+            }
+            if self.config.truncate:
+                payload["truncate"] = self.config.truncate
+            response = await self._client.post(self._endpoint(), json=payload)
+            response.raise_for_status()
+            return self._parse_results(response.json(), top_n)
+
+        return await self._retry(request)
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+def build_rerank_provider(config: ProviderConfig) -> RerankProvider:
+    if config.type == "vllm_rerank":
+        return VLLMRerankProvider(config)
+    if config.type == "xinference_rerank":
+        return XinferenceRerankProvider(config)
+    if config.type == "bailian_rerank":
+        return BailianRerankProvider(config)
+    if config.type == "nvidia_rerank":
+        return NvidiaRerankProvider(config)
+    raise ValueError(f"不支持的 Rerank Provider 类型: {config.type}")
+
+
 def build_provider(config: ProviderConfig) -> EmbeddingProvider:
+    if provider_kind(config.type) != "embedding":
+        raise ValueError(f"Provider 类型不是 Embedding: {config.type}")
     if config.type == "openai_embedding":
         return OpenAIEmbeddingProvider(config)
     if config.type == "ollama_embedding":
