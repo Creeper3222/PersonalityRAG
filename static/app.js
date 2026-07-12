@@ -73,6 +73,7 @@ const state = {
   },
   settings: null,
   loginMode: "api_key",
+  authGeneration: 0,
   systemProviderExpanded: false,
   systemIndexExpanded: false,
   systemPanelRefreshFrame: 0,
@@ -83,6 +84,8 @@ const state = {
     targetUrl: "",
     probeUrls: [],
     probeCursor: 0,
+    requireOfflineTransition: false,
+    sawOfflineTransition: false,
     lastPhase: "",
   },
   selectedLibraryId: localStorage.getItem("prag_library_id") || "",
@@ -311,6 +314,7 @@ const api = createApiClient({
   onUnauthorized: () => showLogin(),
   unauthorizedMessage: () => t("unauthorized"),
   onOperationalError: (error) => logUiFeedback(error.message, "ERROR"),
+  getUnauthorizedGeneration: () => state.authGeneration,
 });
 
 const {
@@ -426,6 +430,11 @@ function selectLibrary(libraryId, options = {}) {
 
 function showLogin() {
   stopLogPolling();
+  stopTaskPolling();
+  resetTaskState({ render: false });
+  if (!$("app").classList.contains("hidden")) {
+    state.authGeneration += 1;
+  }
   $("login").classList.remove("hidden");
   $("app").classList.add("hidden");
 }
@@ -465,7 +474,9 @@ $("login-form").addEventListener("submit", async (event) => {
     await api("/auth/login", {
       method: "POST",
       body: JSON.stringify({ credential: $("api-key").value }),
+      suppressUnauthorizedHandler: true,
     });
+    state.authGeneration += 1;
     showApp();
     await activatePage(state.page);
   } catch (error) {
@@ -475,6 +486,7 @@ $("login-form").addEventListener("submit", async (event) => {
 
 $("logout").addEventListener("click", async () => {
   await api("/auth/logout", { method: "POST" });
+  state.authGeneration += 1;
   showLogin();
 });
 

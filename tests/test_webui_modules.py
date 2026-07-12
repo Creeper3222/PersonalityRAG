@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -115,8 +116,64 @@ def test_file_password_failure_does_not_invalidate_webui_login() -> None:
     )
 
     assert "suppressUnauthorizedHandler = false" in api_source
-    assert "if (!suppressUnauthorizedHandler)" in api_source
+    assert "unauthorizedGeneration === getUnauthorizedGeneration()" in api_source
     assert "suppressUnauthorizedHandler: true" in files_source
+
+
+def test_docker_restart_waits_for_offline_transition_and_preserves_origin() -> None:
+    app_source = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    settings_source = (STATIC_ROOT / "modules" / "settings.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'payload.restart_strategy === "container"' in settings_source
+    assert 'state.restart.targetUrl = containerRestart' in settings_source
+    assert '`${window.location.origin}/`' in settings_source
+    assert "state.restart.requireOfflineTransition = containerRestart" in settings_source
+    assert "state.restart.sawOfflineTransition = true" in settings_source
+    assert "&& !state.restart.sawOfflineTransition" in settings_source
+    assert "getUnauthorizedGeneration: () => state.authGeneration" in app_source
+    assert "suppressUnauthorizedHandler: true" in app_source
+    assert "stopTaskPolling();" in app_source[app_source.index("function showLogin()") :]
+
+
+def test_stale_unauthorized_response_cannot_undo_new_login_generation() -> None:
+    api_module = (STATIC_ROOT / "modules" / "api.js").as_uri()
+    script = f"""
+      import {{ createApiClient }} from {json.dumps(api_module)};
+      let generation = 0;
+      let unauthorizedCalls = 0;
+      let releaseFirst;
+      globalThis.fetch = () => new Promise((resolve) => {{
+        releaseFirst = () => resolve(new Response(
+          JSON.stringify({{ detail: 'old session' }}),
+          {{ status: 401, headers: {{ 'Content-Type': 'application/json' }} }},
+        ));
+      }});
+      const api = createApiClient({{
+        getUnauthorizedGeneration: () => generation,
+        onUnauthorized: () => {{ unauthorizedCalls += 1; }},
+      }});
+      const stale = api('/jobs').catch(() => null);
+      generation += 1;
+      releaseFirst();
+      await stale;
+      if (unauthorizedCalls !== 0) throw new Error('stale 401 invalidated new login');
+      globalThis.fetch = async () => new Response(
+        JSON.stringify({{ detail: 'current session' }}),
+        {{ status: 401, headers: {{ 'Content-Type': 'application/json' }} }},
+      );
+      await api('/jobs').catch(() => null);
+      if (unauthorizedCalls !== 1) throw new Error('current 401 was not handled');
+    """
+    subprocess.run(
+        ["node", "--input-type=module", "--eval", script],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
 
 
 def test_file_manager_module_preserves_rocketcat_file_type_icons() -> None:

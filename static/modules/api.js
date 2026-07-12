@@ -28,6 +28,7 @@ export function createApiClient({
   onUnauthorized = () => {},
   unauthorizedMessage = () => "Unauthorized",
   onOperationalError = () => {},
+  getUnauthorizedGeneration = () => 0,
 } = {}) {
   return async function api(path, options = {}) {
     const {
@@ -39,6 +40,7 @@ export function createApiClient({
     if (!(requestOptions.body instanceof FormData) && !headers["Content-Type"]) {
       headers["Content-Type"] = "application/json";
     }
+    const unauthorizedGeneration = getUnauthorizedGeneration();
     let response;
     try {
       response = await fetch(baseUrl + path, {
@@ -53,7 +55,10 @@ export function createApiClient({
       throw error;
     }
     if (response.status === 401) {
-      if (!suppressUnauthorizedHandler) {
+      if (
+        !suppressUnauthorizedHandler
+        && unauthorizedGeneration === getUnauthorizedGeneration()
+      ) {
         onUnauthorized();
         throw new ApiError(unauthorizedMessage(), 401);
       }

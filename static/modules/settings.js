@@ -310,10 +310,18 @@ async function pollRestartStatus() {
   const candidates = nextRestartProbeBatch();
   const reachableUrl = await firstReachableRestartUrl(candidates);
   if (reachableUrl) {
+    if (
+      state.restart.requireOfflineTransition
+      && !state.restart.sawOfflineTransition
+    ) {
+      state.restart.timer = setTimeout(pollRestartStatus, 350);
+      return;
+    }
     updateRestartScreen("restartPhaseConnecting", reachableUrl);
     window.location.replace(restartRedirectUrl(reachableUrl));
     return;
   }
+  state.restart.sawOfflineTransition = true;
   state.restart.timer = setTimeout(pollRestartStatus, 1200);
 }
 
@@ -324,13 +332,16 @@ function showRestartScreen(payload) {
   resetTaskState({ render: false });
   state.restarting = true;
   state.restart.startedAt = Date.now();
-  state.restart.targetUrl =
-    payload.configured_webui_url || payload.webui_url || window.location.origin + "/";
-  state.restart.probeUrls = normalizeRestartProbeUrls(
-    payload.restart_probe_urls,
-    state.restart.targetUrl,
-  );
+  const containerRestart = payload.restart_strategy === "container";
+  state.restart.targetUrl = containerRestart
+    ? `${window.location.origin}/`
+    : payload.configured_webui_url || payload.webui_url || `${window.location.origin}/`;
+  state.restart.probeUrls = containerRestart
+    ? [state.restart.targetUrl]
+    : normalizeRestartProbeUrls(payload.restart_probe_urls, state.restart.targetUrl);
   state.restart.probeCursor = 0;
+  state.restart.requireOfflineTransition = containerRestart;
+  state.restart.sawOfflineTransition = false;
   document.body.classList.add("restarting");
   $("restart-target-url").textContent = state.restart.targetUrl;
   $("restart-open-link").href = buildAppPageUrl(
