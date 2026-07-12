@@ -1,4 +1,4 @@
-# Generated and verified with CPython 3.12.1 x64 on 2026-07-10.
+# Verified for CPython 3.12 Linux amd64/arm64 for PersonalityRAG v0.1.0.
 # Regenerate only after a clean Python 3.12 runtime install and full validation.
 aiosqlite==0.22.1
 annotated-doc==0.0.4

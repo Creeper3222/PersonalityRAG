@@ -31,7 +31,7 @@ from ..backup_migration import (
     import_prag_package,
 )
 from ..compat import LIVINGMEMORY_DATABASE_VERSION
-from ..config import build_access_url, save_config
+from ..config import build_access_url, deployment_mode, is_docker_deployment, save_config
 from ..http_shared import (
     _launch_restart_helper,
     _restart_probe_urls,
@@ -132,6 +132,10 @@ def _settings_payload() -> dict[str, Any]:
     webui_url = build_access_url(config.access_base_url, actual_port)
     api_access_url = build_access_url(config.access_base_url, actual_access_port)
     return {
+        "deployment_mode": deployment_mode(),
+        "managed_settings": (
+            ["port", "access_port"] if is_docker_deployment() else []
+        ),
         "host": config.host,
         "access_base_url": config.access_base_url,
         "configured_port": config.port,
@@ -165,6 +169,24 @@ async def get_settings():
 @router.patch("/api/v1/settings", dependencies=[Depends(require_auth)])
 async def update_settings(payload: SettingsUpdate):
     changed: list[str] = []
+    if is_docker_deployment():
+        attempted_managed_changes = [
+            field_name
+            for field_name, requested, current in (
+                ("port", payload.port, config.port),
+                ("access_port", payload.access_port, config.access_port),
+            )
+            if requested is not None and requested != current
+        ]
+        if attempted_managed_changes:
+            raise HTTPException(
+                409,
+                {
+                    "code": "docker_managed_settings",
+                    "message": "Docker deployment ports are managed by Compose",
+                    "fields": attempted_managed_changes,
+                },
+            )
     next_webui_port = payload.port if payload.port is not None else config.port
     next_access_port = (
         payload.access_port
@@ -236,17 +258,20 @@ async def restart_service(background_tasks: BackgroundTasks):
     context = current_context()
     if context.restart_in_progress:
         raise HTTPException(409, "restart already in progress")
-    try:
-        _launch_restart_helper()
-    except Exception as exc:
-        logger.exception("restart helper launch failed")
-        raise HTTPException(500, "restart helper launch failed") from exc
+    restart_strategy = "container" if is_docker_deployment() else "process"
+    if not is_docker_deployment():
+        try:
+            _launch_restart_helper()
+        except Exception as exc:
+            logger.exception("restart helper launch failed")
+            raise HTTPException(500, "restart helper launch failed") from exc
     context.restart_in_progress = True
     logger.warning("WebUI requested a PersonalityRAG restart: pid=%s", os.getpid())
     background_tasks.add_task(_shutdown_for_restart)
     return {
         **_settings_payload(),
         "restart_in_progress": True,
+        "restart_strategy": restart_strategy,
         "restart_probe_urls": _restart_probe_urls(),
         "restart_requested_at": time.time(),
     }
@@ -327,6 +352,7 @@ async def import_backup_migration(
             manager=context.manager,
             package_path=upload_path,
             password=password,
+            preserve_managed_network=is_docker_deployment(),
         )
         context.config = next_config
         auth.api_key = config.api_key

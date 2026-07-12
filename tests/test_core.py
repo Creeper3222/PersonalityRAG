@@ -99,7 +99,8 @@ def test_restart_probe_urls_follow_configured_webui_port(
     assert len(urls) == app_module.RESTART_PROBE_SCAN_LIMIT + 1
 
 
-def test_restart_helper_prefers_launcher_on_windows_repo_layout(tmp_path):
+def test_restart_helper_prefers_launcher_on_windows_repo_layout(tmp_path, monkeypatch):
+    monkeypatch.setattr(restart_helper.os, "name", "nt")
     root = tmp_path / "PersonalityRAG"
     scripts = root / ".venv" / "Scripts"
     scripts.mkdir(parents=True)

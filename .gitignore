@@ -1,4 +1,6 @@
 .venv/
+.env
+runtime/
 .venv-next/
 .venv-py*/
 __pycache__/

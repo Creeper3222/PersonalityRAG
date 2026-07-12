@@ -84,9 +84,13 @@ HIDDEN_EXACT_NAMES = {
     "node_modules",
 }
 HIDDEN_PREFIXES = (".venv",)
-SOURCE_READONLY_ROOTS = ("personalityrag", "static", "assets", "tools")
+SOURCE_READONLY_ROOTS = ("personalityrag", "static", "assets", "docker", "tools")
 SOURCE_READONLY_FILES = {
-    "launcher.bat",
+    ".dockerignore",
+    ".env.example",
+    "Dockerfile",
+    "docker-compose.local.yml",
+    "docker-compose.yml",
     "pyproject.toml",
     "run.py",
 }

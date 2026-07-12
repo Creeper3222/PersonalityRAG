@@ -279,6 +279,7 @@ const zhCN = {
   "configPackageImportedIndexPending": "配置包已导入；索引未构建，请确认提供商可用后手动触发索引重建任务。",
   "choosePragPackage": "请选择 .prag 配置包",
   "settingsPortRestartHint": "服务接入端点 URL 保存为不带端口和尾斜杠的基址；WebUI 端口和记忆库接入端口修改都会在下次启动生效。两个配置端口不能相同。",
+  "settingsDockerManagedPorts": "Docker 版容器内部端口固定为 8765 / 8766，并由 Compose 托管。请在部署 .env 中修改宿主映射端口后重新运行启动脚本。",
   "settingsRuntimePendingValue": "{current}（当前运行，重启后 {next}）",
   "restartTitle": "正在重启 PersonalityRAG",
   "restartMessage": "正在关闭旧实例并等待新的 WebUI 恢复连接。若端口已改动，界面会自动跳转到新地址。",

@@ -16,7 +16,12 @@ from typing import Any
 
 import pyzipper
 
-from .config import AppConfig, app_config_from_dict, save_config
+from .config import (
+    DOCKER_MANAGED_CONFIG_FIELDS,
+    AppConfig,
+    app_config_from_dict,
+    save_config,
+)
 from .identifiers import validate_identifier
 from .io_utils import run_blocking
 from .libraries import LibraryManager
@@ -720,6 +725,7 @@ async def import_prag_package(
     manager: LibraryManager,
     package_path: Path,
     password: str,
+    preserve_managed_network: bool = False,
 ) -> tuple[AppConfig, dict[str, Any]]:
     _package_password(password)
     if await manager.control.has_any_running_jobs():
@@ -736,6 +742,14 @@ async def import_prag_package(
             extract_dir / "config" / "global.json",
         )
         next_config = app_config_from_dict(global_config, provider=config.provider)
+        ignored_config_fields: list[str] = []
+        if preserve_managed_network:
+            for field_name in DOCKER_MANAGED_CONFIG_FIELDS:
+                imported_value = getattr(next_config, field_name)
+                current_value = getattr(config, field_name)
+                if imported_value != current_value:
+                    ignored_config_fields.append(field_name)
+                setattr(next_config, field_name, current_value)
         provider_snapshot = None
         if scope.get("include_providers"):
             provider_snapshot = await run_blocking(
@@ -805,6 +819,7 @@ async def import_prag_package(
         ),
         "indexes_pending": bool(scope.get("include_libraries")),
         "restart_required": True,
+        "ignored_config_fields": ignored_config_fields,
     }
     logger.warning(
         "备份迁移配置包导入完成：include_libraries=%s include_providers=%s libraries=%s providers=%s",

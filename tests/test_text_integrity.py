@@ -36,6 +36,20 @@ RUSSIAN_TECHNICAL_ONLY_KEYS = {
 
 
 def _tracked_text_files() -> list[Path]:
+    if not (REPO_ROOT / ".git").exists():
+        return [
+            path
+            for path in REPO_ROOT.rglob("*")
+            if path.is_file()
+            and not any(
+                part in {"__pycache__", ".pytest_cache", ".test-runtime"}
+                for part in path.relative_to(REPO_ROOT).parts
+            )
+            and (
+                path.suffix.lower() in TEXT_SUFFIXES
+                or path.name == ".editorconfig"
+            )
+        ]
     result = subprocess.run(
         ["git", "ls-files", "-z"],
         cwd=REPO_ROOT,

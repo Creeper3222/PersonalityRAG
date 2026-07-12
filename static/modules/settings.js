@@ -358,6 +358,8 @@ async function loadSettings() {
     );
     $("settings-access-base-url").value = data.access_base_url || "http://127.0.0.1";
     $("settings-port").value = data.configured_port || 8765;
+    const managedSettings = new Set(data.managed_settings || []);
+    $("settings-port").disabled = managedSettings.has("port");
     $("settings-actual-port").textContent = formatRuntimePendingValue(
       data.actual_port,
       data.configured_port,
@@ -367,6 +369,7 @@ async function loadSettings() {
       data.configured_api_access_url || data.api_access_url || "—",
     );
     $("settings-access-port").value = data.configured_access_port || 8766;
+    $("settings-access-port").disabled = managedSettings.has("access_port");
     $("settings-actual-access-port").textContent = formatRuntimePendingValue(
       data.actual_access_port,
       data.configured_access_port,
@@ -377,7 +380,9 @@ async function loadSettings() {
     $("settings-clear-password").checked = false;
     $("settings-runtime-idle-minutes").value = data.runtime_residency?.idle_minutes || 30;
     $("settings-runtime-max-non-default").value = data.runtime_residency?.max_non_default_runtimes || 4;
-    $("settings-note").textContent = t("settingsPortRestartHint");
+    $("settings-note").textContent = data.deployment_mode === "docker"
+      ? t("settingsDockerManagedPorts")
+      : t("settingsPortRestartHint");
   } catch (error) {
     toast(error.message, true);
   }

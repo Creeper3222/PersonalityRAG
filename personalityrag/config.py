@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import secrets
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -10,6 +11,21 @@ from urllib.parse import urlsplit
 
 
 DEFAULT_ACCESS_BASE_URL = "http://127.0.0.1"
+DEPLOYMENT_ENV = "PERSONALITYRAG_DEPLOYMENT"
+DOCKER_DEPLOYMENT = "docker"
+DOCKER_HOST = "0.0.0.0"
+DOCKER_WEBUI_PORT = 8765
+DOCKER_ACCESS_PORT = 8766
+DOCKER_MANAGED_CONFIG_FIELDS = ("host", "port", "access_port")
+
+
+def deployment_mode() -> str:
+    value = str(os.environ.get(DEPLOYMENT_ENV, "desktop") or "desktop")
+    return value.strip().lower()
+
+
+def is_docker_deployment() -> bool:
+    return deployment_mode() == DOCKER_DEPLOYMENT
 
 
 def normalize_access_base_url(value: str | None) -> str:
@@ -172,6 +188,34 @@ class AppConfig:
         return hashlib.sha256(self.api_key.encode("utf-8")).hexdigest()[:12]
 
 
+def apply_deployment_constraints(
+    config: AppConfig,
+    *,
+    initialize_defaults: bool = False,
+) -> list[str]:
+    if not is_docker_deployment():
+        return []
+    changed: list[str] = []
+    required = {
+        "host": DOCKER_HOST,
+        "port": DOCKER_WEBUI_PORT,
+        "access_port": DOCKER_ACCESS_PORT,
+    }
+    for field_name, value in required.items():
+        if getattr(config, field_name) != value:
+            setattr(config, field_name, value)
+            changed.append(field_name)
+    if initialize_defaults:
+        default_provider_url = os.environ.get(
+            "PERSONALITYRAG_DEFAULT_EMBEDDING_API_BASE",
+            "http://host.docker.internal:8001/v1",
+        ).strip()
+        if default_provider_url and config.provider.api_base != default_provider_url:
+            config.provider.api_base = default_provider_url
+            changed.append("provider.api_base")
+    return changed
+
+
 def _merge_dataclass(cls, raw: dict[str, Any] | None):
     raw = raw or {}
     allowed = {item.name for item in cls.__dataclass_fields__.values()}
@@ -198,8 +242,11 @@ def _normalize_runtime_residency(config: AppConfig) -> None:
 
 
 def load_config(path: Path) -> AppConfig:
-    if not path.exists():
+    created = not path.exists()
+    if created:
         config = AppConfig()
+        _normalize_runtime_residency(config)
+        apply_deployment_constraints(config, initialize_defaults=True)
         save_config(path, config)
         return config
     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -245,6 +292,7 @@ def load_config(path: Path) -> AppConfig:
     if not config.library_psk_secret:
         config.library_psk_secret = secrets.token_urlsafe(48)
     config.access_base_url = normalize_access_base_url(config.access_base_url)
+    apply_deployment_constraints(config, initialize_defaults=created)
     save_config(path, config)
     return config
 

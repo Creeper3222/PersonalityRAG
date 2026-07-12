@@ -278,6 +278,7 @@ const enUS = {
   "configPackageImportedIndexPending": "Config package imported. Indexes are not built; confirm providers are available, then rebuild indexes manually.",
   "choosePragPackage": "Choose a .prag package",
   "settingsPortRestartHint": "The endpoint base URL is saved without a port or trailing slash. WebUI and memory API port changes take effect on next launch. The two configured ports must differ.",
+  "settingsDockerManagedPorts": "Docker container ports are fixed at 8765 / 8766 and managed by Compose. Change host mappings in the deployment .env, then run the start script again.",
   "settingsRuntimePendingValue": "{current} (running now, {next} after restart)",
   "restartTitle": "Restarting PersonalityRAG",
   "restartMessage": "Shutting down the current instance and waiting for the WebUI to come back. If the port changed, this page will jump to the new address automatically.",

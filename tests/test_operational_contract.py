@@ -188,6 +188,8 @@ async def test_health_and_settings_core_fields_remain_stable() -> None:
         "api_key_fingerprint",
         "port_change_requires_restart",
         "access_port_change_requires_restart",
+        "deployment_mode",
+        "managed_settings",
         "runtime_residency",
     }
 

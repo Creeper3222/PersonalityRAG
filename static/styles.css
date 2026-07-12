@@ -6,6 +6,7 @@
   --log-bg:#fff;--log-text:#212529;--log-row:rgba(15,23,42,.08);--log-badge-bg:#f4f7fb;
   --scrollbar-thumb:rgba(108,117,125,.34);--scrollbar-thumb-hover:rgba(108,117,125,.52);--scrollbar-thumb-active:rgba(73,80,87,.7)
 }
+.settings-grid input:disabled{cursor:not-allowed;opacity:.68;background:var(--panel-soft);color:var(--muted)}
 [data-theme="dark"]{
   --bg:#17131b;--panel:#211b25;--panel-soft:#2a222e;--panel-rgb:33,27,37;--text:#f7edf5;--muted:#b8a6b7;
   --line:#3b303e;--accent:#ff5b96;--accent2:#a594ff;--success:#54d7aa;--danger:#ff6b8f;
