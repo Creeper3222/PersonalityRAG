@@ -4,7 +4,9 @@ import argparse
 import asyncio
 import base64
 import json
+import os
 import sys
+import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -14,14 +16,35 @@ import websockets
 ROOT = Path(__file__).resolve().parents[1]
 
 
-async def run(devtools_url: str) -> dict:
-    config = json.loads(
-        (ROOT / "config" / "config.json").read_text(encoding="utf-8")
-    )
+def default_state_root() -> Path:
+    return Path(os.environ.get("PERSONALITYRAG_STATE_ROOT", ROOT)).resolve()
+
+
+def default_credential(state_root: Path) -> str:
+    config_path = state_root / "config" / "config.json"
+    if not config_path.exists():
+        return ""
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    if config.get("login_password_hash"):
+        return ""
+    return str(config.get("api_key") or "")
+
+
+async def run(
+    devtools_url: str,
+    *,
+    base_url: str,
+    credential: str,
+    report_dir: Path,
+) -> dict:
+    base_url = base_url.rstrip("/")
     pages = json.loads(
-        urllib.request.urlopen(f"{devtools_url}/json/list").read()
+        urllib.request.urlopen(f"{devtools_url}/json/list", timeout=5).read()
     )
-    page = pages[0]
+    page = next(
+        (item for item in pages if item.get("type") == "page"),
+        pages[0],
+    )
     async with websockets.connect(
         page["webSocketDebuggerUrl"], max_size=20_000_000
     ) as ws:
@@ -61,23 +84,24 @@ async def run(devtools_url: str) -> dict:
                 "mobile": False,
             },
         )
-        await call("Page.navigate", {"url": "http://127.0.0.1:8765/"})
+        await call("Page.navigate", {"url": f"{base_url}/"})
         await asyncio.sleep(1.5)
-        expression = (
-            "fetch('/api/v1/auth/login',"
-            "{method:'POST',headers:{'Content-Type':'application/json'},"
-            f"body:JSON.stringify({{api_key:{json.dumps(config['api_key'])}}})}})"
-            ".then(r=>r.json())"
-        )
-        await call(
-            "Runtime.evaluate",
-            {
-                "expression": expression,
-                "awaitPromise": True,
-                "returnByValue": True,
-            },
-        )
-        await call("Page.navigate", {"url": "http://127.0.0.1:8765/"})
+        if credential:
+            expression = (
+                "fetch('/api/v1/auth/login',"
+                "{method:'POST',headers:{'Content-Type':'application/json'},"
+                f"body:JSON.stringify({{credential:{json.dumps(credential)}}})}})"
+                ".then(async r=>{if(!r.ok)throw new Error(await r.text());return r.json()})"
+            )
+            await call(
+                "Runtime.evaluate",
+                {
+                    "expression": expression,
+                    "awaitPromise": True,
+                    "returnByValue": True,
+                },
+            )
+        await call("Page.navigate", {"url": f"{base_url}/"})
         await asyncio.sleep(2.5)
         libraries = await call(
             "Runtime.evaluate",
@@ -86,13 +110,11 @@ async def run(devtools_url: str) -> dict:
                     "({title:document.querySelector('#page-title')?.textContent,"
                     "cards:document.querySelectorAll("
                     "'#library-cards .management-card').length,"
-                    "body:document.body.innerText.slice(0,1200)})"
+                    "body:document.body.innerText.slice(0,1200),"
+                    "selectedLibraryId:localStorage.getItem('prag_library_id')||''})"
                 ),
                 "returnByValue": True,
             },
-        )
-        report_dir = (
-            ROOT / "data" / "libraries" / "beileite" / "reports"
         )
         report_dir.mkdir(parents=True, exist_ok=True)
         screenshot = await call(
@@ -170,28 +192,43 @@ async def run(devtools_url: str) -> dict:
                 "returnByValue": True,
             },
         )
-        await call(
+        editor_existing = {"result": {"value": {
+            "idReadOnly": True,
+            "secretBlank": True,
+            "clearVisible": False,
+            "existingProviderPresent": False,
+        }}}
+        existing_provider = await call(
             "Runtime.evaluate",
             {
-                "expression": (
-                    "document.querySelector('#provider-modal').classList.add('hidden');"
-                    "document.querySelector('.edit-provider').click()"
-                )
-            },
-        )
-        await asyncio.sleep(0.3)
-        editor_existing = await call(
-            "Runtime.evaluate",
-            {
-                "expression": (
-                    "({idReadOnly:document.querySelector('#provider-id').readOnly,"
-                    "secretBlank:document.querySelector('#provider-api-key').value===''," 
-                    "clearVisible:!document.querySelector("
-                    "'#provider-clear-key-row').classList.contains('hidden')})"
-                ),
+                "expression": "Boolean(document.querySelector('.edit-provider'))",
                 "returnByValue": True,
             },
         )
+        if existing_provider["result"]["value"]:
+            await call(
+                "Runtime.evaluate",
+                {
+                    "expression": (
+                        "document.querySelector('#provider-modal').classList.add('hidden');"
+                        "document.querySelector('.edit-provider').click()"
+                    )
+                },
+            )
+            await asyncio.sleep(0.3)
+            editor_existing = await call(
+                "Runtime.evaluate",
+                {
+                    "expression": (
+                        "({idReadOnly:document.querySelector('#provider-id').readOnly,"
+                        "secretBlank:document.querySelector('#provider-api-key').value==='',"
+                        "clearVisible:!document.querySelector("
+                        "'#provider-clear-key-row').classList.contains('hidden'),"
+                        "existingProviderPresent:true})"
+                    ),
+                    "returnByValue": True,
+                },
+            )
         await call(
             "Runtime.evaluate",
             {
@@ -244,6 +281,179 @@ async def run(devtools_url: str) -> dict:
                 "returnByValue": True,
             },
         )
+        await call(
+            "Runtime.evaluate",
+            {
+                "expression": (
+                    "document.querySelector('.nav[data-page=files]').click()"
+                )
+            },
+        )
+        await asyncio.sleep(1.2)
+        files = await call(
+            "Runtime.evaluate",
+            {
+                "expression": (
+                    "({title:document.querySelector('#page-title')?.textContent||'',"
+                    "rows:document.querySelectorAll('#file-table-body tr').length,"
+                    "protectedItems:document.querySelectorAll('.file-badge-readonly').length,"
+                    "folderIcons:document.querySelectorAll('.file-icon--folder').length,"
+                    "textIcons:document.querySelectorAll('.file-icon--file-text').length,"
+                    "codeIcons:document.querySelectorAll('.file-icon--file-code').length,"
+                    "genericIcons:document.querySelectorAll('.file-icon--file-generic').length,"
+                    "visibleInternal:Array.from(document.querySelectorAll('.file-name-copy strong'))"
+                    ".some(node=>['.git','.venv','.pytest_cache','.ruff_cache'].includes(node.textContent))})"
+                ),
+                "returnByValue": True,
+            },
+        )
+        await call(
+            "Runtime.evaluate",
+            {
+                "expression": (
+                    "Array.from(document.querySelectorAll('#file-table-body tr'))"
+                    ".find(row=>row.querySelector('.file-name-copy strong')?.textContent==='run.py')"
+                    "?.querySelector('[data-file-open]')?.click()"
+                )
+            },
+        )
+        await asyncio.sleep(0.5)
+        file_preview = await call(
+            "Runtime.evaluate",
+            {
+                "expression": (
+                    "({visible:!document.querySelector('#file-preview-modal')?.classList.contains('hidden'),"
+                    "contentLength:document.querySelector('#file-preview-content')?.textContent.length||0})"
+                ),
+                "returnByValue": True,
+            },
+        )
+        await call(
+            "Runtime.evaluate",
+            {
+                "expression": (
+                    "document.querySelector('[data-file-modal-close=file-preview-modal]')?.click();"
+                    "Array.from(document.querySelectorAll('#file-table-body tr'))"
+                    ".find(row=>row.querySelector('.file-name-copy strong')?.textContent==='docs')"
+                    "?.querySelector('[data-file-open]')?.click()"
+                )
+            },
+        )
+        await asyncio.sleep(0.5)
+        file_navigation = await call(
+            "Runtime.evaluate",
+            {
+                "expression": (
+                    "({path:document.querySelector('#file-current-path')?.textContent||'',"
+                    "breadcrumbCount:document.querySelectorAll('[data-file-breadcrumb]').length})"
+                ),
+                "returnByValue": True,
+            },
+        )
+        await call(
+            "Runtime.evaluate",
+            {
+                "expression": (
+                    "document.querySelector('[data-file-breadcrumb=\"\"]')?.click()"
+                )
+            },
+        )
+        await asyncio.sleep(0.5)
+        await call(
+            "Runtime.evaluate",
+            {"expression": "document.documentElement.dataset.theme='light'"},
+        )
+        screenshot = await call(
+            "Page.captureScreenshot",
+            {"format": "png", "captureBeyondViewport": False},
+        )
+        (report_dir / "files-light-desktop.png").write_bytes(
+            base64.b64decode(screenshot["data"])
+        )
+        await call(
+            "Runtime.evaluate",
+            {"expression": "document.documentElement.dataset.theme='dark'"},
+        )
+        screenshot = await call(
+            "Page.captureScreenshot",
+            {"format": "png", "captureBeyondViewport": False},
+        )
+        (report_dir / "files-dark-desktop.png").write_bytes(
+            base64.b64decode(screenshot["data"])
+        )
+        await call(
+            "Emulation.setDeviceMetricsOverride",
+            {
+                "width": 430,
+                "height": 900,
+                "deviceScaleFactor": 1,
+                "mobile": True,
+            },
+        )
+        screenshot = await call(
+            "Page.captureScreenshot",
+            {"format": "png", "captureBeyondViewport": False},
+        )
+        (report_dir / "files-dark-mobile.png").write_bytes(
+            base64.b64decode(screenshot["data"])
+        )
+        await call(
+            "Runtime.evaluate",
+            {"expression": "document.documentElement.dataset.theme='light'"},
+        )
+        screenshot = await call(
+            "Page.captureScreenshot",
+            {"format": "png", "captureBeyondViewport": False},
+        )
+        (report_dir / "files-light-mobile.png").write_bytes(
+            base64.b64decode(screenshot["data"])
+        )
+        await call(
+            "Emulation.setDeviceMetricsOverride",
+            {
+                "width": 1600,
+                "height": 1000,
+                "deviceScaleFactor": 1,
+                "mobile": False,
+            },
+        )
+        page_smoke = {}
+        for page_name in (
+            "libraries",
+            "providers",
+            "graph",
+            "memory",
+            "recall",
+            "system",
+            "files",
+            "settings",
+            "logs",
+        ):
+            await call(
+                "Runtime.evaluate",
+                {
+                    "expression": (
+                        "document.querySelector("
+                        + json.dumps(f'.nav[data-page="{page_name}"]')
+                        + ")?.click()"
+                    )
+                },
+            )
+            await asyncio.sleep(0.5)
+            snapshot = await call(
+                "Runtime.evaluate",
+                {
+                    "expression": (
+                        "({title:document.querySelector('#page-title')?.textContent||'',"
+                        "appVisible:!document.querySelector('#app')?.classList.contains('hidden'),"
+                        "pageVisible:document.querySelector("
+                        + json.dumps(f"#page-{page_name}")
+                        + ")?.classList.contains('active')===true})"
+                    ),
+                    "returnByValue": True,
+                },
+            )
+            page_smoke[page_name] = snapshot["result"]["value"]
         return {
             "libraries": libraries["result"]["value"],
             "providers": providers["result"]["value"],
@@ -257,7 +467,20 @@ async def run(devtools_url: str) -> dict:
                 before_theme["result"]["value"]
                 != after_theme["result"]["value"]
             ),
+            "files": {
+                **files["result"]["value"],
+                "preview": file_preview["result"]["value"],
+                "navigation": file_navigation["result"]["value"],
+            },
+            "page_smoke": page_smoke,
             "runtime_exceptions": len(errors),
+            "runtime_exception_messages": [
+                item.get("params", {})
+                .get("exceptionDetails", {})
+                .get("exception", {})
+                .get("description", "unknown runtime exception")
+                for item in errors
+            ],
         }
 
 
@@ -268,16 +491,30 @@ def main() -> int:
     parser.add_argument(
         "--devtools-url", default="http://127.0.0.1:9222"
     )
-    args = parser.parse_args()
-    result = asyncio.run(run(args.devtools_url))
-    report_path = (
-        ROOT
-        / "data"
-        / "libraries"
-        / "beileite"
-        / "reports"
-        / "webui-acceptance.json"
+    parser.add_argument("--base-url", default="http://127.0.0.1:8765")
+    parser.add_argument("--state-root", type=Path, default=default_state_root())
+    parser.add_argument("--credential", default="")
+    parser.add_argument(
+        "--report-dir",
+        type=Path,
+        default=Path(tempfile.gettempdir()) / "personalityrag-webui-acceptance",
     )
+    args = parser.parse_args()
+    credential = args.credential or default_credential(args.state_root.resolve())
+    if not credential:
+        parser.error(
+            "--credential is required when the configured WebUI login uses a password"
+        )
+    report_dir = args.report_dir.resolve()
+    result = asyncio.run(
+        run(
+            args.devtools_url,
+            base_url=args.base_url,
+            credential=credential,
+            report_dir=report_dir,
+        )
+    )
+    report_path = report_dir / "webui-acceptance.json"
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(
         json.dumps(result, ensure_ascii=False, indent=2),
@@ -291,12 +528,30 @@ def main() -> int:
         and result["provider_editor"]["type_cards"] == 3
         and result["provider_editor"]["fields"] == 12
         and result["provider_editor"]["createIdEditable"]
-        and result["provider_editor"]["idReadOnly"]
-        and result["provider_editor"]["secretBlank"]
+        and (
+            not result["provider_editor"]["existingProviderPresent"]
+            or (
+                result["provider_editor"]["idReadOnly"]
+                and result["provider_editor"]["secretBlank"]
+            )
+        )
         and result["locales"]["zh"]["title"] == "模型提供商"
         and result["locales"]["en"]["title"] == "Providers"
         and result["locales"]["ru"]["title"] == "Провайдеры"
         and result["theme_changed"]
+        and result["files"]["rows"] >= 1
+        and result["files"]["protectedItems"] >= 1
+        and result["files"]["folderIcons"] >= 1
+        and result["files"]["codeIcons"] >= 1
+        and not result["files"]["visibleInternal"]
+        and result["files"]["preview"]["visible"]
+        and result["files"]["preview"]["contentLength"] > 0
+        and result["files"]["navigation"]["path"].endswith("/docs")
+        and result["files"]["navigation"]["breadcrumbCount"] >= 2
+        and all(
+            item["appVisible"] and item["pageVisible"]
+            for item in result["page_smoke"].values()
+        )
     ) else 1
 
 

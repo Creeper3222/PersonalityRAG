@@ -5,6 +5,23 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 from .config import normalize_access_base_url
+from .identifiers import validate_identifier
+
+
+def _validate_required_id(value: str, *, field: str) -> str:
+    return validate_identifier(value, field=field)
+
+
+def _validate_optional_id(value: str | None, *, field: str) -> str | None:
+    if value is None or value == "":
+        return value
+    return validate_identifier(value, field=field)
+
+
+def _validate_present_id(value: str | None, *, field: str) -> str | None:
+    if value is None:
+        return None
+    return validate_identifier(value, field=field)
 
 
 class LoginRequest(BaseModel):
@@ -18,6 +35,8 @@ class SettingsUpdate(BaseModel):
     access_port: int | None = Field(default=None, ge=1, le=65535)
     new_password: str | None = None
     clear_password: bool = False
+    runtime_idle_minutes: int | None = Field(default=None, ge=1)
+    max_non_default_runtimes: int | None = Field(default=None, ge=1)
 
     @field_validator("access_base_url")
     @classmethod
@@ -30,6 +49,12 @@ class SettingsUpdate(BaseModel):
             raise ValueError(
                 "服务接入端点 URL 需为不带端口、路径、查询参数或尾斜杠的 http(s) 基址"
             ) from exc
+
+
+class BackupMigrationExportRequest(BaseModel):
+    password: str = Field(default="", max_length=512)
+    include_libraries: bool = True
+    include_providers: bool = True
 
 
 class UiLogRequest(BaseModel):
@@ -80,10 +105,14 @@ class MemoryUpdate(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class MemoryPersonaUpdate(BaseModel):
+    persona_id: str = ""
+
+
 class RecallRequest(BaseModel):
     query: str
-    k: int = Field(default=5, ge=1, le=50)
-    rerank_k: int | None = Field(default=None, ge=1, le=50)
+    k: int = Field(default=5, ge=1)
+    rerank_k: int | None = Field(default=None, ge=1)
     session_id: str | None = None
     persona_id: str | None = None
     rerank: bool | None = None
@@ -111,6 +140,20 @@ class ConversationTrimRequest(BaseModel):
     delete_count: int = Field(default=0, ge=0)
 
 
+class AdapterHeartbeatRequest(BaseModel):
+    wait_seconds: float = Field(default=0, ge=0, le=55)
+    manual_reconnect: bool = False
+
+
+class AdapterDisconnectRequest(BaseModel):
+    instance_id: str
+
+    @field_validator("instance_id")
+    @classmethod
+    def validate_instance_id(cls, value: str) -> str:
+        return _validate_required_id(value, field="适配器实例ID")
+
+
 class BatchDelete(BaseModel):
     memory_ids: list[int]
 
@@ -131,6 +174,11 @@ class GraphQuery(BaseModel):
 class RebuildRequest(BaseModel):
     reason: str = "manual"
     provider_id: str | None = None
+
+    @field_validator("provider_id")
+    @classmethod
+    def validate_provider_id(cls, value: str | None) -> str | None:
+        return _validate_optional_id(value, field="Provider ID")
 
 
 class MigrationRequest(BaseModel):
@@ -160,6 +208,12 @@ class ProviderCreate(BaseModel):
     model_endpoint: str = ""
     truncate: str = ""
     launch_model_if_not_running: bool = False
+    index_rebuild_settings: dict[str, Any] | None = None
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str) -> str:
+        return _validate_required_id(value, field="Provider ID")
 
 
 class ProviderUpdate(BaseModel):
@@ -184,10 +238,21 @@ class ProviderUpdate(BaseModel):
     model_endpoint: str | None = None
     truncate: str | None = None
     launch_model_if_not_running: bool | None = None
+    index_rebuild_settings: dict[str, Any] | None = None
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str | None) -> str | None:
+        return _validate_present_id(value, field="Provider ID")
 
 
 class ProviderCopy(BaseModel):
     new_id: str | None = None
+
+    @field_validator("new_id")
+    @classmethod
+    def validate_new_id(cls, value: str | None) -> str | None:
+        return _validate_optional_id(value, field="Provider ID")
 
 
 class DebugProviderRevisionPatch(BaseModel):
@@ -208,8 +273,25 @@ class LibraryCreate(BaseModel):
     default_persona_id: str = ""
     provider_id: str
     rerank_provider_id: str | None = None
+    conversation_settings: dict[str, Any] | None = None
     recall_settings: dict[str, Any] | None = None
     maintenance_settings: dict[str, Any] | None = None
+    metadata: dict[str, Any] | None = None
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str) -> str:
+        return _validate_required_id(value, field="记忆库 ID")
+
+    @field_validator("provider_id")
+    @classmethod
+    def validate_provider_id(cls, value: str) -> str:
+        return _validate_required_id(value, field="Provider ID")
+
+    @field_validator("rerank_provider_id")
+    @classmethod
+    def validate_rerank_provider_id(cls, value: str | None) -> str | None:
+        return _validate_optional_id(value, field="Provider ID")
 
 
 class LibraryUpdate(BaseModel):
@@ -219,8 +301,25 @@ class LibraryUpdate(BaseModel):
     default_persona_id: str | None = None
     provider_id: str | None = None
     rerank_provider_id: str | None = None
+    conversation_settings: dict[str, Any] | None = None
     recall_settings: dict[str, Any] | None = None
     maintenance_settings: dict[str, Any] | None = None
+    metadata: dict[str, Any] | None = None
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str | None) -> str | None:
+        return _validate_present_id(value, field="记忆库 ID")
+
+    @field_validator("provider_id")
+    @classmethod
+    def validate_provider_id(cls, value: str | None) -> str | None:
+        return _validate_present_id(value, field="Provider ID")
+
+    @field_validator("rerank_provider_id")
+    @classmethod
+    def validate_rerank_provider_id(cls, value: str | None) -> str | None:
+        return _validate_optional_id(value, field="Provider ID")
 
 
 class LibraryPskRequest(BaseModel):

@@ -4,6 +4,8 @@ PersonalityRAG 是一个脱离具体 Bot 框架独立运行的人格记忆 RAG �
 
 项目采用 **AGPL-3.0-only**。PersonalityRAG 的存储、召回、图记忆、迁移和管理界面设计受到 [lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory) 启发，并以其 LivingMemory 数据库结构作为兼容目标。来源与版权信息见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)，完整许可证见 [LICENSE](LICENSE)。
 
+AstrBot 接入请使用配套插件：[astrbot_plugin_personality_rag_adapter](https://github.com/Creeper3222/astrbot_plugin_personality_rag_adapter)。
+
 ## 当前能力
 
 - 独立 Windows Shell 版本，双击 `launcher.bat` 启动。
@@ -13,14 +15,16 @@ PersonalityRAG 是一个脱离具体 Bot 框架独立运行的人格记忆 RAG �
 - 全局 Rerank Provider 池，支持 vLLM/OpenAI-compatible Rerank、Xinference Rerank、阿里云百炼 qwen3-rerank/DashScope 分支、NVIDIA NIM Rerank。
 - Provider revision 与 FAISS generation 绑定；切换 embedding 模型会提示并重建索引，重建验证成功后再原子切换。
 - 最大上下文长度自动检测和手动设置；切换到更低上下文模型时会提示潜在截断风险，但不会修改或截断源文本。
-- 记忆管理、知识图谱、召回测试、系统概览、日志与任务列表、基础设置。
+- 记忆管理、知识图谱、召回测试、系统概览、文件管理、日志与任务列表、基础设置。
 - 自定义 WebUI/接入 URL 基址，方便从 Docker、局域网或云端反向代理访问。
 - `livingmemory.db` 单文件导入、全量索引重建、记忆库复制、核心数据库备份和删除回收。
 - Bearer API Key、WebUI 登录密码和库级 PSK 接入密钥。
 
-首版不包含 LLM 自动总结、Agent 工具、AstrBot/MaiBot/EchoBot 接入插件，也不会持续采集聊天记录。
+本体不内置 Bot 接入插件，也不会主动持续采集聊天记录；AstrBot 对话捕获、召回注入、LLM 总结和 Agent 工具由配套适配器插件完成。
 
 ## 启动
+
+运行环境固定为 **CPython 3.12 x64**。启动器会校验已有 `.venv`；如果发现其它 Python 版本，会明确拒绝启动，且不会删除或覆盖现有环境。
 
 双击：
 
@@ -30,10 +34,11 @@ launcher.bat
 
 启动器会自动完成：
 
-1. 创建 `.venv`。
-2. 安装或补齐 `requirements.txt` 中缺失的依赖。
-3. 生成 `config/config.json`、随机 API Key、会话密钥和库级 PSK 派生密钥。
-4. 启动 WebUI，默认地址为 `http://127.0.0.1:8765/`。
+1. 在不存在 `.venv` 时创建 Python 3.12 x64 虚拟环境。
+2. 按 `requirements-runtime.lock` 安装经过 Python 3.12 验证的运行依赖。
+3. 根据 Python 版本、`requirements.txt` 和锁文件生成依赖指纹；三者未变化时后续启动会跳过 `pip install`。
+4. 生成 `config/config.json`、随机 API Key、会话密钥和库级 PSK 派生密钥。
+5. 启动 WebUI，默认地址为 `http://127.0.0.1:8765/`。
 
 如果配置端口被占用，服务会向后寻找可用端口，并在终端和日志中提示实际访问地址。基础设置页可以调整 WebUI 端口、接入端口和 URL 基址。
 
@@ -120,6 +125,18 @@ PersonalityRAG 复刻 LivingMemory 数据库版本 v8 对应的核心召回链�
 
 如果当前记忆库绑定了 Rerank Provider，召回 API 和 WebUI 召回测试页可以返回重排结果；Rerank 失败时会回退到未重排的 embedding 召回结果。
 
+## 文件管理
+
+WebUI 的“文件管理”页面复用 RocketCatShell 已验证的文件管理交互，用于为后续 Linux / Docker 部署提供不依赖宿主机桌面的文件浏览入口。页面支持目录浏览、UTF-8 文本查看和编辑、图片预览、新建、上传、重命名、移动、删除以及单项或批量下载。
+
+- 文件管理只接受 PersonalityRAG 程序目录或运行数据目录内的相对路径；绝对路径、盘符、`..`、UNC 路径和符号链接越界目标都会被拒绝。
+- 当程序目录和运行数据目录分离时，页面提供两个根入口；路径相同或互相包含时自动合并，不能借另一入口绕过保护。
+- `.git`、虚拟环境、Python/测试缓存和 `node_modules` 不会显示，直接请求同样被拒绝。
+- 本体源码、WebUI 静态资源、启动与依赖文件，以及 `config/`、`data/` 中的配置、数据库、索引和日志只允许浏览与下载，不能通过文件管理修改、移动或删除。
+- 读取或下载运行数据需要再次输入 WebUI 登录/文件管理验证密码；密码只在请求体中传递，不会写入 URL 或日志。
+- 文本预览和在线编辑上限为 `1 MiB`；单次最多上传 20 个文件，单文件上限为 `100 MiB`。大目录和批量下载使用临时 ZIP 流式返回，不会整体载入进程内存。
+- 文件列表为目录、图片、TXT、JSON/Python/Markdown、PDF、Word 和其它文件显示不同图标；全部配色跟随 PersonalityRAG 明暗主题。
+
 ## REST API
 
 除健康检查、登录状态和静态资源外，接口默认需要：
@@ -153,6 +170,16 @@ POST       /api/v1/libraries/{library_id}/graph/query
 POST       /api/v1/libraries/{library_id}/indexes/rebuild
 GET        /api/v1/jobs
 GET        /api/v1/jobs/{job_id}
+
+GET        /api/v1/files
+POST       /api/v1/files/read
+POST       /api/v1/files/write
+POST       /api/v1/files/create
+POST       /api/v1/files/upload
+POST       /api/v1/files/rename
+POST       /api/v1/files/move
+POST       /api/v1/files/delete
+GET/POST   /api/v1/files/download
 ```
 
 旧的 `/api/v1/memories`、`/api/v1/recall`、`/api/v1/graph/...` 会代理到默认记忆库，用于早期脚本兼容。
@@ -167,7 +194,7 @@ Bot 适配器推荐使用：
 Authorization: Bearer psk-...
 ```
 
-PSK 只在包含 `{library_id}` 的记忆库路径上生效，例如 `/api/v1/libraries/beileite/recall`。适配器必须同时配置正确的记忆库 ID 和对应 PSK，否则会返回 `401 Unauthorized`。全局 API Key 仍保留给本机管理脚本和旧版兼容。
+PSK 只在包含 `{library_id}` 的记忆库路径上生效，新安装的默认库 ID 为 `Default`，例如 `/api/v1/libraries/Default/recall`。适配器必须手动配置正确的记忆库 ID 和对应 PSK，否则会返回 `401 Unauthorized`。全局 API Key 仍保留给本机管理脚本和旧版兼容。
 
 ## 发布版内容
 

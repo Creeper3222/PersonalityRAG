@@ -24,12 +24,12 @@
     "max_retries": 5
   },
   "recall": {
-    "top_k": 10,
     "rrf_k": 60,
     "decay_rate": 0.0,
     "score_alpha": 0.5,
     "score_beta": 0.25,
     "score_gamma": 0.25,
+    "importance_weight": 1.0,
     "mmr_lambda": 0.7,
     "document_route_weight": 0.65,
     "graph_route_weight": 0.35,

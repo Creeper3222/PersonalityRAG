@@ -10,8 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from personalityrag.config import load_config
-from personalityrag.libraries import LibraryManager
+from personalityrag.config import load_config  # noqa: E402
+from personalityrag.libraries import LibraryManager  # noqa: E402
 
 
 DEFAULT_SOURCE = Path(

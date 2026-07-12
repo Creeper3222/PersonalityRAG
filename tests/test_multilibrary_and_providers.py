@@ -9,17 +9,22 @@ import httpx
 import numpy as np
 import pytest
 
-from personalityrag.config import AppConfig, ProviderConfig
+from personalityrag.config import (
+    AppConfig,
+    ProviderConfig,
+    RuntimeResidencyConfig,
+)
 from personalityrag.compat import LIVINGMEMORY_DATABASE_VERSION
 from personalityrag.control import ControlStore
 from personalityrag.graph import GraphBuilder
 from personalityrag.indexes import IndexManager
-from personalityrag.libraries import LibraryManager
+from personalityrag.libraries import DEFAULT_LIBRARY_ID, LibraryManager
 from personalityrag.providers import (
     EmbeddingProvider,
     OllamaEmbeddingProvider,
     OpenAIEmbeddingProvider,
     VLLMEmbeddingProvider,
+    provider_config_hash,
 )
 from personalityrag.storage import Storage
 from personalityrag.text import TextProcessor
@@ -69,6 +74,50 @@ class FakeProvider(EmbeddingProvider):
 class FailingProvider(FakeProvider):
     async def test_connection(self):
         return {"available": False, "error": "fixture failure"}
+
+
+def _patch_fake_providers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "personalityrag.service.build_provider",
+        lambda config: FakeProvider(config),
+    )
+    monkeypatch.setattr(
+        "personalityrag.libraries.build_provider",
+        lambda config: FakeProvider(config),
+    )
+
+
+@pytest.mark.asyncio
+async def test_new_install_uses_Default_and_existing_default_is_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "PersonalityRAG"
+    provider_config = ProviderConfig(dimensions=8)
+    monkeypatch.setattr(
+        "personalityrag.service.build_provider", lambda config: FakeProvider(config)
+    )
+    monkeypatch.setattr(
+        "personalityrag.libraries.build_provider", lambda config: FakeProvider(config)
+    )
+
+    manager = LibraryManager(root, AppConfig(provider=provider_config))
+    await manager.initialize()
+    try:
+        default = await manager.control.default_library()
+        assert DEFAULT_LIBRARY_ID == "Default"
+        assert default.id == DEFAULT_LIBRARY_ID
+        await manager.update_library(default.id, {"id": "existing_default"})
+    finally:
+        await manager.close()
+
+    restored = LibraryManager(root, AppConfig(provider=provider_config))
+    await restored.initialize()
+    try:
+        default = await restored.control.default_library()
+        assert default.id == "existing_default"
+        assert await restored.control.get_library(DEFAULT_LIBRARY_ID) is None
+    finally:
+        await restored.close()
 
 
 @pytest.mark.asyncio
@@ -578,6 +627,41 @@ async def test_provider_copy_delete_reuses_released_id_and_numbers(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_embedding_provider_index_rebuild_settings_are_non_semantic(
+    tmp_path: Path,
+):
+    control = ControlStore(tmp_path / "system.db")
+    seed = ProviderConfig(id="embedding_provider", dimensions=8)
+    await control.initialize(seed)
+
+    before = await control.get_provider(seed.id)
+    assert before is not None
+    before_hash = provider_config_hash(before.config)
+
+    updated = await control.update_provider(
+        seed.id,
+        {
+            "index_rebuild_settings": {
+                "batch_size": 25,
+                "embedding_batch_size": 4,
+                "tasks_limit": 1,
+                "max_retries": 7,
+                "retry_base_delay": 12,
+                "batch_delay": 3,
+                "request_delay": 2,
+                "max_failure_ratio": 0.05,
+            },
+        },
+    )
+
+    assert updated.revision == before.revision
+    assert provider_config_hash(updated.config) == before_hash
+    assert updated.config.index_rebuild_settings.batch_size == 25
+    assert updated.config.index_rebuild_settings.embedding_batch_size == 4
+    assert updated.config.index_rebuild_settings.max_retries == 7
+
+
+@pytest.mark.asyncio
 async def test_provider_kind_filtering_and_rerank_usage_protection(tmp_path: Path):
     control = ControlStore(tmp_path / "system.db")
     seed = ProviderConfig(id="embedding_provider")
@@ -643,7 +727,7 @@ async def test_library_rerank_binding_does_not_queue_rebuild(
     manager = LibraryManager(root, AppConfig(provider=provider_config))
     await manager.initialize()
     try:
-        runtime = await manager.get_runtime("beileite")
+        runtime = await manager.get_runtime("Default")
         generation_before = runtime.indexes.status()["generation"]
         await manager.create_provider(
             {
@@ -660,7 +744,7 @@ async def test_library_rerank_binding_does_not_queue_rebuild(
             }
         )
         updated = await manager.update_library(
-            "beileite", {"rerank_provider_id": "local_rerank"}
+            "Default", {"rerank_provider_id": "local_rerank"}
         )
         assert updated["rerank_provider_id"] == "local_rerank"
         assert runtime.indexes.status()["generation"] == generation_before
@@ -673,7 +757,7 @@ async def test_library_rerank_binding_does_not_queue_rebuild(
 
 
 @pytest.mark.asyncio
-async def test_legacy_data_migrates_to_beileite_and_libraries_are_isolated(
+async def test_legacy_data_migrates_to_Default_and_libraries_are_isolated(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     root = tmp_path / "PersonalityRAG"
@@ -706,11 +790,11 @@ async def test_legacy_data_migrates_to_beileite_and_libraries_are_isolated(
     manager = LibraryManager(root, AppConfig(provider=provider_config))
     await manager.initialize()
     try:
-        default = await manager.library_detail("beileite")
+        default = await manager.library_detail("Default")
         assert default["name"] == "贝雷特"
         assert default["stats"]["total_memories"] == 1
         assert not (data / "livingmemory.db").exists()
-        assert (data / "libraries" / "beileite" / "livingmemory.db").exists()
+        assert (data / "libraries" / "Default" / "livingmemory.db").exists()
         marker = json.loads(
             (data / ".multilibrary_migrated_v1.json").read_text(
                 encoding="utf-8"
@@ -718,7 +802,7 @@ async def test_legacy_data_migrates_to_beileite_and_libraries_are_isolated(
         )
         assert marker["validation"] == "passed"
         assert (
-            await (await manager.get_runtime("beileite")).storage.get_document(
+            await (await manager.get_runtime("Default")).storage.get_document(
                 original_id
             )
         )
@@ -751,7 +835,7 @@ async def test_legacy_data_migrates_to_beileite_and_libraries_are_isolated(
         )
         assert (await second_runtime.storage.statistics())["total_memories"] == 1
         assert (
-            await (await manager.get_runtime("beileite")).storage.statistics()
+            await (await manager.get_runtime("Default")).storage.statistics()
         )["total_memories"] == 1
     finally:
         await manager.close()
@@ -834,7 +918,7 @@ async def test_failed_legacy_layout_validation_rolls_back_source(
     with pytest.raises(RuntimeError, match="文档 FAISS ID 数量"):
         await manager.initialize()
     assert (data / "livingmemory.db").exists()
-    assert not (data / "libraries" / "beileite").exists()
+    assert not (data / "libraries" / "Default").exists()
     assert not (data / ".multilibrary_migrated_v1.json").exists()
     assert (data / "personalityrag_system.db").read_bytes() == system_before
 
@@ -864,22 +948,27 @@ async def test_library_listing_stays_lazy_and_rejected_default_delete_keeps_runt
     manager = LibraryManager(root, AppConfig(provider=provider_config))
     await manager.initialize()
     try:
-        assert set(manager.runtimes) == {"beileite"}
+        assert set(manager.runtimes) == {"Default"}
         libraries = await manager.list_libraries()
-        assert {item["id"] for item in libraries} == {"beileite", "second"}
-        assert set(manager.runtimes) == {"beileite"}
+        assert {item["id"] for item in libraries} == {"Default", "second"}
+        assert set(manager.runtimes) == {"Default"}
 
-        runtime = manager.runtimes["beileite"]
+        runtime = manager.runtimes["Default"]
         provider = runtime.provider
         await manager.update_library(
-            "second", {"recall_settings": {"top_k": 3}}
+            "second", {"recall_settings": {"top_k": 3, "importance_weight": 2.5}}
         )
+        second = await manager.control.get_library("second")
         second_runtime = await manager.get_runtime("second")
-        assert second_runtime.config.recall.top_k == 3
-        assert runtime.config.recall.top_k == 10
+        assert second is not None
+        assert "top_k" not in second.recall_settings
+        assert second_runtime.config.recall.importance_weight == 2.5
+        assert runtime.config.recall.importance_weight == 1.0
+        assert not hasattr(second_runtime.config.recall, "top_k")
+        assert not hasattr(runtime.config.recall, "top_k")
         with pytest.raises(ValueError, match="默认记忆库不能删除"):
-            await manager.delete_library("beileite")
-        assert manager.runtimes["beileite"] is runtime
+            await manager.delete_library("Default")
+        assert manager.runtimes["Default"] is runtime
         assert provider.closed is False
     finally:
         await manager.close()
@@ -903,20 +992,20 @@ async def test_library_copy_uses_numbered_fallback_after_soft_delete(
     manager = LibraryManager(root, AppConfig(provider=provider_config))
     await manager.initialize()
     try:
-        first = await manager.copy_library("beileite")
-        second = await manager.copy_library("beileite")
-        assert first["id"] == "beileite_copy"
+        first = await manager.copy_library("Default")
+        second = await manager.copy_library("Default")
+        assert first["id"] == "Default_copy"
         assert first["name"] == "贝雷特(副本)"
-        assert second["id"] == "beileite_copy2"
+        assert second["id"] == "Default_copy2"
         assert second["name"] == "贝雷特(副本2)"
 
         await manager.delete_library(first["id"])
-        third = await manager.copy_library("beileite")
-        assert third["id"] == "beileite_copy3"
+        third = await manager.copy_library("Default")
+        assert third["id"] == "Default_copy3"
         assert third["name"] == "贝雷特(副本3)"
         assert not (root / "data" / "libraries" / first["id"]).exists()
         trash_candidates = list(
-            (root / "data" / "trash" / "libraries").glob("beileite_copy-*")
+            (root / "data" / "trash" / "libraries").glob("Default_copy-*")
         )
         assert trash_candidates
         assert sorted(item.name for item in trash_candidates[0].iterdir()) == [
@@ -925,7 +1014,7 @@ async def test_library_copy_uses_numbered_fallback_after_soft_delete(
         ]
 
         libraries = {item["id"] for item in await manager.list_libraries()}
-        assert libraries == {"beileite", "beileite_copy2", "beileite_copy3"}
+        assert libraries == {"Default", "Default_copy2", "Default_copy3"}
     finally:
         await manager.close()
 
@@ -1057,7 +1146,7 @@ async def test_provider_switch_is_atomic_and_failed_switch_preserves_binding(
     manager = LibraryManager(root, AppConfig(provider=provider_config))
     await manager.initialize()
     try:
-        runtime = await manager.get_runtime("beileite")
+        runtime = await manager.get_runtime("Default")
         old_provider = runtime.provider
         await manager.create_library(
             {
@@ -1076,8 +1165,8 @@ async def test_provider_switch_is_atomic_and_failed_switch_preserves_binding(
                 "dimensions": 8,
             }
         )
-        await manager.rebuild_library("beileite", switched["id"])
-        binding = await manager.control.get_library("beileite")
+        await manager.rebuild_library("Default", switched["id"])
+        binding = await manager.control.get_library("Default")
         assert binding is not None
         assert binding.provider_id == "second_provider"
         other_binding = await manager.control.get_library("other_library")
@@ -1099,8 +1188,8 @@ async def test_provider_switch_is_atomic_and_failed_switch_preserves_binding(
         current_generation = runtime.indexes.status()["generation"]
         current_provider = runtime.provider
         with pytest.raises(RuntimeError, match="Provider 测试失败"):
-            await manager.rebuild_library("beileite", failed["id"])
-        binding = await manager.control.get_library("beileite")
+            await manager.rebuild_library("Default", failed["id"])
+        binding = await manager.control.get_library("Default")
         assert binding is not None
         assert binding.provider_id == "second_provider"
         assert runtime.provider is current_provider
@@ -1123,11 +1212,11 @@ async def test_persona_and_session_filters_remain_library_local(
     manager = LibraryManager(root, AppConfig(provider=provider_config))
     await manager.initialize()
     try:
-        runtime = await manager.get_runtime("beileite")
+        runtime = await manager.get_runtime("Default")
         await runtime.create_memory(
             {
                 "content": "贝雷特喜欢夜空与星辰",
-                "persona_id": "beileite",
+                "persona_id": "Default",
                 "session_id": "session-a",
                 "topics": ["星空"],
             }
@@ -1141,11 +1230,11 @@ async def test_persona_and_session_filters_remain_library_local(
             }
         )
         by_persona = await runtime.retrieval.search(
-            "喜欢什么", k=10, persona_id="beileite"
+            "喜欢什么", k=10, persona_id="Default"
         )
         assert by_persona
         assert all(
-            item.metadata.get("persona_id") == "beileite"
+            item.metadata.get("persona_id") == "Default"
             for item in by_persona
         )
 
@@ -1187,7 +1276,7 @@ async def test_queries_keep_using_old_snapshot_during_provider_rebuild(
     manager = LibraryManager(root, AppConfig(provider=provider_config))
     await manager.initialize()
     try:
-        runtime = await manager.get_runtime("beileite")
+        runtime = await manager.get_runtime("Default")
         await runtime.create_memory(
             {"content": "旧索引在重建期间仍应可查询", "persona_id": "fixture"}
         )
@@ -1203,7 +1292,7 @@ async def test_queries_keep_using_old_snapshot_during_provider_rebuild(
             }
         )
         rebuild = asyncio.create_task(
-            manager.rebuild_library("beileite", provider["id"])
+            manager.rebuild_library("Default", provider["id"])
         )
         await asyncio.wait_for(started.wait(), timeout=1)
         results = await asyncio.wait_for(
@@ -1220,3 +1309,182 @@ async def test_queries_keep_using_old_snapshot_during_provider_rebuild(
         # aiosqlite uses a worker thread; allow its final call_soon_threadsafe
         # notification to reach the still-open test event loop on Windows.
         await asyncio.sleep(0.05)
+
+
+@pytest.mark.asyncio
+async def test_runtime_residency_keeps_default_and_evicts_non_default_lru(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_fake_providers(monkeypatch)
+    provider = ProviderConfig(dimensions=8)
+    config = AppConfig(
+        provider=provider,
+        runtime_residency=RuntimeResidencyConfig(
+            idle_minutes=30,
+            max_non_default_runtimes=2,
+        ),
+    )
+    manager = LibraryManager(tmp_path / "PersonalityRAG", config)
+    await manager.initialize()
+    try:
+        for library_id in ("first", "second", "third"):
+            await manager.create_library(
+                {
+                    "id": library_id,
+                    "name": library_id,
+                    "provider_id": provider.id,
+                }
+            )
+
+        assert set(manager.runtimes) == {"Default", "second", "third"}
+        assert manager.runtimes["Default"] is not None
+
+        await manager.get_runtime("first")
+        assert set(manager.runtimes) == {"Default", "first", "third"}
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_residency_lease_allows_temporary_overflow_then_converges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_fake_providers(monkeypatch)
+    provider = ProviderConfig(dimensions=8)
+    config = AppConfig(
+        provider=provider,
+        runtime_residency=RuntimeResidencyConfig(
+            idle_minutes=30,
+            max_non_default_runtimes=1,
+        ),
+    )
+    manager = LibraryManager(tmp_path / "PersonalityRAG", config)
+    await manager.initialize()
+    try:
+        await manager.create_library(
+            {"id": "held", "name": "held", "provider_id": provider.id}
+        )
+        await manager.acquire_runtime("held")
+        await manager.create_library(
+            {"id": "waiting", "name": "waiting", "provider_id": provider.id}
+        )
+
+        assert set(manager.runtimes) == {"Default", "held", "waiting"}
+        assert manager.runtime_residency_status()["runtimes"]["held"][
+            "lease_count"
+        ] == 1
+
+        await manager.release_runtime("held")
+        non_default = set(manager.runtimes) - {"Default"}
+        assert len(non_default) == 1
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_job_runtime_lease_is_acquired_only_during_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_fake_providers(monkeypatch)
+    provider = ProviderConfig(dimensions=8)
+    manager = LibraryManager(
+        tmp_path / "PersonalityRAG",
+        AppConfig(
+            provider=provider,
+            runtime_residency=RuntimeResidencyConfig(
+                idle_minutes=30,
+                max_non_default_runtimes=1,
+            ),
+        ),
+    )
+    await manager.initialize()
+    try:
+        await manager.create_library(
+            {"id": "held", "name": "held", "provider_id": provider.id}
+        )
+        await manager.acquire_runtime("held")
+        await manager.create_library(
+            {"id": "worker", "name": "worker", "provider_id": provider.id}
+        )
+        assert set(manager.runtimes) == {"Default", "held", "worker"}
+        observed: list[int] = []
+
+        async def operation(progress):
+            observed.append(
+                manager.runtime_residency_status()["runtimes"]["worker"][
+                    "lease_count"
+                ]
+            )
+            return {"ok": True}
+
+        assert manager.jobs is not None
+        job_id = await manager.jobs.start(
+            "fixture_runtime_job",
+            operation,
+            library_id="worker",
+            dedupe_active=False,
+        )
+        result = await asyncio.wait_for(manager.jobs.wait(job_id), timeout=2)
+
+        assert result["status"] == "completed"
+        assert observed == [1]
+        assert set(manager.runtimes) == {"Default", "held"}
+        await manager.release_runtime("held")
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_hot_limit_and_idle_reload_preserve_recall_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_fake_providers(monkeypatch)
+    provider = ProviderConfig(dimensions=8)
+    config = AppConfig(
+        provider=provider,
+        runtime_residency=RuntimeResidencyConfig(
+            idle_minutes=1,
+            max_non_default_runtimes=2,
+        ),
+    )
+    manager = LibraryManager(tmp_path / "PersonalityRAG", config)
+    await manager.initialize()
+    try:
+        for library_id in ("recall", "spare"):
+            await manager.create_library(
+                {
+                    "id": library_id,
+                    "name": library_id,
+                    "provider_id": provider.id,
+                }
+            )
+        runtime = await manager.get_runtime("recall")
+        await runtime.create_memory(
+            {
+                "content": "贝雷特喜欢在夜空下观察星辰",
+                "persona_id": "fixture",
+                "topics": ["星空"],
+            }
+        )
+        before = await runtime.retrieval.search("贝雷特 星辰", 5)
+
+        config.runtime_residency.max_non_default_runtimes = 1
+        await manager.apply_runtime_residency()
+        assert len(set(manager.runtimes) - {"Default"}) == 1
+
+        if "recall" not in manager.runtimes:
+            runtime = await manager.get_runtime("recall")
+        manager._runtime_residency["recall"].last_used_at -= 120
+        assert await manager.sweep_runtimes() == ["recall"]
+        assert "recall" not in manager.runtimes
+        assert "Default" in manager.runtimes
+
+        reloaded = await manager.get_runtime("recall")
+        after = await reloaded.retrieval.search("贝雷特 星辰", 5)
+        assert [item.doc_id for item in after] == [item.doc_id for item in before]
+        assert [item.final_score for item in after] == pytest.approx(
+            [item.final_score for item in before],
+            abs=1e-12,
+        )
+    finally:
+        await manager.close()

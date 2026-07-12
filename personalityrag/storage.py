@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import sqlite3
 import time
@@ -11,6 +10,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import aiosqlite
+
+from .atoms import compute_atom_ttl
+from .migration import sha256_file
 
 
 def normalize_metadata(value: Any) -> dict[str, Any]:
@@ -622,7 +624,7 @@ class Storage:
             cursor = await db.execute("SELECT id,content FROM graph_entries ORDER BY id")
             graph_rows_raw = await cursor.fetchall()
             graph_rows = [
-                (int(row["id"]), " ".join(tokenize(row["content"] or "")))
+                (int(row["id"]), str(row["content"] or ""))
                 for row in graph_rows_raw
             ]
             await db.executemany(
@@ -643,6 +645,124 @@ class Storage:
             "documents": len(memory_rows),
             "graph_entries": len(graph_rows),
             "atoms": len(atom_rows),
+        }
+
+    async def graph_integrity_report(self) -> dict[str, int]:
+        async with self.connect() as db:
+            async def count_sql(sql: str) -> int:
+                row = await (await db.execute(sql)).fetchone()
+                return int(row[0] or 0)
+
+            documents = await count_sql("SELECT COUNT(*) FROM documents")
+            graph_nodes = await count_sql("SELECT COUNT(*) FROM graph_nodes")
+            graph_edges = await count_sql("SELECT COUNT(*) FROM graph_edges")
+            graph_entries = await count_sql("SELECT COUNT(*) FROM graph_entries")
+            graph_entry_nodes = await count_sql(
+                "SELECT COUNT(*) FROM graph_entry_nodes"
+            )
+            graph_fts = await count_sql(
+                "SELECT COUNT(*) FROM livingmemory_graph_entries_fts"
+            )
+            docs_with_graph = await count_sql(
+                "SELECT COUNT(DISTINCT source_memory_id) FROM graph_entries"
+            )
+            docs_without_graph = await count_sql(
+                """SELECT COUNT(*) FROM documents d
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM graph_entries ge WHERE ge.source_memory_id=d.id
+                )"""
+            )
+            orphan_graph_entries = await count_sql(
+                """SELECT COUNT(*) FROM graph_entries ge
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM documents d WHERE d.id=ge.source_memory_id
+                )"""
+            )
+        return {
+            "documents": documents,
+            "graph_nodes": graph_nodes,
+            "graph_edges": graph_edges,
+            "graph_entries": graph_entries,
+            "graph_entry_nodes": graph_entry_nodes,
+            "graph_fts": graph_fts,
+            "documents_with_graph": docs_with_graph,
+            "documents_without_graph": docs_without_graph,
+            "orphan_graph_entries": orphan_graph_entries,
+        }
+
+    async def fts_integrity_report(self) -> dict[str, int]:
+        async with self.connect() as db:
+            async def count_sql(sql: str) -> int:
+                try:
+                    row = await (await db.execute(sql)).fetchone()
+                except Exception:
+                    return -1
+                return int(row[0] or 0)
+
+            documents = await count_sql("SELECT COUNT(*) FROM documents")
+            document_fts = await count_sql("SELECT COUNT(*) FROM livingmemory_memories_fts")
+            graph_entries = await count_sql("SELECT COUNT(*) FROM graph_entries")
+            graph_fts = await count_sql("SELECT COUNT(*) FROM livingmemory_graph_entries_fts")
+            active_atoms = await count_sql(
+                "SELECT COUNT(*) FROM memory_atoms WHERE status='active'"
+            )
+            atom_fts = await count_sql("SELECT COUNT(*) FROM memory_atoms_fts")
+
+        return {
+            "documents": documents,
+            "document_fts": document_fts,
+            "graph_entries": graph_entries,
+            "graph_fts": graph_fts,
+            "active_atoms": active_atoms,
+            "atom_fts": atom_fts,
+        }
+
+    async def rebuild_graph_from_documents(
+        self,
+        tokenize,
+        graph_builder,
+        progress=None,
+    ) -> dict[str, int]:
+        async with self._write_lock, self.connect() as db:
+            total_row = await (
+                await db.execute("SELECT COUNT(*) FROM documents")
+            ).fetchone()
+            total = int(total_row[0] or 0)
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute("DELETE FROM livingmemory_graph_entries_fts")
+            await db.execute("DELETE FROM graph_entry_nodes")
+            await db.execute("DELETE FROM graph_entries")
+            await db.execute("DELETE FROM graph_edges")
+            await db.execute("DELETE FROM graph_nodes")
+
+            cursor = await db.execute(
+                "SELECT id,text,metadata FROM documents ORDER BY id"
+            )
+            rebuilt_documents = 0
+            rebuilt_entries = 0
+            while True:
+                rows = await cursor.fetchmany(100)
+                if not rows:
+                    break
+                for row in rows:
+                    memory_id = int(row["id"])
+                    text = str(row["text"] or "")
+                    metadata = normalize_metadata(row["metadata"])
+                    canonical = str(metadata.get("canonical_summary") or text)
+                    graph = graph_builder(memory_id, canonical, metadata)
+                    await self._insert_graph(db, graph, tokenize)
+                    rebuilt_documents += 1
+                    rebuilt_entries += len(graph.get("entries") or [])
+                if progress and total:
+                    await progress(
+                        rebuilt_documents / total,
+                        f"已回填 {rebuilt_documents}/{total} 条记忆的图数据",
+                    )
+            await db.commit()
+        return {
+            "documents": total,
+            "rebuilt_documents": rebuilt_documents,
+            "graph_entries": rebuilt_entries,
         }
 
     async def list_documents(
@@ -739,6 +859,35 @@ class Storage:
             "updated_at": row["updated_at"],
         }
 
+    async def document_ids(self) -> list[int]:
+        async with self.connect() as db:
+            rows = await (
+                await db.execute("SELECT id FROM documents ORDER BY id")
+            ).fetchall()
+        return [int(row["id"]) for row in rows]
+
+    async def graph_entry_ids(self) -> list[int]:
+        async with self.connect() as db:
+            rows = await (
+                await db.execute("SELECT id FROM graph_entries ORDER BY id")
+            ).fetchall()
+        return [int(row["id"]) for row in rows]
+
+    async def documents_for_ids(self, memory_ids: Iterable[int]) -> list[dict[str, Any]]:
+        ids = sorted({int(value) for value in memory_ids if int(value) > 0})
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        async with self.connect() as db:
+            rows = await (
+                await db.execute(
+                    f"""SELECT id,doc_id,text,metadata,created_at,updated_at
+                    FROM documents WHERE id IN ({placeholders}) ORDER BY id""",
+                    tuple(ids),
+                )
+            ).fetchall()
+        return [self._document_row(row) for row in rows]
+
     async def iter_documents(self, batch_size: int = 500):
         last_id = 0
         while True:
@@ -783,6 +932,327 @@ class Storage:
                 for row in rows
             ]
             last_id = int(rows[-1]["id"])
+
+    async def graph_entries_for_memory_ids(
+        self, memory_ids: Iterable[int]
+    ) -> list[dict[str, Any]]:
+        ids = sorted({int(value) for value in memory_ids if int(value) > 0})
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        async with self.connect() as db:
+            rows = await (
+                await db.execute(
+                    f"""SELECT id,source_memory_id,session_id,persona_id,
+                    entry_type,relation_type,content,metadata
+                    FROM graph_entries
+                    WHERE source_memory_id IN ({placeholders})
+                    ORDER BY id""",
+                    tuple(ids),
+                )
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "source_memory_id": int(row["source_memory_id"]),
+                "session_id": row["session_id"],
+                "persona_id": row["persona_id"],
+                "entry_type": row["entry_type"],
+                "relation_type": row["relation_type"],
+                "content": row["content"],
+                "metadata": normalize_metadata(row["metadata"]),
+            }
+            for row in rows
+        ]
+
+    async def candidate_graph_evidence(
+        self,
+        candidate_ids: list[int],
+        tokens: list[str],
+        *,
+        max_entries_per_candidate: int = 3,
+        graph_expansion_limit: int = 24,
+        graph_expansion_hops: int = 1,
+        graph_second_hop_weight: float = 0.4,
+    ) -> dict[int, dict[str, Any]]:
+        normalized_ids = [
+            int(item)
+            for item in dict.fromkeys(candidate_ids)
+            if int(item) > 0
+        ]
+        if not normalized_ids:
+            return {}
+        token_values = [
+            str(token).strip()
+            for token in dict.fromkeys(tokens)
+            if str(token).strip()
+        ]
+        placeholders = ",".join("?" for _ in normalized_ids)
+        max_entries = max(1, min(8, int(max_entries_per_candidate)))
+        expansion_limit = max(1, min(200, int(graph_expansion_limit)))
+        hops = max(1, min(2, int(graph_expansion_hops)))
+        second_hop_weight = max(0.0, min(1.0, float(graph_second_hop_weight)))
+        evidence: dict[int, dict[str, Any]] = {
+            memory_id: {
+                "keyword_score": 0.0,
+                "node_score": 0.0,
+                "graph_confidence": 0.0,
+                "entries": [],
+                "_entry_ids": set(),
+            }
+            for memory_id in normalized_ids
+        }
+
+        def confidence_from(metadata: dict[str, Any]) -> float:
+            try:
+                return max(0.0, min(1.0, float(metadata.get("graph_confidence", 0.7))))
+            except (TypeError, ValueError):
+                return 0.7
+
+        def add_entry(
+            row: dict[str, Any],
+            *,
+            score: float,
+            source: str,
+            score_field: str | None,
+        ) -> None:
+            memory_id = int(row["source_memory_id"])
+            if memory_id not in evidence:
+                return
+            entry_id = int(row["id"])
+            bucket = evidence[memory_id]
+            if score_field:
+                bucket[score_field] = max(
+                    float(bucket.get(score_field) or 0.0),
+                    max(0.0, min(1.0, float(score))),
+                )
+            if entry_id in bucket["_entry_ids"]:
+                return
+            metadata = normalize_metadata(row.get("metadata"))
+            if score_field and score > 0:
+                bucket["graph_confidence"] = max(
+                    float(bucket.get("graph_confidence") or 0.0),
+                    confidence_from(metadata),
+                )
+            bucket["_entry_ids"].add(entry_id)
+            bucket["entries"].append(
+                {
+                    "entry_id": entry_id,
+                    "content": str(row.get("content") or ""),
+                    "entry_type": row.get("entry_type"),
+                    "relation_type": row.get("relation_type"),
+                    "metadata": metadata,
+                    "source": source,
+                    "score": max(0.0, min(1.0, float(score))),
+                }
+            )
+
+        async def entries_for_nodes(
+            db: Any,
+            node_ids: list[int],
+            *,
+            weight: float,
+            source: str,
+        ) -> None:
+            if not node_ids:
+                return
+            unique_nodes = sorted({int(node_id) for node_id in node_ids})
+            node_placeholders = ",".join("?" for _ in unique_nodes)
+            rows = await (
+                await db.execute(
+                    f"""SELECT ge.id,ge.source_memory_id,ge.content,ge.metadata,
+                    ge.entry_type,ge.relation_type,
+                    COUNT(DISTINCT gen.node_id) AS hit_count
+                    FROM graph_entries ge
+                    JOIN graph_entry_nodes gen ON gen.entry_id=ge.id
+                    WHERE ge.source_memory_id IN ({placeholders})
+                    AND gen.node_id IN ({node_placeholders})
+                    GROUP BY ge.id
+                    ORDER BY hit_count DESC, ge.id DESC
+                    LIMIT ?""",
+                    (*normalized_ids, *unique_nodes, expansion_limit),
+                )
+            ).fetchall()
+            for row in rows:
+                score = max(
+                    0.0,
+                    min(1.0, (0.35 + 0.15 * int(row["hit_count"] or 0)) * weight),
+                )
+                add_entry(
+                    dict(row),
+                    score=score,
+                    source=source,
+                    score_field="node_score",
+                )
+
+        async def neighbor_node_ids(
+            db: Any,
+            node_ids: list[int],
+        ) -> list[int]:
+            if not node_ids:
+                return []
+            unique_nodes = sorted({int(node_id) for node_id in node_ids})
+            node_placeholders = ",".join("?" for _ in unique_nodes)
+            rows = await (
+                await db.execute(
+                    f"""SELECT neighbor_id, SUM(edge_weight) AS total_weight
+                    FROM (
+                        SELECT target_node_id AS neighbor_id, weight AS edge_weight
+                        FROM graph_edges
+                        WHERE source_memory_id IN ({placeholders})
+                        AND source_node_id IN ({node_placeholders})
+                        AND status='active'
+                        UNION ALL
+                        SELECT source_node_id AS neighbor_id, weight AS edge_weight
+                        FROM graph_edges
+                        WHERE source_memory_id IN ({placeholders})
+                        AND target_node_id IN ({node_placeholders})
+                        AND status='active'
+                    )
+                    WHERE neighbor_id NOT IN ({node_placeholders})
+                    GROUP BY neighbor_id
+                    ORDER BY total_weight DESC, neighbor_id ASC
+                    LIMIT ?""",
+                    (
+                        *normalized_ids,
+                        *unique_nodes,
+                        *normalized_ids,
+                        *unique_nodes,
+                        *unique_nodes,
+                        expansion_limit,
+                    ),
+                )
+            ).fetchall()
+            return [int(row["neighbor_id"]) for row in rows]
+
+        async with self.connect() as db:
+            if token_values:
+                fts = " OR ".join(
+                    f'"{token.replace(chr(34), chr(34) * 2)}"'
+                    for token in token_values
+                )
+                try:
+                    rows = await (
+                        await db.execute(
+                            f"""SELECT ge.id,ge.source_memory_id,ge.content,ge.metadata,
+                            ge.entry_type,ge.relation_type,
+                            bm25(livingmemory_graph_entries_fts) AS score
+                            FROM livingmemory_graph_entries_fts gf
+                            JOIN graph_entries ge ON ge.id=gf.entry_id
+                            WHERE livingmemory_graph_entries_fts MATCH ?
+                            AND ge.source_memory_id IN ({placeholders})
+                            ORDER BY score ASC LIMIT ?""",
+                            (
+                                fts,
+                                *normalized_ids,
+                                max(expansion_limit, len(normalized_ids) * max_entries),
+                            ),
+                        )
+                    ).fetchall()
+                except Exception:
+                    rows = []
+                if rows:
+                    raw_scores = [float(row["score"]) for row in rows]
+                    high, low = max(raw_scores), min(raw_scores)
+                    span = high - low
+                    for row in rows:
+                        score = (
+                            1.0
+                            if span == 0
+                            else (high - float(row["score"])) / span
+                        )
+                        add_entry(
+                            dict(row),
+                            score=score,
+                            source="rerank_graph_keyword",
+                            score_field="keyword_score",
+                        )
+
+                like_clauses = " OR ".join(
+                    ["n.canonical_value LIKE ? OR n.node_value LIKE ?"]
+                    * len(token_values)
+                )
+                like_params: list[str] = []
+                for token in token_values:
+                    pattern = f"%{token}%"
+                    like_params.extend([pattern, pattern])
+                node_rows = await (
+                    await db.execute(
+                        f"""SELECT DISTINCT n.id
+                        FROM graph_entries ge
+                        JOIN graph_entry_nodes gen ON gen.entry_id=ge.id
+                        JOIN graph_nodes n ON n.id=gen.node_id
+                        WHERE ge.source_memory_id IN ({placeholders})
+                        AND ({like_clauses})
+                        ORDER BY n.id LIMIT ?""",
+                        (*normalized_ids, *like_params, expansion_limit),
+                    )
+                ).fetchall()
+                direct_node_ids = [int(row["id"]) for row in node_rows]
+                await entries_for_nodes(
+                    db,
+                    direct_node_ids,
+                    weight=1.0,
+                    source="rerank_graph_node",
+                )
+                first_hop_ids = await neighbor_node_ids(db, direct_node_ids)
+                await entries_for_nodes(
+                    db,
+                    first_hop_ids,
+                    weight=0.7,
+                    source="rerank_graph_neighbor",
+                )
+                if hops >= 2 and first_hop_ids:
+                    second_hop_ids = [
+                        node_id
+                        for node_id in await neighbor_node_ids(db, first_hop_ids)
+                        if node_id not in set(direct_node_ids) | set(first_hop_ids)
+                    ]
+                    await entries_for_nodes(
+                        db,
+                        second_hop_ids,
+                        weight=second_hop_weight,
+                        source="rerank_graph_second_hop",
+                    )
+
+            fallback_rows = await (
+                await db.execute(
+                    f"""SELECT id,source_memory_id,content,metadata,entry_type,relation_type
+                    FROM graph_entries
+                    WHERE source_memory_id IN ({placeholders})
+                    ORDER BY source_memory_id ASC, id DESC""",
+                    (*normalized_ids,),
+                )
+            ).fetchall()
+            fallback_count: dict[int, int] = {memory_id: 0 for memory_id in normalized_ids}
+            for row in fallback_rows:
+                memory_id = int(row["source_memory_id"])
+                if fallback_count.get(memory_id, 0) >= max_entries:
+                    continue
+                fallback_count[memory_id] = fallback_count.get(memory_id, 0) + 1
+                add_entry(
+                    dict(row),
+                    score=0.0,
+                    source="rerank_graph_fallback",
+                    score_field=None,
+                )
+
+        result: dict[int, dict[str, Any]] = {}
+        for memory_id, payload in evidence.items():
+            entries = sorted(
+                payload["entries"],
+                key=lambda item: (float(item.get("score") or 0.0), int(item.get("entry_id") or 0)),
+                reverse=True,
+            )[:max_entries]
+            if not entries:
+                continue
+            result[memory_id] = {
+                "keyword_score": float(payload.get("keyword_score") or 0.0),
+                "node_score": float(payload.get("node_score") or 0.0),
+                "graph_confidence": float(payload.get("graph_confidence") or 0.0),
+                "entries": entries,
+            }
+        return result
 
     async def create_memory(
         self,
@@ -925,7 +1395,7 @@ class Storage:
             )
             await db.execute(
                 "INSERT INTO livingmemory_graph_entries_fts(entry_id,content) VALUES(?,?)",
-                (entry_id, " ".join(tokenize(entry["content"]))),
+                (entry_id, str(entry["content"] or "")),
             )
             await db.executemany(
                 "INSERT INTO graph_entry_nodes(entry_id,node_id) VALUES(?,?)",
@@ -940,22 +1410,18 @@ class Storage:
         self, db, memory_id: int, atoms: list[dict[str, Any]], metadata: dict[str, Any]
     ) -> None:
         now = time.time()
-        ttl_defaults = {
-            "episodic": (7.0, "exponential"),
-            "planned": (2.0, "step"),
-            "factual": (180.0, "exponential"),
-            "relational": (90.0, "linear"),
-            "preference": (60.0, "exponential"),
-            "unknown": (30.0, "exponential"),
-        }
         for raw in atoms:
             content = str(raw.get("content") or "").strip()
             if not content:
                 continue
             atom_type = str(raw.get("atom_type") or "unknown").lower()
-            base_ttl, decay = ttl_defaults.get(atom_type, ttl_defaults["unknown"])
             importance = max(0.0, min(1.0, float(raw.get("importance", 0.5))))
-            ttl = max(1.0, base_ttl * (0.5 + importance))
+            ttl, decay = compute_atom_ttl(
+                atom_type,
+                importance,
+                raw.get("reinforcement_count", 0),
+                raw.get("event_time"),
+            )
             cursor = await db.execute(
                 """INSERT INTO memory_atoms(
                     parent_memory_id,atom_type,content,entities,importance,confidence,
@@ -1020,6 +1486,133 @@ class Storage:
             await db.commit()
         return True
 
+    async def update_memory_metadata(
+        self, memory_id: int, updates: dict[str, Any]
+    ) -> bool:
+        async with self._write_lock, self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            row = await (
+                await db.execute(
+                    "SELECT metadata FROM documents WHERE id=?", (memory_id,)
+                )
+            ).fetchone()
+            if not row:
+                await db.rollback()
+                return False
+
+            metadata = normalize_metadata(row["metadata"])
+            metadata.update(dict(updates.get("metadata") or {}))
+            for key in (
+                "importance",
+                "status",
+                "memory_type",
+                "session_id",
+                "persona_id",
+            ):
+                if key in updates:
+                    metadata[key] = updates[key]
+            metadata["updated_at"] = time.time()
+            await db.execute(
+                "UPDATE documents SET metadata=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (json.dumps(metadata, ensure_ascii=False), memory_id),
+            )
+
+            graph_metadata_updates = {
+                key: metadata.get(key)
+                for key in (
+                    "importance",
+                    "session_id",
+                    "persona_id",
+                    "last_access_time",
+                )
+                if key in updates or key in dict(updates.get("metadata") or {})
+            }
+            if graph_metadata_updates:
+                graph_rows = await (
+                    await db.execute(
+                        "SELECT id,metadata FROM graph_entries WHERE source_memory_id=?",
+                        (memory_id,),
+                    )
+                ).fetchall()
+                for graph_row in graph_rows:
+                    graph_metadata = normalize_metadata(graph_row["metadata"])
+                    graph_metadata.update(graph_metadata_updates)
+                    await db.execute(
+                        "UPDATE graph_entries SET metadata=?,updated_at=? WHERE id=?",
+                        (
+                            json.dumps(graph_metadata, ensure_ascii=False),
+                            time.strftime(
+                                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                            ),
+                            int(graph_row["id"]),
+                        ),
+                    )
+            if "session_id" in updates or "persona_id" in updates:
+                assignments = []
+                params: list[Any] = []
+                for key in ("session_id", "persona_id"):
+                    if key in updates:
+                        assignments.append(f"{key}=?")
+                        params.append(metadata.get(key))
+                assignments.append("updated_at=?")
+                params.append(
+                    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                )
+                params.append(memory_id)
+                await db.execute(
+                    f"UPDATE graph_entries SET {','.join(assignments)} WHERE source_memory_id=?",
+                    params,
+                )
+                atom_assignments = []
+                atom_params: list[Any] = []
+                for key in ("session_id", "persona_id"):
+                    if key in updates:
+                        atom_assignments.append(f"{key}=?")
+                        atom_params.append(metadata.get(key))
+                atom_params.append(memory_id)
+                await db.execute(
+                    f"UPDATE memory_atoms SET {','.join(atom_assignments)} WHERE parent_memory_id=?",
+                    atom_params,
+                )
+            await db.commit()
+        return True
+
+    async def update_memory_persona(
+        self, memory_id: int, persona_id: str | None
+    ) -> bool:
+        normalized_persona_id = str(persona_id or "").strip() or None
+        async with self._write_lock, self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            row = await (
+                await db.execute(
+                    "SELECT metadata FROM documents WHERE id=?", (memory_id,)
+                )
+            ).fetchone()
+            if not row:
+                await db.rollback()
+                return False
+            metadata = normalize_metadata(row["metadata"])
+            metadata["persona_id"] = normalized_persona_id
+            metadata["updated_at"] = time.time()
+            await db.execute(
+                "UPDATE documents SET metadata=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (json.dumps(metadata, ensure_ascii=False), memory_id),
+            )
+            await db.execute(
+                "UPDATE graph_entries SET persona_id=?,updated_at=? WHERE source_memory_id=?",
+                (
+                    normalized_persona_id,
+                    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    memory_id,
+                ),
+            )
+            await db.execute(
+                "UPDATE memory_atoms SET persona_id=? WHERE parent_memory_id=?",
+                (normalized_persona_id, memory_id),
+            )
+            await db.commit()
+        return True
+
     async def delete_memories(self, memory_ids: Iterable[int]) -> int:
         ids = sorted({int(value) for value in memory_ids})
         if not ids:
@@ -1060,6 +1653,18 @@ class Storage:
                 deleted += 1
             await db.commit()
         return deleted
+
+    async def mark_memory_indexed(self, memory_id: int, *, generation: str = "") -> None:
+        payload = {"index_generation": generation} if generation else {}
+        async with self.connect() as db:
+            await db.execute(
+                """UPDATE memory_write_ops
+                SET status='completed', step='index_incremental_completed',
+                    payload=?, updated_at=?
+                WHERE memory_id=? AND op_type='add'""",
+                (json.dumps(payload, ensure_ascii=False), time.time(), int(memory_id)),
+            )
+            await db.commit()
 
     async def _delete_graph(self, db, memory_id: int) -> None:
         entry_ids = [
@@ -1136,7 +1741,7 @@ class Storage:
                 state = str(meta.get("status") or "active")
                 status[state] = status.get(state, 0) + 1
                 session = meta.get("session_id")
-                if session:
+                if session and state == "active":
                     sessions[str(session)] = sessions.get(str(session), 0) + 1
                 value = float(meta.get("importance", 0.5) or 0.5)
                 value = value * 10 if value <= 1 else value
@@ -1185,6 +1790,75 @@ class Storage:
             "conversation_counts": conversation,
         }
 
+    async def summary_statistics(self) -> dict[str, Any]:
+        """Return only the scalar counters needed by library cards."""
+        count_keys = (
+            "total_memories",
+            "graph_nodes",
+            "graph_edges",
+            "graph_entries",
+            "atom_count",
+        )
+        counts = {key: 0 for key in count_keys}
+        session_count = 0
+        if self.db_path.exists():
+            async with self.connect() as db:
+                row = await (
+                    await db.execute(
+                        """SELECT
+                        (SELECT COUNT(*) FROM documents) AS total_memories,
+                        (SELECT COUNT(*) FROM graph_nodes) AS graph_nodes,
+                        (SELECT COUNT(*) FROM graph_edges) AS graph_edges,
+                        (SELECT COUNT(*) FROM graph_entries) AS graph_entries,
+                        (SELECT COUNT(*) FROM memory_atoms) AS atom_count,
+                        (SELECT COUNT(DISTINCT CAST(
+                            json_extract(metadata,'$.session_id') AS TEXT
+                        )) FROM documents
+                        WHERE json_valid(metadata)
+                          AND NULLIF(TRIM(CAST(
+                              json_extract(metadata,'$.session_id') AS TEXT
+                          )), '') IS NOT NULL
+                          AND COALESCE(
+                              json_extract(metadata,'$.status'), 'active'
+                          ) = 'active') AS session_count"""
+                    )
+                ).fetchone()
+            counts = {key: int(row[key] or 0) for key in count_keys}
+            session_count = int(row["session_count"] or 0)
+        conversation = {"sessions": 0, "messages": 0, "pending_messages": 0}
+        if self.conversations_path.exists():
+            db = await aiosqlite.connect(self.conversations_path)
+            db.row_factory = aiosqlite.Row
+            try:
+                row = await (
+                    await db.execute(
+                        """SELECT
+                        (SELECT COUNT(*) FROM sessions) AS sessions,
+                        (SELECT COUNT(*) FROM messages) AS messages,
+                        (SELECT COALESCE(SUM(MAX(
+                            0,
+                            message_count - CAST(COALESCE(CASE
+                                WHEN json_valid(metadata)
+                                THEN json_extract(
+                                    metadata,'$.last_summarized_index'
+                                )
+                                ELSE 0
+                            END,0) AS INTEGER)
+                        )),0) FROM sessions) AS pending_messages"""
+                    )
+                ).fetchone()
+                conversation = {
+                    key: int(row[key] or 0)
+                    for key in ("sessions", "messages", "pending_messages")
+                }
+            finally:
+                await db.close()
+        return {
+            **counts,
+            "session_count": session_count,
+            "conversation_counts": conversation,
+        }
+
     async def integrity_report(self) -> dict[str, Any]:
         def inspect(path: Path) -> dict[str, Any]:
             if not path.exists():
@@ -1204,7 +1878,7 @@ class Storage:
                     "integrity": integrity,
                     "foreign_key_errors": len(fk),
                     "tables": tables,
-                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "sha256": sha256_file(path),
                 }
             finally:
                 con.close()

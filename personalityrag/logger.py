@@ -201,7 +201,9 @@ def configure_logging(
     )
 
     app_logger = logging.getLogger(LOGGER_NAME)
-    app_logger.setLevel(level)
+    # Keep DEBUG records available to the WebUI buffer while file and console
+    # handlers continue to honor the configured persistent logging level.
+    app_logger.setLevel(logging.DEBUG)
     app_logger.propagate = False
     for handler in list(app_logger.handlers):
         app_logger.removeHandler(handler)

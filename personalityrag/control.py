@@ -14,7 +14,8 @@ from .compat import (
     LIVINGMEMORY_DATABASE_VERSION_LABEL,
     default_library_metadata,
 )
-from .config import ProviderConfig
+from .config import ConversationConfig, MaintenanceConfig, ProviderConfig, RecallConfig
+from .identifiers import validate_identifier
 from .providers import (
     PROVIDER_TEMPLATES,
     config_from_dict,
@@ -22,6 +23,25 @@ from .providers import (
     provider_kind,
     provider_config_hash,
 )
+from .repositories import (
+    AdapterRepository,
+    JobRepository,
+    LibraryRepository,
+    ProviderRepository,
+    SnapshotRepository,
+)
+
+ADAPTER_CONNECTION_TTL_SECONDS = 180.0
+
+
+class AdapterForcedOfflineError(ValueError):
+    def __init__(self, connection: dict[str, Any]):
+        super().__init__("连接被强制切断")
+        self.connection = connection
+
+
+class AdapterConnectionChangedError(ValueError):
+    pass
 
 
 @dataclass(slots=True)
@@ -51,6 +71,7 @@ class LibraryRecord:
     provider_id: str
     provider_revision: int
     rerank_provider_id: str
+    conversation_settings: dict[str, Any]
     recall_settings: dict[str, Any]
     maintenance_settings: dict[str, Any]
     metadata: dict[str, Any]
@@ -64,6 +85,14 @@ class LibraryRecord:
 class ControlStore:
     def __init__(self, path: Path):
         self.path = path
+        async def connect():
+            return await self.connect()
+
+        self.provider_repository = ProviderRepository(connect)
+        self.library_repository = LibraryRepository(connect)
+        self.adapter_repository = AdapterRepository(connect)
+        self.job_repository = JobRepository(connect)
+        self.snapshot_repository = SnapshotRepository(connect)
 
     @staticmethod
     def _provider_functional_payload(config: ProviderConfig) -> dict[str, Any]:
@@ -71,6 +100,10 @@ class ControlStore:
         payload.pop("display_name", None)
         payload.pop("max_context_tokens", None)
         payload.pop("max_context_tokens_source", None)
+        payload.pop("index_rebuild_settings", None)
+        payload.pop("batch_size", None)
+        payload.pop("concurrency", None)
+        payload.pop("max_retries", None)
         return payload
 
     @classmethod
@@ -83,10 +116,32 @@ class ControlStore:
 
     @staticmethod
     def _validate_library_id(library_id: str) -> str:
-        value = str(library_id or "").strip()
-        if not value or not value.replace("_", "").replace("-", "").isalnum():
-            raise ValueError("记忆库 ID 只能包含字母、数字、下划线和连字符")
-        return value
+        return validate_identifier(library_id, field="记忆库 ID")
+
+    @staticmethod
+    def _merge_settings(defaults: dict[str, Any], *parts: dict[str, Any] | None) -> dict[str, Any]:
+        merged = dict(defaults)
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            merged.update({key: value for key, value in part.items() if key in defaults})
+        return merged
+
+    @classmethod
+    def _conversation_settings(
+        cls, *parts: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        return cls._merge_settings(asdict(ConversationConfig()), *parts)
+
+    @classmethod
+    def _recall_settings(cls, *parts: dict[str, Any] | None) -> dict[str, Any]:
+        return cls._merge_settings(asdict(RecallConfig()), *parts)
+
+    @classmethod
+    def _maintenance_settings(
+        cls, *parts: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        return cls._merge_settings(asdict(MaintenanceConfig()), *parts)
 
     async def connect(self):
         db = await aiosqlite.connect(self.path)
@@ -130,6 +185,7 @@ class ControlStore:
                     provider_id TEXT NOT NULL,
                     provider_revision INTEGER NOT NULL,
                     rerank_provider_id TEXT,
+                    conversation_config_json TEXT NOT NULL DEFAULT '{}',
                     recall_config_json TEXT NOT NULL DEFAULT '{}',
                     maintenance_config_json TEXT NOT NULL DEFAULT '{}',
                     metadata_json TEXT NOT NULL DEFAULT '{}',
@@ -179,16 +235,49 @@ class ControlStore:
                     activated_at REAL,
                     PRIMARY KEY(library_id, generation)
                 );
+                CREATE TABLE IF NOT EXISTS adapter_connections (
+                    library_id TEXT NOT NULL,
+                    adapter_id TEXT NOT NULL,
+                    instance_id TEXT NOT NULL,
+                    adapter_type TEXT NOT NULL DEFAULT 'unknown',
+                    connected_at REAL NOT NULL,
+                    last_seen REAL NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'active',
+                    disconnected_at REAL,
+                    disconnect_reason TEXT,
+                    PRIMARY KEY(library_id, adapter_id)
+                );
                 """
             )
             await self._ensure_column(db, "jobs", "library_id", "TEXT")
             await self._ensure_column(db, "migration_runs", "library_id", "TEXT")
             await self._ensure_column(db, "libraries", "rerank_provider_id", "TEXT")
             await self._ensure_column(
+                db, "libraries", "conversation_config_json", "TEXT NOT NULL DEFAULT '{}'"
+            )
+            await self._ensure_column(
                 db,
                 "index_generations",
                 "library_id",
                 "TEXT NOT NULL DEFAULT ''",
+            )
+            await self._ensure_column(
+                db,
+                "adapter_connections",
+                "state",
+                "TEXT NOT NULL DEFAULT 'active'",
+            )
+            await self._ensure_column(
+                db,
+                "adapter_connections",
+                "disconnected_at",
+                "REAL",
+            )
+            await self._ensure_column(
+                db,
+                "adapter_connections",
+                "disconnect_reason",
+                "TEXT",
             )
             await db.execute(
                 "INSERT OR REPLACE INTO schema_info(key,value) VALUES('service_version','0.1.0')"
@@ -202,6 +291,10 @@ class ControlStore:
             if "recall_config_json" not in columns:
                 await db.execute(
                     "ALTER TABLE libraries ADD COLUMN recall_config_json TEXT NOT NULL DEFAULT '{}'"
+                )
+            if "conversation_config_json" not in columns:
+                await db.execute(
+                    "ALTER TABLE libraries ADD COLUMN conversation_config_json TEXT NOT NULL DEFAULT '{}'"
                 )
             if "maintenance_config_json" not in columns:
                 await db.execute(
@@ -333,29 +426,26 @@ class ControlStore:
     async def get_provider(
         self, provider_id: str, revision: int | None = None
     ) -> ProviderRevision | None:
-        db = await self.connect()
-        try:
-            if revision is None:
-                row = await (
-                    await db.execute(
-                        """SELECT pr.* FROM providers p JOIN provider_revisions pr
-                        ON pr.provider_id=p.id AND pr.revision=p.latest_revision
-                        WHERE p.id=? AND p.deleted_at IS NULL""",
-                        (provider_id,),
-                    )
-                ).fetchone()
-            else:
-                row = await (
-                    await db.execute(
-                        """SELECT pr.* FROM providers p JOIN provider_revisions pr
-                        ON pr.provider_id=p.id
-                        WHERE p.id=? AND pr.revision=? AND p.deleted_at IS NULL""",
-                        (provider_id, revision),
-                    )
-                ).fetchone()
-        finally:
-            await db.close()
+        row = await self.provider_repository.get_row(provider_id, revision)
         return self._provider_row(row) if row else None
+
+    async def get_providers_bulk(
+        self, bindings: set[tuple[str, int | None]]
+    ) -> dict[tuple[str, int | None], ProviderRevision]:
+        rows = await self.provider_repository.rows_for_bindings(bindings)
+        result: dict[tuple[str, int | None], ProviderRevision] = {}
+        for row in rows:
+            record = self._provider_row(row)
+            exact = (record.provider_id, record.revision)
+            if exact in bindings:
+                result[exact] = record
+            latest = (record.provider_id, None)
+            if (
+                latest in bindings
+                and record.revision == int(row["latest_revision"])
+            ):
+                result[latest] = record
+        return result
 
     @staticmethod
     def _provider_row(row: aiosqlite.Row) -> ProviderRevision:
@@ -446,6 +536,259 @@ class ControlStore:
         payload = ControlStore._provider_functional_payload(config)
         text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _normalize_adapter_text(value: str, *, field: str) -> str:
+        text = validate_identifier(value, field=field)
+        if len(text) > 128:
+            raise ValueError(f"{field} 不能超过 128 个字符")
+        return text
+
+    @staticmethod
+    def _adapter_connection_public(row: aiosqlite.Row) -> dict[str, Any]:
+        return {
+            "library_id": row["library_id"],
+            "adapter_id": row["adapter_id"],
+            "instance_id": row["instance_id"],
+            "adapter_type": row["adapter_type"],
+            "connected_at": float(row["connected_at"]),
+            "last_seen": float(row["last_seen"]),
+            "state": str(row["state"] or "active"),
+            "disconnected_at": (
+                float(row["disconnected_at"])
+                if row["disconnected_at"] is not None
+                else None
+            ),
+            "disconnect_reason": str(row["disconnect_reason"] or ""),
+        }
+
+    async def register_adapter_connection(
+        self,
+        library_id: str,
+        *,
+        adapter_id: str,
+        instance_id: str,
+        adapter_type: str = "unknown",
+        ttl_seconds: float = ADAPTER_CONNECTION_TTL_SECONDS,
+        manual_reconnect: bool = False,
+    ) -> dict[str, Any]:
+        library_id = self._validate_library_id(library_id)
+        if not await self.get_library(library_id):
+            raise KeyError(library_id)
+        adapter_id = self._normalize_adapter_text(adapter_id, field="适配器标识ID")
+        instance_id = self._normalize_adapter_text(instance_id, field="适配器实例ID")
+        adapter_type = str(adapter_type or "unknown").strip()[:64] or "unknown"
+        now = time.time()
+        active_cutoff = now - float(ttl_seconds)
+        db = await self.connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            row = await (
+                await db.execute(
+                    """SELECT * FROM adapter_connections
+                    WHERE library_id=? AND adapter_id=?""",
+                    (library_id, adapter_id),
+                )
+            ).fetchone()
+            if (
+                row
+                and str(row["state"] or "active") == "forced_offline"
+                and not manual_reconnect
+            ):
+                raise AdapterForcedOfflineError(
+                    self._adapter_connection_public(row)
+                )
+            if (
+                row
+                and str(row["state"] or "active") == "active"
+                and str(row["instance_id"]) != instance_id
+                and float(row["last_seen"] or 0) >= active_cutoff
+            ):
+                raise ValueError(
+                    f"适配器标识ID已被其它实例占用：{adapter_id}"
+                )
+            same_instance = (
+                row
+                and str(row["state"] or "active") == "active"
+                and str(row["instance_id"]) == instance_id
+            )
+            connected_at = float(row["connected_at"]) if same_instance else now
+            await db.execute(
+                """INSERT INTO adapter_connections
+                (library_id,adapter_id,instance_id,adapter_type,connected_at,last_seen,
+                 state,disconnected_at,disconnect_reason)
+                VALUES(?,?,?,?,?,?,'active',NULL,NULL)
+                ON CONFLICT(library_id,adapter_id) DO UPDATE SET
+                    instance_id=excluded.instance_id,
+                    adapter_type=excluded.adapter_type,
+                    connected_at=excluded.connected_at,
+                    last_seen=excluded.last_seen,
+                    state='active',
+                    disconnected_at=NULL,
+                    disconnect_reason=NULL""",
+                (
+                    library_id,
+                    adapter_id,
+                    instance_id,
+                    adapter_type,
+                    connected_at,
+                    now,
+                ),
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+        return (
+            await self.adapter_connection(library_id, adapter_id)
+        ) or {
+            "library_id": library_id,
+            "adapter_id": adapter_id,
+            "instance_id": instance_id,
+            "adapter_type": adapter_type,
+            "connected_at": connected_at,
+            "last_seen": now,
+            "state": "active",
+            "disconnected_at": None,
+            "disconnect_reason": "",
+        }
+
+    async def force_disconnect_adapter(
+        self,
+        library_id: str,
+        adapter_id: str,
+        *,
+        expected_instance_id: str,
+        reason: str = "forced_by_admin",
+    ) -> dict[str, Any]:
+        library_id = self._validate_library_id(library_id)
+        adapter_id = self._normalize_adapter_text(adapter_id, field="适配器标识ID")
+        expected_instance_id = self._normalize_adapter_text(
+            expected_instance_id,
+            field="适配器实例ID",
+        )
+        db = await self.connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            row = await (
+                await db.execute(
+                    """SELECT * FROM adapter_connections
+                    WHERE library_id=? AND adapter_id=?""",
+                    (library_id, adapter_id),
+                )
+            ).fetchone()
+            if not row:
+                raise KeyError(adapter_id)
+            if str(row["instance_id"]) != expected_instance_id:
+                raise AdapterConnectionChangedError(
+                    "适配器连接实例已变化，请刷新后重试"
+                )
+            disconnected_at = time.time()
+            await db.execute(
+                """UPDATE adapter_connections
+                SET state='forced_offline',disconnected_at=?,disconnect_reason=?
+                WHERE library_id=? AND adapter_id=?""",
+                (disconnected_at, str(reason or "forced_by_admin"), library_id, adapter_id),
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+        connection = await self.adapter_connection(library_id, adapter_id)
+        if not connection:
+            raise KeyError(adapter_id)
+        return connection
+
+    async def adapter_connection(
+        self, library_id: str, adapter_id: str
+    ) -> dict[str, Any] | None:
+        db = await self.connect()
+        try:
+            row = await (
+                await db.execute(
+                    """SELECT * FROM adapter_connections
+                    WHERE library_id=? AND adapter_id=?""",
+                    (library_id, adapter_id),
+                )
+            ).fetchone()
+            return self._adapter_connection_public(row) if row else None
+        finally:
+            await db.close()
+
+    async def forced_adapter_connections(self) -> list[dict[str, Any]]:
+        db = await self.connect()
+        try:
+            rows = await (
+                await db.execute(
+                    """SELECT * FROM adapter_connections
+                    WHERE state='forced_offline'
+                    ORDER BY library_id,adapter_id"""
+                )
+            ).fetchall()
+            return [self._adapter_connection_public(row) for row in rows]
+        finally:
+            await db.close()
+
+    async def active_adapter_connections(
+        self,
+        library_id: str,
+        *,
+        ttl_seconds: float = ADAPTER_CONNECTION_TTL_SECONDS,
+    ) -> list[dict[str, Any]]:
+        cutoff = time.time() - float(ttl_seconds)
+        rows = await self.adapter_repository.active_rows(
+            [library_id], cutoff=cutoff
+        )
+        return [self._adapter_connection_public(row) for row in rows]
+
+    async def active_adapter_connections_map(
+        self,
+        library_ids: list[str],
+        *,
+        ttl_seconds: float = ADAPTER_CONNECTION_TTL_SECONDS,
+    ) -> dict[str, list[dict[str, Any]]]:
+        if not library_ids:
+            return {}
+        cutoff = time.time() - float(ttl_seconds)
+        rows = await self.adapter_repository.active_rows(
+            library_ids, cutoff=cutoff
+        )
+        result: dict[str, list[dict[str, Any]]] = {library_id: [] for library_id in library_ids}
+        for row in rows:
+            result.setdefault(str(row["library_id"]), []).append(
+                self._adapter_connection_public(row)
+            )
+        return result
+
+    @staticmethod
+    def _job_public(row: aiosqlite.Row) -> dict[str, Any]:
+        result = dict(row)
+        if result.get("result"):
+            try:
+                result["result"] = json.loads(result["result"])
+            except json.JSONDecodeError:
+                result["result"] = None
+        return result
+
+    async def active_long_job(self, library_id: str) -> dict[str, Any] | None:
+        return (await self.active_long_jobs_map([library_id])).get(library_id)
+
+    async def active_long_jobs_map(
+        self, library_ids: list[str]
+    ) -> dict[str, dict[str, Any] | None]:
+        if not library_ids:
+            return {}
+        rows = await self.job_repository.active_long_rows(library_ids)
+        result: dict[str, dict[str, Any] | None] = {library_id: None for library_id in library_ids}
+        for row in rows:
+            library_id = str(row["library_id"] or "")
+            if library_id and result.get(library_id) is None:
+                result[library_id] = self._job_public(row)
+        return result
 
     async def debug_provider_revisions(self, provider_id: str) -> dict[str, Any]:
         db = await self.connect()
@@ -681,8 +1024,209 @@ class ControlStore:
             result.append(item)
         return result
 
+    async def export_provider_snapshot(self) -> dict[str, Any]:
+        provider_rows, revision_rows = (
+            await self.snapshot_repository.provider_rows()
+        )
+        revisions = []
+        for row in revision_rows:
+            config = config_from_dict(json.loads(row["config_json"]))
+            revisions.append(
+                {
+                    "provider_id": row["provider_id"],
+                    "revision": int(row["revision"]),
+                    "config": asdict(config),
+                    "config_sha256": provider_config_hash(config),
+                    "created_at": float(row["created_at"]),
+                }
+            )
+        return {
+            "providers": [
+                {
+                    "id": row["id"],
+                    "latest_revision": int(row["latest_revision"]),
+                    "created_at": float(row["created_at"]),
+                    "updated_at": float(row["updated_at"]),
+                }
+                for row in provider_rows
+            ],
+            "provider_revisions": revisions,
+        }
+
+    async def restore_provider_snapshot(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        providers = list(snapshot.get("providers") or [])
+        revisions = list(snapshot.get("provider_revisions") or [])
+        provider_ids = [
+            validate_identifier(item.get("id"), field="Provider ID")
+            for item in providers
+        ]
+        if len(set(provider_ids)) != len(provider_ids):
+            raise ValueError("provider snapshot contains invalid or duplicate IDs")
+        provider_id_set = set(provider_ids)
+        revision_rows = []
+        for item in revisions:
+            provider_id = validate_identifier(
+                item.get("provider_id"), field="Provider ID"
+            )
+            if provider_id not in provider_id_set:
+                continue
+            config = config_from_dict(dict(item.get("config") or {}))
+            if config.id != provider_id:
+                raise ValueError(f"provider config ID mismatch: {provider_id}")
+            revision = int(item.get("revision") or 0)
+            if revision <= 0:
+                raise ValueError(f"invalid provider revision: {provider_id}")
+            revision_rows.append(
+                {
+                    "provider_id": provider_id,
+                    "revision": revision,
+                    "config_json": json.dumps(asdict(config), ensure_ascii=False),
+                    "config_sha256": provider_config_hash(config),
+                    "created_at": float(item.get("created_at") or time.time()),
+                }
+            )
+        revisions_by_provider: dict[str, set[int]] = {}
+        for row in revision_rows:
+            revisions_by_provider.setdefault(row["provider_id"], set()).add(
+                int(row["revision"])
+            )
+        for provider in providers:
+            provider_id = validate_identifier(provider.get("id"), field="Provider ID")
+            latest_revision = int(provider.get("latest_revision") or 0)
+            if latest_revision not in revisions_by_provider.get(provider_id, set()):
+                raise ValueError(f"provider {provider_id} missing latest revision")
+        db = await self.connect()
+        try:
+            await db.execute("PRAGMA foreign_keys=OFF")
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute("DELETE FROM provider_revisions")
+            await db.execute("DELETE FROM providers")
+            for provider in providers:
+                await db.execute(
+                    """INSERT INTO providers
+                    (id,latest_revision,deleted_at,created_at,updated_at)
+                    VALUES(?,?,NULL,?,?)""",
+                    (
+                        validate_identifier(provider["id"], field="Provider ID"),
+                        int(provider["latest_revision"]),
+                        float(provider.get("created_at") or time.time()),
+                        float(provider.get("updated_at") or time.time()),
+                    ),
+                )
+            for row in revision_rows:
+                await db.execute(
+                    """INSERT INTO provider_revisions
+                    (provider_id,revision,config_json,config_sha256,created_at)
+                    VALUES(?,?,?,?,?)""",
+                    (
+                        row["provider_id"],
+                        row["revision"],
+                        row["config_json"],
+                        row["config_sha256"],
+                        row["created_at"],
+                    ),
+                )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+        return {"providers": len(providers), "provider_revisions": len(revision_rows)}
+
+    async def export_library_snapshot(self) -> dict[str, Any]:
+        rows = await self.snapshot_repository.library_rows()
+        return {
+            "libraries": [self._library_row(row).public() for row in rows]
+        }
+
+    async def restore_library_snapshot(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        libraries = list(snapshot.get("libraries") or [])
+        if not libraries:
+            raise ValueError("library snapshot is empty")
+        ids = [self._validate_library_id(str(item.get("id") or "")) for item in libraries]
+        if len(set(ids)) != len(ids):
+            raise ValueError("library snapshot contains duplicate IDs")
+        default_ids = [str(item.get("id")) for item in libraries if bool(item.get("is_default"))]
+        default_id = default_ids[0] if default_ids else ids[0]
+        now = time.time()
+        db = await self.connect()
+        try:
+            await db.execute("PRAGMA foreign_keys=OFF")
+            await db.execute("BEGIN IMMEDIATE")
+            for table in (
+                "library_generation_bindings",
+                "index_generations",
+                "adapter_connections",
+                "migration_runs",
+                "jobs",
+                "libraries",
+            ):
+                await db.execute(f"DELETE FROM {table}")
+            for item in libraries:
+                library_id = self._validate_library_id(str(item.get("id") or ""))
+                provider_id = validate_identifier(
+                    item.get("provider_id"), field="Provider ID"
+                )
+                rerank_provider_id = str(item.get("rerank_provider_id") or "")
+                if rerank_provider_id:
+                    rerank_provider_id = validate_identifier(
+                        rerank_provider_id, field="Provider ID"
+                    )
+                await db.execute(
+                    """INSERT INTO libraries
+                    (id,name,description,default_persona_id,is_default,provider_id,
+                     provider_revision,rerank_provider_id,conversation_config_json,
+                     recall_config_json,maintenance_config_json,metadata_json,
+                     deleted_at,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,?)""",
+                    (
+                        library_id,
+                        str(item.get("name") or library_id),
+                        str(item.get("description") or ""),
+                        str(item.get("default_persona_id") or ""),
+                        1 if library_id == default_id else 0,
+                        provider_id,
+                        int(item.get("provider_revision") or 1),
+                        rerank_provider_id or None,
+                        json.dumps(
+                            self._conversation_settings(
+                                item.get("conversation_settings")
+                            ),
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            self._recall_settings(item.get("recall_settings")),
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            self._maintenance_settings(
+                                item.get("maintenance_settings")
+                            ),
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            {
+                                **default_library_metadata(),
+                                **dict(item.get("metadata") or {}),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        float(item.get("created_at") or now),
+                        float(item.get("updated_at") or now),
+                    ),
+                )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+        return {"libraries": len(libraries), "default_library": default_id}
+
     async def create_provider(self, payload: dict[str, Any]) -> ProviderRevision:
         config = config_from_dict(payload)
+        validate_identifier(config.id, field="Provider ID")
         now = time.time()
         db = await self.connect()
         try:
@@ -721,7 +1265,9 @@ class ControlStore:
             raise KeyError(provider_id)
         changes = dict(payload)
         next_provider_id = (
-            str(changes.pop("id")).strip() if "id" in changes else provider_id
+            validate_identifier(changes.pop("id"), field="Provider ID")
+            if "id" in changes
+            else provider_id
         )
         usage = (
             await self.provider_usage(provider_id)
@@ -901,6 +1447,7 @@ class ControlStore:
         if not current:
             raise KeyError(provider_id)
         if new_id:
+            new_id = validate_identifier(new_id, field="Provider ID")
             await self._purge_deleted_provider(new_id)
             candidate = new_id
             copy_index = 1
@@ -963,15 +1510,27 @@ class ControlStore:
         name: str,
         provider_id: str,
         provider_revision: int,
+        conversation_settings: dict[str, Any] | None = None,
         recall_settings: dict[str, Any] | None = None,
         maintenance_settings: dict[str, Any] | None = None,
     ) -> LibraryRecord:
+        library_id = self._validate_library_id(library_id)
+        provider_id = validate_identifier(provider_id, field="Provider ID")
         existing = await self.get_library(library_id)
         if existing:
-            if not existing.recall_settings or not existing.maintenance_settings:
+            if (
+                not existing.conversation_settings
+                or not existing.recall_settings
+                or not existing.maintenance_settings
+            ):
                 return await self.update_library(
                     library_id,
                     {
+                        "conversation_settings": (
+                            existing.conversation_settings
+                            or conversation_settings
+                            or {}
+                        ),
                         "recall_settings": (
                             existing.recall_settings or recall_settings or {}
                         ),
@@ -998,9 +1557,9 @@ class ControlStore:
             await db.execute(
                 """INSERT INTO libraries
                 (id,name,description,default_persona_id,is_default,provider_id,
-                 provider_revision,rerank_provider_id,recall_config_json,maintenance_config_json,
-                 metadata_json,created_at,updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 provider_revision,rerank_provider_id,conversation_config_json,
+                 recall_config_json,maintenance_config_json,metadata_json,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     library_id,
                     name,
@@ -1010,8 +1569,15 @@ class ControlStore:
                     provider_id,
                     provider_revision,
                     None,
-                    json.dumps(recall_settings or {}, ensure_ascii=False),
-                    json.dumps(maintenance_settings or {}, ensure_ascii=False),
+                    json.dumps(
+                        self._conversation_settings(conversation_settings),
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(self._recall_settings(recall_settings), ensure_ascii=False),
+                    json.dumps(
+                        self._maintenance_settings(maintenance_settings),
+                        ensure_ascii=False,
+                    ),
                     json.dumps(default_library_metadata(), ensure_ascii=False),
                     now,
                     now,
@@ -1062,9 +1628,9 @@ class ControlStore:
             await db.execute(
                 """INSERT INTO libraries
                 (id,name,description,default_persona_id,is_default,provider_id,
-                 provider_revision,rerank_provider_id,recall_config_json,maintenance_config_json,
-                 metadata_json,created_at,updated_at)
-                VALUES(?,?,?,?,0,?,?,?,?,?,?,?,?)""",
+                 provider_revision,rerank_provider_id,conversation_config_json,
+                 recall_config_json,maintenance_config_json,metadata_json,created_at,updated_at)
+                VALUES(?,?,?,?,0,?,?,?,?,?,?,?,?,?)""",
                 (
                     library_id,
                     name,
@@ -1074,10 +1640,19 @@ class ControlStore:
                     provider.revision,
                     str(payload.get("rerank_provider_id") or "") or None,
                     json.dumps(
-                        payload.get("recall_settings") or {}, ensure_ascii=False
+                        self._conversation_settings(
+                            payload.get("conversation_settings")
+                        ),
+                        ensure_ascii=False,
                     ),
                     json.dumps(
-                        payload.get("maintenance_settings") or {},
+                        self._recall_settings(payload.get("recall_settings")),
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        self._maintenance_settings(
+                            payload.get("maintenance_settings")
+                        ),
                         ensure_ascii=False,
                     ),
                     json.dumps(
@@ -1099,18 +1674,12 @@ class ControlStore:
         return (await self.get_library(library_id))  # type: ignore[return-value]
 
     async def get_library(self, library_id: str) -> LibraryRecord | None:
-        db = await self.connect()
-        try:
-            row = await (
-                await db.execute(
-                    "SELECT * FROM libraries WHERE id=? AND deleted_at IS NULL",
-                    (library_id,),
-                )
-            ).fetchone()
-        finally:
-            await db.close()
+        row = await self.library_repository.get_row(library_id)
         if not row:
             return None
+        return self._library_row(row)
+
+    def _library_row(self, row: aiosqlite.Row) -> LibraryRecord:
         return LibraryRecord(
             id=row["id"],
             name=row["name"],
@@ -1120,9 +1689,14 @@ class ControlStore:
             provider_id=row["provider_id"],
             provider_revision=int(row["provider_revision"]),
             rerank_provider_id=str(row["rerank_provider_id"] or ""),
-            recall_settings=json.loads(row["recall_config_json"] or "{}"),
-            maintenance_settings=json.loads(
-                row["maintenance_config_json"] or "{}"
+            conversation_settings=self._conversation_settings(
+                json.loads(row["conversation_config_json"] or "{}")
+            ),
+            recall_settings=self._recall_settings(
+                json.loads(row["recall_config_json"] or "{}")
+            ),
+            maintenance_settings=self._maintenance_settings(
+                json.loads(row["maintenance_config_json"] or "{}")
             ),
             metadata=self._decode_library_metadata(row["metadata_json"]),
             created_at=float(row["created_at"]),
@@ -1140,22 +1714,8 @@ class ControlStore:
             await db.close()
 
     async def list_libraries(self) -> list[LibraryRecord]:
-        db = await self.connect()
-        try:
-            rows = await (
-                await db.execute(
-                    """SELECT * FROM libraries WHERE deleted_at IS NULL
-                    ORDER BY is_default DESC, created_at"""
-                )
-            ).fetchall()
-        finally:
-            await db.close()
-        result = []
-        for row in rows:
-            record = await self.get_library(row["id"])
-            if record:
-                result.append(record)
-        return result
+        rows = await self.library_repository.list_rows()
+        return [self._library_row(row) for row in rows]
 
     async def default_library(self) -> LibraryRecord:
         db = await self.connect()
@@ -1186,8 +1746,11 @@ class ControlStore:
             if "id" in payload
             else current.id
         )
-        if next_library_id != current.id and current.is_default:
-            raise ValueError("默认记忆库 ID 不能修改")
+        if (
+            next_library_id != current.id
+            and await self.active_adapter_connections(current.id)
+        ):
+            raise ValueError("记忆库已被适配器连接，不能修改 ID")
         db = await self.connect()
         try:
             if next_library_id != current.id:
@@ -1238,9 +1801,14 @@ class ControlStore:
                     "UPDATE migration_runs SET library_id=? WHERE library_id=?",
                     (next_library_id, current.id),
                 )
+                await db.execute(
+                    "UPDATE adapter_connections SET library_id=? WHERE library_id=?",
+                    (next_library_id, current.id),
+                )
             await db.execute(
                 """UPDATE libraries SET id=?,name=?,description=?,default_persona_id=?,
-                rerank_provider_id=?,recall_config_json=?,maintenance_config_json=?,updated_at=?
+                rerank_provider_id=?,conversation_config_json=?,recall_config_json=?,
+                maintenance_config_json=?,metadata_json=?,updated_at=?
                 WHERE id=?""",
                 (
                     next_library_id,
@@ -1259,14 +1827,37 @@ class ControlStore:
                     )
                     or None,
                     json.dumps(
-                        payload.get("recall_settings", current.recall_settings),
+                        self._conversation_settings(
+                            current.conversation_settings,
+                            payload.get(
+                                "conversation_settings",
+                                current.conversation_settings,
+                            ),
+                        ),
                         ensure_ascii=False,
                     ),
                     json.dumps(
-                        payload.get(
-                            "maintenance_settings",
-                            current.maintenance_settings,
+                        self._recall_settings(
+                            current.recall_settings,
+                            payload.get("recall_settings", current.recall_settings),
                         ),
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        self._maintenance_settings(
+                            current.maintenance_settings,
+                            payload.get(
+                                "maintenance_settings",
+                                current.maintenance_settings,
+                            ),
+                        ),
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {
+                            **current.metadata,
+                            **dict(payload.get("metadata") or {}),
+                        },
                         ensure_ascii=False,
                     ),
                     time.time(),
@@ -1366,12 +1957,31 @@ class ControlStore:
         finally:
             await db.close()
 
+    async def has_any_running_jobs(self) -> bool:
+        db = await self.connect()
+        try:
+            count = int(
+                (
+                    await (
+                        await db.execute(
+                            """SELECT COUNT(*) FROM jobs
+                            WHERE status IN ('queued','running')"""
+                        )
+                    ).fetchone()
+                )[0]
+            )
+            return count > 0
+        finally:
+            await db.close()
+
     async def mark_library_deleted(self, library_id: str) -> None:
         record = await self.get_library(library_id)
         if not record:
             raise KeyError(library_id)
         if record.is_default:
             raise ValueError("默认记忆库不能删除")
+        if await self.active_adapter_connections(library_id):
+            raise ValueError("记忆库已被适配器连接，不能删除")
         if await self.has_running_jobs(library_id):
             raise ValueError("记忆库存在运行中的任务，不能删除")
         db = await self.connect()

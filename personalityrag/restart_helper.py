@@ -92,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
     argv = argv or sys.argv
     if len(argv) != 3:
         return 2
-    old_pid = int(argv[1])
+    int(argv[1])
     root = Path(argv[2]).resolve()
     deadline = time.time() + 90
     while time.time() < deadline:

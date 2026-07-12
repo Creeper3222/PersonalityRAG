@@ -1,10 +1,13 @@
 .venv/
+.venv-next/
+.venv-py*/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .coverage
 htmlcov/
 .ruff_cache/
+.test-runtime/
 config/config.json
 config/config.test.json
 data/

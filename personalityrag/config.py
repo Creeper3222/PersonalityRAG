@@ -40,6 +40,18 @@ def build_access_url(base_url: str, port: int) -> str:
 
 
 @dataclass(slots=True)
+class IndexRebuildSettings:
+    batch_size: int = 50
+    embedding_batch_size: int = 8
+    tasks_limit: int = 1
+    max_retries: int = 5
+    retry_base_delay: float = 30.0
+    batch_delay: float = 5.0
+    request_delay: float = 5.0
+    max_failure_ratio: float = 0.02
+
+
+@dataclass(slots=True)
 class ProviderConfig:
     id: str = "vllm_embedding"
     display_name: str = "本机 bge-m3"
@@ -62,17 +74,24 @@ class ProviderConfig:
     model_endpoint: str = ""
     truncate: str = ""
     launch_model_if_not_running: bool = False
+    index_rebuild_settings: IndexRebuildSettings = field(
+        default_factory=IndexRebuildSettings
+    )
 
 
 @dataclass(slots=True)
 class RecallConfig:
-    top_k: int = 10
     rrf_k: int = 60
     decay_rate: float = 0.0
+    access_decay_window_days: float = 30.0
+    access_decay_max_count: int = 10
+    access_count_decay_multiplier: float = 0.5
     score_alpha: float = 0.5
     score_beta: float = 0.25
     score_gamma: float = 0.25
+    importance_weight: float = 1.0
     mmr_lambda: float = 0.7
+    graph_memory_enabled: bool = True
     document_route_weight: float = 0.65
     graph_route_weight: float = 0.35
     cross_route_bonus: float = 0.08
@@ -80,22 +99,36 @@ class RecallConfig:
     graph_expansion_hops: int = 1
     graph_second_hop_weight: float = 0.4
     dynamic_route_weighting: bool = True
+    graph_max_topics: int = 6
+    graph_max_participants: int = 8
+    graph_max_facts: int = 8
     use_persona_filtering: bool = True
     use_session_filtering: bool = False
+    search_cache_enabled: bool = True
     search_cache_ttl_seconds: float = 45.0
     search_cache_max_size: int = 256
 
 
 @dataclass(slots=True)
 class MaintenanceConfig:
+    atom_enabled: bool = True
     atom_maintenance_interval_hours: float = 24.0
     atom_forget_delay_days: float = 7.0
     atom_purge_delay_days: float = 30.0
-    auto_cleanup_enabled: bool = True
-    cleanup_days_threshold: int = 30
+    auto_cleanup_enabled: bool = False
+    cleanup_days_threshold: int = 7
     cleanup_importance_threshold: float = 0.3
     backup_enabled: bool = True
     backup_keep_days: int = 7
+
+
+@dataclass(slots=True)
+class ConversationConfig:
+    max_sessions: int = 100
+    session_ttl: int = 3600
+    context_window_size: int = 300
+    max_messages_per_session: int = 1000
+    cleanup_batch_size: int = 50
 
 
 @dataclass(slots=True)
@@ -106,6 +139,12 @@ class LoggingConfig:
     web_max_entries: int = 2000
     web_max_bytes: int = 4 * 1024 * 1024
     web_max_entry_bytes: int = 32 * 1024
+
+
+@dataclass(slots=True)
+class RuntimeResidencyConfig:
+    idle_minutes: int = 30
+    max_non_default_runtimes: int = 4
 
 
 @dataclass(slots=True)
@@ -122,7 +161,11 @@ class AppConfig:
     provider: ProviderConfig = field(default_factory=ProviderConfig)
     recall: RecallConfig = field(default_factory=RecallConfig)
     maintenance: MaintenanceConfig = field(default_factory=MaintenanceConfig)
+    conversation: ConversationConfig = field(default_factory=ConversationConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    runtime_residency: RuntimeResidencyConfig = field(
+        default_factory=RuntimeResidencyConfig
+    )
 
     @property
     def api_key_fingerprint(self) -> str:
@@ -132,7 +175,26 @@ class AppConfig:
 def _merge_dataclass(cls, raw: dict[str, Any] | None):
     raw = raw or {}
     allowed = {item.name for item in cls.__dataclass_fields__.values()}
-    return cls(**{key: value for key, value in raw.items() if key in allowed})
+    payload = {key: value for key, value in raw.items() if key in allowed}
+    if cls is ProviderConfig and isinstance(
+        payload.get("index_rebuild_settings"), dict
+    ):
+        payload["index_rebuild_settings"] = _merge_dataclass(
+            IndexRebuildSettings,
+            payload["index_rebuild_settings"],
+        )
+    return cls(**payload)
+
+
+def _normalize_runtime_residency(config: AppConfig) -> None:
+    config.runtime_residency.idle_minutes = max(
+        1,
+        int(config.runtime_residency.idle_minutes),
+    )
+    config.runtime_residency.max_non_default_runtimes = max(
+        1,
+        int(config.runtime_residency.max_non_default_runtimes),
+    )
 
 
 def load_config(path: Path) -> AppConfig:
@@ -167,8 +229,15 @@ def load_config(path: Path) -> AppConfig:
     top["maintenance"] = _merge_dataclass(
         MaintenanceConfig, raw.get("maintenance")
     )
+    top["conversation"] = _merge_dataclass(
+        ConversationConfig, raw.get("conversation")
+    )
     top["logging"] = _merge_dataclass(LoggingConfig, raw.get("logging"))
+    top["runtime_residency"] = _merge_dataclass(
+        RuntimeResidencyConfig, raw.get("runtime_residency")
+    )
     config = AppConfig(**top)
+    _normalize_runtime_residency(config)
     if not config.api_key:
         config.api_key = f"prag_{secrets.token_urlsafe(32)}"
     if not config.session_secret:
@@ -177,6 +246,59 @@ def load_config(path: Path) -> AppConfig:
         config.library_psk_secret = secrets.token_urlsafe(48)
     config.access_base_url = normalize_access_base_url(config.access_base_url)
     save_config(path, config)
+    return config
+
+
+def app_config_from_dict(
+    raw: dict[str, Any],
+    *,
+    provider: ProviderConfig | dict[str, Any] | None = None,
+) -> AppConfig:
+    payload = dict(raw or {})
+    if provider is not None:
+        payload["provider"] = (
+            asdict(provider) if isinstance(provider, ProviderConfig) else dict(provider)
+        )
+    top = {
+        key: value
+        for key, value in payload.items()
+        if key
+        in {
+            "version",
+            "host",
+            "access_base_url",
+            "port",
+            "access_port",
+            "api_key",
+            "session_secret",
+            "library_psk_secret",
+            "webui_password_hash",
+        }
+    }
+    provider_raw = dict(payload.get("provider") or {})
+    if provider_raw.get("type") == "openai_compatible":
+        provider_raw["type"] = "vllm_embedding"
+    top["provider"] = _merge_dataclass(ProviderConfig, provider_raw)
+    top["recall"] = _merge_dataclass(RecallConfig, payload.get("recall"))
+    top["maintenance"] = _merge_dataclass(
+        MaintenanceConfig, payload.get("maintenance")
+    )
+    top["conversation"] = _merge_dataclass(
+        ConversationConfig, payload.get("conversation")
+    )
+    top["logging"] = _merge_dataclass(LoggingConfig, payload.get("logging"))
+    top["runtime_residency"] = _merge_dataclass(
+        RuntimeResidencyConfig, payload.get("runtime_residency")
+    )
+    config = AppConfig(**top)
+    _normalize_runtime_residency(config)
+    if not config.api_key:
+        config.api_key = f"prag_{secrets.token_urlsafe(32)}"
+    if not config.session_secret:
+        config.session_secret = secrets.token_urlsafe(48)
+    if not config.library_psk_secret:
+        config.library_psk_secret = secrets.token_urlsafe(48)
+    config.access_base_url = normalize_access_base_url(config.access_base_url)
     return config
 
 

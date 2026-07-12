@@ -64,6 +64,29 @@ def test_configure_logging_writes_rotated_file_and_web_buffer(tmp_path):
     assert get_log_buffer().summary()["entry_count"] <= 20
 
 
+def test_web_buffer_keeps_debug_when_file_level_is_info(tmp_path):
+    log_file = tmp_path / "logs" / "personalityrag.log"
+    configure_logging(
+        log_file,
+        level_name="INFO",
+        web_max_entries=20,
+        web_max_bytes=4096,
+        web_max_entry_bytes=1024,
+    )
+
+    logger.debug("web-only-debug-record")
+    logger.info("persistent-info-record")
+
+    entries = get_log_buffer().get_entries()
+    assert any(
+        item["level"] == "DEBUG" and item["message"] == "web-only-debug-record"
+        for item in entries
+    )
+    file_text = log_file.read_text(encoding="utf-8")
+    assert "web-only-debug-record" not in file_text
+    assert "persistent-info-record" in file_text
+
+
 def test_log_sanitizer_redacts_secrets():
     text = sanitize_log_message(
         "api_key=secret authorization=BearerToken prag_abcdefghijklmnopqrstuvwxyz"

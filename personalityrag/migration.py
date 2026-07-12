@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
-import os
 import shutil
 import sqlite3
 import stat
@@ -11,6 +9,8 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+
+from .io_utils import run_blocking
 
 
 DB_FILES = (
@@ -169,6 +169,51 @@ def validate_livingmemory_db_file(path: Path) -> dict[str, Any]:
         con.close()
 
 
+def validate_conversations_db_file(path: Path) -> dict[str, Any]:
+    if not path.exists() or not path.is_file():
+        raise RuntimeError("conversations.db 文件不存在")
+    con = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+    try:
+        integrity = con.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != "ok":
+            raise RuntimeError(f"SQLite integrity_check 失败：{integrity}")
+        tables = {
+            row[0]
+            for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table','virtual table')"
+            )
+        }
+        required = {"sessions", "messages"}
+        missing = sorted(required - tables)
+        if missing:
+            raise RuntimeError(f"缺少 conversations 核心表：{missing}")
+        required_columns = {
+            "sessions": {"id", "session_id", "created_at", "last_active_at", "message_count"},
+            "messages": {"id", "session_id", "role", "content", "timestamp"},
+        }
+        for table, columns in required_columns.items():
+            actual = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
+            missing_columns = sorted(columns - actual)
+            if missing_columns:
+                raise RuntimeError(f"{table} 表缺少字段：{missing_columns}")
+
+        def count(table: str) -> int:
+            return int(con.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+
+        return {
+            "path": str(path),
+            "sha256": sha256_file(path),
+            "integrity": integrity,
+            "tables": sorted(tables),
+            "counts": {
+                "sessions": count("sessions"),
+                "messages": count("messages"),
+            },
+        }
+    finally:
+        con.close()
+
+
 class LivingMemoryMigrator:
     def __init__(self, destination_data_dir: Path):
         self.destination = destination_data_dir
@@ -203,8 +248,8 @@ class LivingMemoryMigrator:
             if not source.exists():
                 continue
             target = archive / name
-            await asyncio.to_thread(sqlite_backup, source, target)
-            source_reports[name] = await asyncio.to_thread(
+            await run_blocking(sqlite_backup, source, target)
+            source_reports[name] = await run_blocking(
                 table_fingerprint, target
             )
             if progress:
@@ -216,11 +261,11 @@ class LivingMemoryMigrator:
         for name in EXTRA_FILES:
             source = source_dir / name
             if source.exists():
-                await asyncio.to_thread(shutil.copy2, source, archive / name)
+                await run_blocking(shutil.copy2, source, archive / name)
         for directory in ("stopwords", "backups"):
             source = source_dir / directory
             if source.exists():
-                await asyncio.to_thread(
+                await run_blocking(
                     shutil.copytree,
                     source,
                     archive / directory,
@@ -235,11 +280,11 @@ class LivingMemoryMigrator:
         for name in DB_FILES[:2]:
             current = self.destination / name
             if current.exists() and current.stat().st_size > 0:
-                await asyncio.to_thread(shutil.copy2, current, previous / name)
-            await asyncio.to_thread(shutil.copy2, archive / name, current)
+                await run_blocking(shutil.copy2, current, previous / name)
+            await run_blocking(shutil.copy2, archive / name, current)
         stopwords_source = archive / "stopwords"
         if stopwords_source.exists():
-            await asyncio.to_thread(
+            await run_blocking(
                 shutil.copytree,
                 stopwords_source,
                 self.destination / "stopwords",
@@ -247,7 +292,7 @@ class LivingMemoryMigrator:
             )
         imported_backups = archive / "backups"
         if imported_backups.exists():
-            await asyncio.to_thread(
+            await run_blocking(
                 shutil.copytree,
                 imported_backups,
                 self.destination / "livingmemory_backups",
@@ -257,7 +302,7 @@ class LivingMemoryMigrator:
         if progress:
             await progress(0.6, "正在逐表校验迁移结果")
         target_reports = {
-            name: await asyncio.to_thread(
+            name: await run_blocking(
                 table_fingerprint, self.destination / name
             )
             for name in DB_FILES[:2]
@@ -280,7 +325,7 @@ class LivingMemoryMigrator:
             if path.is_file():
                 archive_files[str(path.relative_to(archive))] = {
                     "size": path.stat().st_size,
-                    "sha256": await asyncio.to_thread(sha256_file, path),
+                    "sha256": await run_blocking(sha256_file, path),
                 }
         report = {
             "run_id": run_id,

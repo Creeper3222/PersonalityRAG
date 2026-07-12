@@ -9,13 +9,13 @@ from pathlib import Path
 
 import uvicorn
 
-from personalityrag.config import build_access_url, load_config
+import personalityrag.app as app_module
+from personalityrag.config import build_access_url
 from personalityrag.instance_lock import InstanceLock, SingleInstanceError
 
 
 ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = ROOT / "config" / "config.json"
-config = load_config(CONFIG_PATH)
+config = app_module.config
 
 
 def port_available(host: str, port: int) -> bool:
@@ -56,24 +56,24 @@ def resolve_port(
 
 
 async def serve_dual_ports(host: str, webui_port: int, access_port: int) -> None:
-    import personalityrag.app as app_module
-
     webui_server = uvicorn.Server(
         uvicorn.Config(
-            "personalityrag.app:app",
+            app_module.app,
             host=host,
             port=webui_port,
             reload=False,
             log_level="info",
+            access_log=False,
         )
     )
     access_server = uvicorn.Server(
         uvicorn.Config(
-            "personalityrag.app:app",
+            app_module.app,
             host=host,
             port=access_port,
             reload=False,
             log_level="info",
+            access_log=False,
             lifespan="off",
         )
     )

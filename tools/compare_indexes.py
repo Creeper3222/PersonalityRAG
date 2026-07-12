@@ -15,8 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from personalityrag.control import ControlStore
-from personalityrag.providers import build_provider
+from personalityrag.control import ControlStore  # noqa: E402
+from personalityrag.providers import build_provider  # noqa: E402
 
 
 def build_queries(db_path: Path, limit: int) -> list[str]:

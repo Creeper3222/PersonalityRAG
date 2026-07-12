@@ -5,11 +5,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from personalityrag.config import RecallConfig
+from personalityrag.config import AppConfig, ProviderConfig, RecallConfig
 from personalityrag.graph import GraphBuilder
 from personalityrag.indexes import IndexManager
 from personalityrag.providers import EmbeddingProvider
 from personalityrag.retrieval import RetrievalEngine
+from personalityrag.service import PersonalityRAGService
 from personalityrag.storage import Storage
 from personalityrag.text import TextProcessor
 
@@ -47,6 +48,15 @@ class FakeProvider(EmbeddingProvider):
 
     async def close(self) -> None:
         pass
+
+
+class CountingProvider(FakeProvider):
+    def __init__(self) -> None:
+        self.embedded_texts: list[str] = []
+
+    async def get_embeddings(self, texts: list[str]) -> list[list[float]]:
+        self.embedded_texts.extend(texts)
+        return await super().get_embeddings(texts)
 
 
 @pytest.mark.asyncio
@@ -92,6 +102,397 @@ async def test_write_rebuild_recall_and_delete(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_incremental_upsert_embeds_only_new_memory(tmp_path: Path):
+    storage = Storage(tmp_path)
+    await storage.initialize()
+    text = TextProcessor()
+    graph = GraphBuilder()
+    provider = CountingProvider()
+    indexes = IndexManager(tmp_path, storage, provider, "fake")
+    await indexes.initialize()
+
+    first = await storage.create_memory(
+        {
+            "content": "first memory about sky",
+            "topics": ["sky"],
+            "key_facts": ["first fact"],
+        },
+        text.tokenize,
+        graph.build,
+    )
+    first_update = await indexes.upsert_memories([first], reason="test_first")
+    assert first_update["document_vectors"] == 1
+
+    provider.embedded_texts.clear()
+    second = await storage.create_memory(
+        {
+            "content": "second memory about ocean",
+            "topics": ["ocean"],
+            "key_facts": ["second fact"],
+        },
+        text.tokenize,
+        graph.build,
+    )
+    second_graph_entries = await storage.graph_entries_for_memory_ids([second])
+    second_update = await indexes.upsert_memories([second], reason="test_second")
+
+    assert second_update["document_vectors"] == 2
+    assert len(provider.embedded_texts) == 1 + len(second_graph_entries)
+    assert any("second memory" in text for text in provider.embedded_texts)
+    assert not any("first memory" in text for text in provider.embedded_texts)
+
+
+@pytest.mark.asyncio
+async def test_service_rejects_incremental_write_when_nonempty_index_unbuilt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        "personalityrag.service.build_provider",
+        lambda _config: FakeProvider(),
+    )
+    service = PersonalityRAGService(
+        tmp_path,
+        AppConfig(provider=ProviderConfig(dimensions=FakeProvider.dimension)),
+        data_dir=tmp_path,
+    )
+    await service.storage.initialize()
+    await service.storage.create_memory(
+        {"content": "existing unindexed memory"},
+        service.text.tokenize,
+        service._graph_builder_for_write(),
+    )
+    await service.indexes.initialize()
+
+    with pytest.raises(RuntimeError, match="全量索引重建"):
+        await service.create_memory({"content": "new memory should roll back"})
+
+    stats = await service.storage.statistics()
+    assert stats["total_memories"] == 1
+    assert service.indexes.status()["document_vectors"] == 0
+
+
+@pytest.mark.asyncio
+async def test_service_empty_library_first_write_creates_incremental_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        "personalityrag.service.build_provider",
+        lambda _config: FakeProvider(),
+    )
+    service = PersonalityRAGService(
+        tmp_path,
+        AppConfig(provider=ProviderConfig(dimensions=FakeProvider.dimension)),
+        data_dir=tmp_path,
+    )
+    await service.initialize()
+    try:
+        created = await service.create_memory({"content": "first indexed memory"})
+
+        index_update = created["index_update"]
+        assert index_update["mode"] == "incremental"
+        assert index_update["status"] == "completed"
+        assert index_update["document_vectors"] == 1
+        assert index_update["generation"]
+        assert service.indexes.status()["document_vectors"] == 1
+        assert (await service.storage.statistics())["total_memories"] == 1
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_service_create_rolls_back_when_incremental_index_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        "personalityrag.service.build_provider",
+        lambda _config: FakeProvider(),
+    )
+    service = PersonalityRAGService(
+        tmp_path,
+        AppConfig(provider=ProviderConfig(dimensions=FakeProvider.dimension)),
+        data_dir=tmp_path,
+    )
+    await service.initialize()
+
+    async def fail_upsert(*args, **kwargs):
+        raise RuntimeError("incremental index failed")
+
+    service.indexes.upsert_memories = fail_upsert  # type: ignore[method-assign]
+    try:
+        with pytest.raises(RuntimeError, match="incremental index failed"):
+            await service.create_memory({"content": "should not remain"})
+
+        assert (await service.storage.statistics())["total_memories"] == 0
+        assert service.indexes.status()["document_vectors"] == 0
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_service_content_update_replaces_old_memory_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        "personalityrag.service.build_provider",
+        lambda _config: FakeProvider(),
+    )
+    service = PersonalityRAGService(
+        tmp_path,
+        AppConfig(provider=ProviderConfig(dimensions=FakeProvider.dimension)),
+        data_dir=tmp_path,
+    )
+    await service.initialize()
+    try:
+        created = await service.create_memory(
+            {"content": "old content about tea", "key_facts": ["old tea fact"]}
+        )
+        old_id = int(created["id"])
+
+        updated = await service.update_memory(
+            old_id,
+            {"content": "new content about coffee"},
+            rebuild=False,
+        )
+
+        assert updated is not None
+        new_id = int(updated["new_memory_id"])
+        assert new_id != old_id
+        assert await service.storage.get_document(old_id) is None
+        assert await service.storage.get_document(new_id) is not None
+        assert service.indexes.status()["document_vectors"] == 1
+        results = await service.retrieval.search("coffee", 5)
+        assert [item.doc_id for item in results] == [new_id]
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_service_persona_update_keeps_ids_and_indexes_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    provider = CountingProvider()
+    monkeypatch.setattr(
+        "personalityrag.service.build_provider",
+        lambda _config: provider,
+    )
+    service = PersonalityRAGService(
+        tmp_path,
+        AppConfig(provider=ProviderConfig(dimensions=FakeProvider.dimension)),
+        data_dir=tmp_path,
+    )
+    await service.initialize()
+    try:
+        created = await service.create_memory(
+            {
+                "content": "四条旧记忆需要补回正确人格",
+                "persona_id": None,
+                "topics": ["人格修正"],
+                "key_facts": ["旧记忆的人格字段为空"],
+            }
+        )
+        memory_id = int(created["id"])
+        generation = service.indexes.status()["generation"]
+        graph_before = await service.storage.graph_entries_for_memory_ids(
+            [memory_id]
+        )
+        graph_ids = [int(item["id"]) for item in graph_before]
+        provider.embedded_texts.clear()
+
+        updated = await service.update_memory_persona(memory_id, "贝雷特")
+
+        assert updated is not None
+        assert int(updated["id"]) == memory_id
+        assert updated["metadata"]["persona_id"] == "贝雷特"
+        assert updated["index_update"] == {
+            "mode": "metadata_only",
+            "status": "completed",
+            "index_changed": False,
+            "generation": generation,
+            "document_vectors": service.indexes.status()["document_vectors"],
+            "graph_vectors": service.indexes.status()["graph_vectors"],
+        }
+        assert provider.embedded_texts == []
+        assert service.indexes.status()["generation"] == generation
+        graph_after = await service.storage.graph_entries_for_memory_ids(
+            [memory_id]
+        )
+        assert [int(item["id"]) for item in graph_after] == graph_ids
+        assert all(item["persona_id"] == "贝雷特" for item in graph_after)
+        async with service.storage.connect() as db:
+            atom_personas = [
+                row["persona_id"]
+                for row in await (
+                    await db.execute(
+                        "SELECT persona_id FROM memory_atoms WHERE parent_memory_id=?",
+                        (memory_id,),
+                    )
+                ).fetchall()
+            ]
+        assert atom_personas
+        assert atom_personas == ["贝雷特"] * len(atom_personas)
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_service_display_metadata_update_does_not_rebuild_indexes_or_graph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    provider = CountingProvider()
+    monkeypatch.setattr(
+        "personalityrag.service.build_provider",
+        lambda _config: provider,
+    )
+    service = PersonalityRAGService(
+        tmp_path,
+        AppConfig(provider=ProviderConfig(dimensions=FakeProvider.dimension)),
+        data_dir=tmp_path,
+    )
+    await service.initialize()
+    try:
+        created = await service.create_memory(
+            {
+                "content": "群聊中的手动测试记忆",
+                "persona_id": "贝雷特",
+                "importance": 0.6,
+                "topics": ["测试"],
+                "key_facts": ["这是一条测试记忆"],
+            }
+        )
+        memory_id = int(created["id"])
+        generation = service.indexes.status()["generation"]
+        graph_before = await service.storage.graph_entries_for_memory_ids(
+            [memory_id]
+        )
+        graph_identity = [
+            (int(item["id"]), item["content"])
+            for item in graph_before
+        ]
+        provider.embedded_texts.clear()
+
+        updated = await service.update_memory(
+            memory_id,
+            {
+                "memory_type": "GROUP_CHAT",
+                "status": "archived",
+                "importance": 0.8,
+                "metadata": {"update_history": [{"description": "分类修正"}]},
+            },
+            rebuild=False,
+        )
+
+        assert updated is not None
+        assert int(updated["id"]) == memory_id
+        assert "new_memory_id" not in updated
+        assert updated["metadata"]["memory_type"] == "GROUP_CHAT"
+        assert updated["metadata"]["status"] == "archived"
+        assert updated["metadata"]["importance"] == pytest.approx(0.8)
+        assert updated["metadata"]["persona_id"] == "贝雷特"
+        assert updated["index_update"]["mode"] == "metadata_only"
+        assert updated["index_update"]["index_changed"] is False
+        assert updated["index_update"]["generation"] == generation
+        assert provider.embedded_texts == []
+        assert service.indexes.status()["generation"] == generation
+
+        graph_after = await service.storage.graph_entries_for_memory_ids(
+            [memory_id]
+        )
+        assert [
+            (int(item["id"]), item["content"])
+            for item in graph_after
+        ] == graph_identity
+        assert all(
+            item["metadata"]["importance"] == pytest.approx(0.8)
+            for item in graph_after
+        )
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_service_content_update_rolls_back_when_old_delete_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        "personalityrag.service.build_provider",
+        lambda _config: FakeProvider(),
+    )
+    service = PersonalityRAGService(
+        tmp_path,
+        AppConfig(provider=ProviderConfig(dimensions=FakeProvider.dimension)),
+        data_dir=tmp_path,
+    )
+    await service.initialize()
+    try:
+        created = await service.create_memory({"content": "original durable memory"})
+        old_id = int(created["id"])
+        original_delete = service.storage.delete_memories
+
+        async def flaky_delete(memory_ids):
+            if old_id in {int(value) for value in memory_ids}:
+                raise RuntimeError("delete old failed")
+            return await original_delete(memory_ids)
+
+        service.storage.delete_memories = flaky_delete  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="delete old failed"):
+            await service.update_memory(
+                old_id,
+                {"content": "replacement should roll back"},
+                rebuild=False,
+            )
+
+        assert await service.storage.get_document(old_id) is not None
+        assert (await service.storage.statistics())["total_memories"] == 1
+        assert service.indexes.status()["document_vectors"] == 1
+        results = await service.retrieval.search("original", 5)
+        assert [item.doc_id for item in results] == [old_id]
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_service_delete_removes_only_target_memory_from_indexes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        "personalityrag.service.build_provider",
+        lambda _config: FakeProvider(),
+    )
+    service = PersonalityRAGService(
+        tmp_path,
+        AppConfig(provider=ProviderConfig(dimensions=FakeProvider.dimension)),
+        data_dir=tmp_path,
+    )
+    await service.initialize()
+    try:
+        first = await service.create_memory({"content": "delete target alpha"})
+        second = await service.create_memory({"content": "keep target beta"})
+        first_id = int(first["id"])
+        second_id = int(second["id"])
+
+        result = await service.delete_memories(
+            [first_id],
+            rebuild=False,
+            return_details=True,
+        )
+
+        assert result["deleted"] == 1
+        assert result["index_update"]["removed_documents"] == [first_id]
+        assert await service.storage.get_document(first_id) is None
+        assert await service.storage.get_document(second_id) is not None
+        assert service.indexes.status()["document_vectors"] == 1
+        assert [item.doc_id for item in await service.retrieval.search("beta", 5)] == [
+            second_id
+        ]
+        assert first_id not in [
+            item.doc_id for item in await service.retrieval.search("alpha", 5)
+        ]
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
 async def test_graph_keyword_batches_large_token_lists(tmp_path: Path):
     storage = Storage(tmp_path)
     await storage.initialize()
@@ -101,7 +502,7 @@ async def test_graph_keyword_batches_large_token_lists(tmp_path: Path):
         {
             "content": "long graph token batching smoke",
             "topics": ["RocketCatShell"],
-            "participants": ["beileite"],
+            "participants": ["Default"],
             "key_facts": ["RocketCatShell graph token batching works"],
         },
         text.tokenize,
@@ -114,3 +515,182 @@ async def test_graph_keyword_batches_large_token_lists(tmp_path: Path):
     query = " ".join([f"token{i}" for i in range(700)] + ["RocketCatShell"])
     results = await engine._graph_keyword(query, 5, None, None)
     assert isinstance(results, list)
+
+
+@pytest.mark.asyncio
+async def test_graph_keyword_prioritizes_multi_node_hits(tmp_path: Path):
+    storage = Storage(tmp_path)
+    await storage.initialize()
+    now = "2026-01-01T00:00:00Z"
+    async with storage.connect() as db:
+        await db.executemany(
+            """INSERT INTO graph_nodes(
+                id,node_key,node_type,node_value,canonical_value,
+                metadata,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?)""",
+            [
+                (1, "topic:tv", "topic", "tv", "tv", "{}", now, now),
+                (
+                    2,
+                    "fact:zhiren-tv",
+                    "fact",
+                    "\u667a\u4ebatv",
+                    "\u667a\u4ebatv",
+                    "{}",
+                    now,
+                    now,
+                ),
+            ],
+        )
+        await db.executemany(
+            """INSERT INTO graph_entries(
+                id,entry_key,source_memory_id,entry_type,content,
+                metadata,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?)""",
+            [
+                (1, "entry:single", 1, "fact", "single tv hit", "{}", now, now),
+                (2, "entry:double", 2, "fact", "double tv hit", "{}", now, now),
+            ],
+        )
+        await db.executemany(
+            "INSERT INTO graph_entry_nodes(entry_id,node_id) VALUES(?,?)",
+            [(1, 1), (2, 1), (2, 2)],
+        )
+        await db.commit()
+
+    provider = FakeProvider()
+    indexes = IndexManager(tmp_path, storage, provider, "fake")
+    await indexes.initialize()
+    engine = RetrievalEngine(storage, indexes, TextProcessor(), RecallConfig())
+
+    results = await engine._graph_keyword("\u667a\u4eba" + "tv", 2, None, None)
+
+    assert [item.doc_id for item in results] == [2, 1]
+
+
+@pytest.mark.asyncio
+async def test_fts_writes_livingmemory_compatible_content(tmp_path: Path):
+    storage = Storage(tmp_path)
+    await storage.initialize()
+
+    def tokenize(_text: str) -> list[str]:
+        return ["tokenized", "content"]
+
+    def graph_builder(memory_id: int, content: str, metadata: dict):
+        return {
+            "nodes": [],
+            "edges": [],
+            "entries": [
+                {
+                    "entry_key": f"entry:{memory_id}:{content}",
+                    "source_memory_id": memory_id,
+                    "session_id": metadata.get("session_id"),
+                    "persona_id": metadata.get("persona_id"),
+                    "entry_type": "fact",
+                    "relation_type": "fact",
+                    "content": f"Graph raw entry for {content}",
+                    "metadata": {},
+                    "node_keys": [],
+                }
+            ],
+        }
+
+    memory_id = await storage.create_memory(
+        {"content": "Raw memory text", "persona_id": "p"},
+        tokenize,
+        graph_builder,
+    )
+
+    async def fts_rows():
+        async with storage.connect() as db:
+            doc_row = await (
+                await db.execute(
+                    "SELECT content FROM livingmemory_memories_fts WHERE doc_id=?",
+                    (memory_id,),
+                )
+            ).fetchone()
+            graph_row = await (
+                await db.execute(
+                    """SELECT content FROM livingmemory_graph_entries_fts
+                    WHERE entry_id=(SELECT id FROM graph_entries WHERE source_memory_id=?)
+                    """,
+                    (memory_id,),
+                )
+            ).fetchone()
+        return doc_row["content"], graph_row["content"]
+
+    assert await fts_rows() == (
+        "tokenized content",
+        "Graph raw entry for Raw memory text",
+    )
+
+    await storage.update_memory(
+        memory_id,
+        {"content": "Updated raw memory"},
+        tokenize,
+        graph_builder,
+    )
+    assert await fts_rows() == (
+        "tokenized content",
+        "Graph raw entry for Updated raw memory",
+    )
+
+    await storage.rebuild_fts(tokenize)
+    assert await fts_rows() == (
+        "tokenized content",
+        "Graph raw entry for Updated raw memory",
+    )
+
+
+@pytest.mark.asyncio
+async def test_candidate_graph_evidence_never_returns_outside_candidate_ids(tmp_path: Path):
+    storage = Storage(tmp_path)
+    await storage.initialize()
+    now = "2026-01-01T00:00:00Z"
+    async with storage.connect() as db:
+        await db.executemany(
+            """INSERT INTO graph_entries(
+                id,entry_key,source_memory_id,entry_type,relation_type,content,
+                metadata,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?)""",
+            [
+                (1, "entry:1", 1, "fact", "fact", "candidate alpha", "{}", now, now),
+                (2, "entry:2", 2, "fact", "fact", "candidate target", "{}", now, now),
+                (99, "entry:99", 99, "fact", "fact", "outside target", "{}", now, now),
+            ],
+        )
+        await db.executemany(
+            "INSERT INTO livingmemory_graph_entries_fts(entry_id,content) VALUES(?,?)",
+            [
+                (1, "candidate alpha"),
+                (2, "candidate target"),
+                (99, "outside target"),
+            ],
+        )
+        await db.commit()
+
+    evidence = await storage.candidate_graph_evidence([1, 2], ["target"])
+
+    assert set(evidence) <= {1, 2}
+    assert 99 not in evidence
+    assert evidence[2]["keyword_score"] > 0
+
+
+@pytest.mark.asyncio
+async def test_integrity_report_hashes_database_files_without_read_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = Storage(tmp_path)
+    await storage.initialize()
+
+    def forbidden_read_bytes(path: Path) -> bytes:
+        raise AssertionError(f"read_bytes must not hash database files: {path}")
+
+    monkeypatch.setattr(Path, "read_bytes", forbidden_read_bytes)
+    report = await storage.integrity_report()
+
+    assert report["livingmemory"]["integrity"] == "ok"
+    assert len(report["livingmemory"]["sha256"]) == 64
+    assert report["conversations"]["integrity"] == "ok"
+    assert len(report["conversations"]["sha256"]) == 64

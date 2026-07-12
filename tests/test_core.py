@@ -3,8 +3,10 @@ from __future__ import annotations
 import math
 
 import pytest
+from fastapi import HTTPException
 
 import personalityrag.app as app_module
+import personalityrag.indexes as indexes_module
 import personalityrag.restart_helper as restart_helper
 from personalityrag.app import _normalize_memory_update_payload
 from personalityrag.auth import AuthManager, hash_password, verify_password
@@ -12,6 +14,7 @@ from personalityrag.config import build_access_url, normalize_access_base_url
 from personalityrag.graph import GraphBuilder
 from personalityrag.retrieval import rrf_fuse
 from personalityrag.schemas import MemoryUpdate, SettingsUpdate
+from personalityrag.service import _graph_k_core_node_ids
 
 
 def test_auth_session_and_key():
@@ -51,6 +54,17 @@ def test_access_base_url_normalizes_and_builds_ported_urls():
     )
     with pytest.raises(ValueError):
         normalize_access_base_url("http://127.0.0.1:8765")
+
+
+def test_faiss_thread_limit_defaults_to_eight_and_accepts_environment_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PERSONALITYRAG_FAISS_THREADS", raising=False)
+    assert indexes_module._configured_faiss_threads() == 8
+    monkeypatch.setenv("PERSONALITYRAG_FAISS_THREADS", "3")
+    assert indexes_module._configured_faiss_threads() == 3
+    monkeypatch.setenv("PERSONALITYRAG_FAISS_THREADS", "invalid")
+    assert indexes_module._configured_faiss_threads() == 8
 
 
 def test_settings_payload_keeps_runtime_and_saved_ports_separate(
@@ -120,6 +134,14 @@ def test_memory_update_importance_scale_compatibility():
     )["importance"] == 0.25
 
 
+def test_generic_memory_update_rejects_persona_field():
+    with pytest.raises(HTTPException) as exc_info:
+        _normalize_memory_update_payload(MemoryUpdate(persona_id="贝雷特"))
+
+    assert exc_info.value.status_code == 400
+    assert "独立的人格编辑接口" in str(exc_info.value.detail)
+
+
 def test_graph_builder_legacy_shape():
     graph = GraphBuilder().build(
         7,
@@ -144,3 +166,14 @@ def test_graph_builder_legacy_shape():
         "mentioned_in",
     }
     assert all(entry["source_memory_id"] == 7 for entry in graph["entries"])
+
+
+def test_graph_page_k_core_removes_isolated_and_single_link_nodes():
+    edges = [
+        {"source": 1, "target": 2},
+        {"source": 2, "target": 3},
+        {"source": 3, "target": 1},
+        {"source": 3, "target": 4},
+    ]
+
+    assert _graph_k_core_node_ids({1, 2, 3, 4, 5}, edges, 2) == {1, 2, 3}

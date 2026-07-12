@@ -7,33 +7,40 @@ import os
 import shutil
 import sqlite3
 import time
-from contextlib import closing
-from dataclasses import asdict, replace
+from contextlib import asynccontextmanager, closing
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from .config import (
     AppConfig,
+    ConversationConfig,
     MaintenanceConfig,
     ProviderConfig,
     RecallConfig,
 )
 from .compat import LIVINGMEMORY_DATABASE_VERSION
 from .control import ControlStore, LibraryRecord, ProviderRevision
+from .identifiers import validate_identifier
+from .io_utils import run_blocking
 from .jobs import JobManager
 from .logger import logger
-from .migration import sqlite_backup, validate_livingmemory_db_file
+from .migration import (
+    sqlite_backup,
+    validate_conversations_db_file,
+    validate_livingmemory_db_file,
+)
 from .providers import (
     build_provider,
     build_rerank_provider,
     config_from_dict,
     provider_kind,
 )
-from .service import PersonalityRAGService
+from .service import PersonalityRAGService, scan_library_backups
 from .storage import Storage
 
 
-DEFAULT_LIBRARY_ID = "beileite"
+DEFAULT_LIBRARY_ID = "Default"
 DEFAULT_LIBRARY_NAME = "贝雷特"
 COMPATIBILITY_PAYLOAD = {
     "livingmemory_database_version": LIVINGMEMORY_DATABASE_VERSION,
@@ -49,6 +56,14 @@ LEGACY_ITEMS = (
     "stopwords",
     "decay_state.json",
 )
+PROVIDER_HEALTH_TTL_SECONDS = 60.0
+RUNTIME_SWEEP_MAX_INTERVAL_SECONDS = 60.0
+
+
+@dataclass(slots=True)
+class RuntimeResidencyState:
+    lease_count: int
+    last_used_at: float
 
 
 class LibraryManager:
@@ -60,7 +75,25 @@ class LibraryManager:
         self.control = ControlStore(self.system_path)
         self.runtimes: dict[str, PersonalityRAGService] = {}
         self._runtime_lock = asyncio.Lock()
+        self._runtime_condition = asyncio.Condition(self._runtime_lock)
+        self._runtime_residency: dict[str, RuntimeResidencyState] = {}
+        self._default_library_id = DEFAULT_LIBRARY_ID
+        self._runtime_sweeper_task: asyncio.Task[None] | None = None
+        self._closing = False
         self.jobs: JobManager | None = None
+        self._provider_health_cache: dict[
+            tuple[str, int, str], tuple[float, dict[str, Any]]
+        ] = {}
+        self._provider_health_flights: dict[
+            tuple[str, int, str], asyncio.Task[dict[str, Any]]
+        ] = {}
+        self._provider_health_lock = asyncio.Lock()
+        self._adapter_disconnect_waiters: dict[
+            tuple[str, str], set[asyncio.Future[None]]
+        ] = {}
+        self._forced_adapter_connections: dict[
+            tuple[str, str], dict[str, Any]
+        ] = {}
 
     async def initialize(self) -> None:
         logger.info("初始化 LibraryManager：data_dir=%s system_db=%s", self.data_dir, self.system_path)
@@ -70,36 +103,56 @@ class LibraryManager:
             if (path := Path(str(self.system_path) + suffix)).exists()
         }
         migration: dict[str, Any] | None = None
+        default_library_id = DEFAULT_LIBRARY_ID
         try:
             await self.control.initialize(self.config.provider)
-            self.jobs = JobManager(Storage(self.data_dir, system_path=self.system_path))
+            self._forced_adapter_connections = {
+                (item["library_id"], item["adapter_id"]): item
+                for item in await self.control.forced_adapter_connections()
+            }
+            self.jobs = JobManager(
+                Storage(self.data_dir, system_path=self.system_path),
+                runtime_lease_factory=self.runtime_lease,
+            )
             await self.jobs.clear_for_startup()
             seed = await self.control.get_provider(self.config.provider.id)
             if not seed:
                 raise RuntimeError("默认 Provider 初始化失败")
             logger.info("系统 Provider 已加载：provider=%s revision=%s", seed.provider_id, seed.revision)
             migration = await self._migrate_legacy_layout()
-            await self.control.ensure_default_library(
-                library_id=DEFAULT_LIBRARY_ID,
-                name=DEFAULT_LIBRARY_NAME,
-                provider_id=seed.provider_id,
-                provider_revision=seed.revision,
-                recall_settings=asdict(self.config.recall),
-                maintenance_settings=asdict(self.config.maintenance),
-            )
-            runtime = await self.get_runtime(DEFAULT_LIBRARY_ID)
+            try:
+                default_library = await self.control.default_library()
+            except RuntimeError:
+                default_library = await self.control.ensure_default_library(
+                    library_id=DEFAULT_LIBRARY_ID,
+                    name=DEFAULT_LIBRARY_NAME,
+                    provider_id=seed.provider_id,
+                    provider_revision=seed.revision,
+                    conversation_settings=asdict(self.config.conversation),
+                    recall_settings=asdict(self.config.recall),
+                    maintenance_settings=asdict(self.config.maintenance),
+                )
+                if not default_library.is_default:
+                    default_library = await self.control.set_default_library(
+                        default_library.id
+                    )
+            default_library_id = default_library.id
+            self._default_library_id = default_library_id
+            runtime = await self.get_runtime(default_library_id)
             await self._reconcile_binding(runtime)
             await self._validate_runtime(runtime)
             if migration:
                 self._commit_migration_marker(migration)
-            logger.info("LibraryManager 初始化完成：default_library=%s", DEFAULT_LIBRARY_ID)
+            self._start_runtime_sweeper()
+            logger.info("LibraryManager 初始化完成：default_library=%s", default_library_id)
         except Exception:
             logger.exception("LibraryManager 初始化失败，准备回滚可能的迁移")
             if migration:
-                runtime = self.runtimes.pop(DEFAULT_LIBRARY_ID, None)
+                runtime = self.runtimes.pop(default_library_id, None)
+                self._runtime_residency.pop(default_library_id, None)
                 if runtime is not None:
                     await runtime.close()
-                self._rollback_legacy_layout(migration)
+                await self._rollback_legacy_layout(migration)
                 for suffix in ("", "-wal", "-shm"):
                     path = Path(str(self.system_path) + suffix)
                     path.unlink(missing_ok=True)
@@ -107,19 +160,230 @@ class LibraryManager:
                         path.write_bytes(system_snapshot[suffix])
             raise
 
+    def subscribe_adapter_disconnect(
+        self,
+        library_id: str,
+        adapter_id: str,
+    ) -> asyncio.Future[None]:
+        future = asyncio.get_running_loop().create_future()
+        self._adapter_disconnect_waiters.setdefault(
+            (library_id, adapter_id), set()
+        ).add(future)
+        return future
+
+    def unsubscribe_adapter_disconnect(
+        self,
+        library_id: str,
+        adapter_id: str,
+        future: asyncio.Future[None],
+    ) -> None:
+        key = (library_id, adapter_id)
+        waiters = self._adapter_disconnect_waiters.get(key)
+        if not waiters:
+            return
+        waiters.discard(future)
+        if not waiters:
+            self._adapter_disconnect_waiters.pop(key, None)
+
+    def notify_adapter_disconnect(self, library_id: str, adapter_id: str) -> None:
+        for future in tuple(
+            self._adapter_disconnect_waiters.get((library_id, adapter_id), ())
+        ):
+            if not future.done():
+                future.set_result(None)
+
+    def forced_adapter_connection(
+        self,
+        library_id: str,
+        adapter_id: str,
+    ) -> dict[str, Any] | None:
+        connection = self._forced_adapter_connections.get(
+            (library_id, adapter_id)
+        )
+        return dict(connection) if connection else None
+
+    def mark_adapter_forced_offline(self, connection: dict[str, Any]) -> None:
+        self._forced_adapter_connections[
+            (str(connection["library_id"]), str(connection["adapter_id"]))
+        ] = dict(connection)
+
+    def clear_adapter_forced_offline(
+        self,
+        library_id: str,
+        adapter_id: str,
+    ) -> None:
+        self._forced_adapter_connections.pop((library_id, adapter_id), None)
+
     async def close(self) -> None:
+        self._closing = True
+        waiters = [
+            future
+            for group in self._adapter_disconnect_waiters.values()
+            for future in group
+        ]
+        self._adapter_disconnect_waiters.clear()
+        self._forced_adapter_connections.clear()
+        for future in waiters:
+            if not future.done():
+                future.cancel()
+        if self._runtime_sweeper_task is not None:
+            self._runtime_sweeper_task.cancel()
+            await asyncio.gather(
+                self._runtime_sweeper_task, return_exceptions=True
+            )
+            self._runtime_sweeper_task = None
         if self.jobs is not None:
             await self.jobs.close()
+        flights = list(self._provider_health_flights.values())
+        for task in flights:
+            task.cancel()
+        if flights:
+            await asyncio.gather(*flights, return_exceptions=True)
+        self._provider_health_flights.clear()
+        self._provider_health_cache.clear()
         for runtime in list(self.runtimes.values()):
             await runtime.close()
         self.runtimes.clear()
+        self._runtime_residency.clear()
+
+    async def provider_status(
+        self,
+        runtime: PersonalityRAGService,
+        *,
+        allow_probe: bool = True,
+        ttl_seconds: float = PROVIDER_HEALTH_TTL_SECONDS,
+    ) -> dict[str, Any]:
+        revision = runtime.provider_revision
+        key = (
+            revision.provider_id,
+            revision.revision,
+            revision.config_sha256,
+        )
+        now = time.time()
+        cached = self._provider_health_cache.get(key)
+        if cached and now - cached[0] <= ttl_seconds:
+            return self._provider_status_payload(
+                cached[1],
+                checked_at=cached[0],
+                cached=True,
+                now=now,
+            )
+        if not allow_probe:
+            if cached:
+                return self._provider_status_payload(
+                    cached[1],
+                    checked_at=cached[0],
+                    cached=True,
+                    now=now,
+                )
+            return {
+                "available": None,
+                "status": "not_checked",
+                "reason": "provider status is not cached",
+                "cached": True,
+                "checked_at": None,
+                "age_seconds": None,
+            }
+
+        async with self._provider_health_lock:
+            cached = self._provider_health_cache.get(key)
+            now = time.time()
+            if cached and now - cached[0] <= ttl_seconds:
+                return self._provider_status_payload(
+                    cached[1],
+                    checked_at=cached[0],
+                    cached=True,
+                    now=now,
+                )
+            task = self._provider_health_flights.get(key)
+            reused = task is not None
+            if task is None:
+                task = asyncio.create_task(
+                    self._probe_provider_status(key, runtime.provider)
+                )
+                self._provider_health_flights[key] = task
+
+        result = await asyncio.shield(task)
+        checked_at, cached_result = self._provider_health_cache.get(
+            key, (time.time(), result)
+        )
+        return self._provider_status_payload(
+            cached_result,
+            checked_at=checked_at,
+            cached=reused,
+            now=time.time(),
+        )
+
+    def cached_provider_status(
+        self, revision: ProviderRevision | None
+    ) -> dict[str, Any]:
+        if revision is None:
+            return {
+                "available": None,
+                "status": "not_checked",
+                "reason": "provider revision is unavailable",
+                "cached": True,
+                "checked_at": None,
+                "age_seconds": None,
+            }
+        key = (
+            revision.provider_id,
+            revision.revision,
+            revision.config_sha256,
+        )
+        cached = self._provider_health_cache.get(key)
+        if cached is None:
+            return {
+                "available": None,
+                "status": "not_checked",
+                "reason": "provider status is not cached",
+                "cached": True,
+                "checked_at": None,
+                "age_seconds": None,
+            }
+        return self._provider_status_payload(
+            cached[1],
+            checked_at=cached[0],
+            cached=True,
+            now=time.time(),
+        )
+
+    async def _probe_provider_status(
+        self,
+        key: tuple[str, int, str],
+        provider: Any,
+    ) -> dict[str, Any]:
+        try:
+            result = await provider.test_connection()
+            checked_at = time.time()
+            self._provider_health_cache[key] = (checked_at, dict(result))
+            return dict(result)
+        finally:
+            self._provider_health_flights.pop(key, None)
+
+    @staticmethod
+    def _provider_status_payload(
+        result: dict[str, Any],
+        *,
+        checked_at: float,
+        cached: bool,
+        now: float,
+    ) -> dict[str, Any]:
+        return {
+            **result,
+            "cached": cached,
+            "checked_at": checked_at,
+            "age_seconds": max(0.0, now - checked_at),
+        }
 
     async def _migrate_legacy_layout(self) -> dict[str, Any] | None:
+        return await run_blocking(self._migrate_legacy_layout_sync)
+
+    def _migrate_legacy_layout_sync(self) -> dict[str, Any] | None:
         source_db = self.data_dir / "livingmemory.db"
         target_root = self.data_dir / "libraries" / DEFAULT_LIBRARY_ID
         marker = self.data_dir / ".multilibrary_migrated_v1.json"
         if not source_db.exists():
-            target_root.mkdir(parents=True, exist_ok=True)
             return None
 
         timestamp = time.strftime("%Y%m%d-%H%M%S")
@@ -186,21 +450,17 @@ class LibraryManager:
                 raise RuntimeError(f"{name} 完整性校验失败")
         stats = await runtime.storage.statistics()
         indexes = runtime.indexes.status()
+        document_ids = {int(value) for value in await runtime.storage.document_ids()}
+        graph_ids = {int(value) for value in await runtime.storage.graph_entry_ids()}
+        indexed_document_ids, indexed_graph_ids = runtime.indexes.indexed_ids()
+        if indexed_document_ids != document_ids:
+            raise RuntimeError("文档 FAISS ID 数量与数据库不一致")
+        if indexed_graph_ids != graph_ids:
+            raise RuntimeError("图谱 FAISS ID 数量与数据库不一致")
         if int(indexes["document_vectors"]) != int(stats["total_memories"]):
             raise RuntimeError("文档 FAISS ID 数量与数据库不一致")
         if int(indexes["graph_vectors"]) != int(stats["graph_entries"]):
             raise RuntimeError("图谱 FAISS ID 数量与数据库不一致")
-        if int(stats["total_memories"]) > 0:
-            async with runtime.storage.connect() as db:
-                row = await (
-                    await db.execute(
-                        "SELECT text FROM documents ORDER BY id LIMIT 1"
-                    )
-                ).fetchone()
-            if row and not await runtime.indexes.search_documents(
-                str(row["text"])[:500], 1
-            ):
-                raise RuntimeError("迁移后文档向量抽样召回失败")
 
     def _commit_migration_marker(self, migration: dict[str, Any]) -> None:
         marker = Path(migration["marker"])
@@ -226,7 +486,10 @@ class LibraryManager:
             migration["backup_root"],
         )
 
-    def _rollback_legacy_layout(self, migration: dict[str, Any]) -> None:
+    async def _rollback_legacy_layout(self, migration: dict[str, Any]) -> None:
+        await run_blocking(self._rollback_legacy_layout_sync, migration)
+
+    def _rollback_legacy_layout_sync(self, migration: dict[str, Any]) -> None:
         logger.warning("正在回滚旧单库布局迁移：backup=%s", migration["backup_root"])
         target_root = Path(migration["target_root"])
         backup_root = Path(migration["backup_root"])
@@ -297,88 +560,356 @@ class LibraryManager:
             "graph_vectors": 0,
         }
 
+    def _start_runtime_sweeper(self) -> None:
+        if self._runtime_sweeper_task is None or self._runtime_sweeper_task.done():
+            self._runtime_sweeper_task = asyncio.create_task(
+                self._runtime_sweeper_loop(),
+                name="personalityrag-runtime-residency",
+            )
+
+    async def _runtime_sweeper_loop(self) -> None:
+        while not self._closing:
+            idle_seconds = max(
+                60.0,
+                float(self.config.runtime_residency.idle_minutes) * 60.0,
+            )
+            interval = min(
+                RUNTIME_SWEEP_MAX_INTERVAL_SECONDS,
+                max(5.0, idle_seconds / 2.0),
+            )
+            try:
+                await asyncio.sleep(interval)
+                await self.sweep_runtimes()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("记忆库 runtime 空闲回收巡检失败")
+
+    async def _runtime_has_active_jobs(self, library_id: str) -> bool:
+        return await self.control.has_running_jobs(library_id)
+
+    async def _close_runtime_locked(
+        self,
+        library_id: str,
+        *,
+        reason: str,
+        suppress_errors: bool = True,
+    ) -> bool:
+        runtime = self.runtimes.pop(library_id, None)
+        self._runtime_residency.pop(library_id, None)
+        if runtime is None:
+            return False
+        try:
+            await runtime.close()
+        except Exception:
+            logger.exception(
+                "记忆库 runtime 释放失败：library_id=%s reason=%s",
+                library_id,
+                reason,
+            )
+            if not suppress_errors:
+                raise
+        else:
+            logger.info(
+                "记忆库 runtime 已释放：library_id=%s reason=%s",
+                library_id,
+                reason,
+            )
+        return True
+
+    async def _evict_lru_until_locked(
+        self, max_non_default: int, *, reason: str
+    ) -> list[str]:
+        evicted: list[str] = []
+        target = max(0, int(max_non_default))
+        while True:
+            non_default = [
+                library_id
+                for library_id in self.runtimes
+                if library_id != self._default_library_id
+            ]
+            if len(non_default) <= target:
+                break
+            candidates = sorted(
+                non_default,
+                key=lambda item: self._runtime_residency.get(
+                    item,
+                    RuntimeResidencyState(0, 0.0),
+                ).last_used_at,
+            )
+            selected: str | None = None
+            for library_id in candidates:
+                state = self._runtime_residency.get(library_id)
+                if state is not None and state.lease_count > 0:
+                    continue
+                if await self._runtime_has_active_jobs(library_id):
+                    continue
+                selected = library_id
+                break
+            if selected is None:
+                break
+            await self._close_runtime_locked(selected, reason=reason)
+            evicted.append(selected)
+        return evicted
+
+    async def _load_runtime_locked(
+        self, library_id: str
+    ) -> PersonalityRAGService:
+        current = self.runtimes.get(library_id)
+        if current is not None:
+            return current
+        library = await self.control.get_library(library_id)
+        if not library:
+            raise KeyError(library_id)
+        if library_id != self._default_library_id:
+            limit = max(
+                1,
+                int(self.config.runtime_residency.max_non_default_runtimes),
+            )
+            await self._evict_lru_until_locked(
+                limit - 1,
+                reason="capacity",
+            )
+        logger.info("懒加载记忆库 runtime：library_id=%s", library_id)
+        provider = await self.control.get_provider(
+            library.provider_id, library.provider_revision
+        )
+        if not provider:
+            raise RuntimeError(
+                f"记忆库 {library_id} 绑定的 Provider revision 不存在"
+            )
+        rerank_provider = None
+        if library.rerank_provider_id:
+            rerank_provider = await self.control.get_provider(
+                library.rerank_provider_id
+            )
+            if not rerank_provider:
+                logger.warning(
+                    "记忆库绑定的 Rerank Provider 不存在，将跳过重排：library_id=%s provider=%s",
+                    library_id,
+                    library.rerank_provider_id,
+                )
+        runtime_config = replace(
+            self.config,
+            conversation=ConversationConfig(
+                **{
+                    **asdict(self.config.conversation),
+                    **library.conversation_settings,
+                }
+            ),
+            recall=RecallConfig(
+                **{
+                    **asdict(self.config.recall),
+                    **library.recall_settings,
+                }
+            ),
+            maintenance=MaintenanceConfig(
+                **{
+                    **asdict(self.config.maintenance),
+                    **library.maintenance_settings,
+                }
+            ),
+        )
+        runtime = PersonalityRAGService(
+            self.root,
+            runtime_config,
+            self.data_dir / "libraries" / library_id,
+            library_id=library_id,
+            default_persona_id=library.default_persona_id,
+            provider_revision=provider,
+            rerank_provider_revision=rerank_provider,
+            system_path=self.system_path,
+        )
+        await runtime.initialize()
+        now = time.monotonic()
+        self.runtimes[library_id] = runtime
+        self._runtime_residency[library_id] = RuntimeResidencyState(
+            lease_count=0,
+            last_used_at=now,
+        )
+        logger.info("记忆库 runtime 已加载：library_id=%s", library_id)
+        return runtime
+
     async def get_runtime(self, library_id: str) -> PersonalityRAGService:
-        if library_id in self.runtimes:
-            return self.runtimes[library_id]
         async with self._runtime_lock:
-            if library_id in self.runtimes:
-                return self.runtimes[library_id]
-            library = await self.control.get_library(library_id)
-            if not library:
-                raise KeyError(library_id)
-            logger.info("懒加载记忆库 runtime：library_id=%s", library_id)
-            provider = await self.control.get_provider(
-                library.provider_id, library.provider_revision
-            )
-            if not provider:
-                raise RuntimeError(
-                    f"记忆库 {library_id} 绑定的 Provider revision 不存在"
-                )
-            rerank_provider = None
-            if library.rerank_provider_id:
-                rerank_provider = await self.control.get_provider(
-                    library.rerank_provider_id
-                )
-                if not rerank_provider:
-                    logger.warning(
-                        "记忆库绑定的 Rerank Provider 不存在，将跳过重排：library_id=%s provider=%s",
-                        library_id,
-                        library.rerank_provider_id,
-                    )
-            runtime_config = replace(
-                self.config,
-                recall=RecallConfig(
-                    **{
-                        **asdict(self.config.recall),
-                        **library.recall_settings,
-                    }
-                ),
-                maintenance=MaintenanceConfig(
-                    **{
-                        **asdict(self.config.maintenance),
-                        **library.maintenance_settings,
-                    }
-                ),
-            )
-            runtime = PersonalityRAGService(
-                self.root,
-                runtime_config,
-                self.data_dir / "libraries" / library_id,
-                library_id=library_id,
-                provider_revision=provider,
-                rerank_provider_revision=rerank_provider,
-                system_path=self.system_path,
-            )
-            await runtime.initialize()
-            self.runtimes[library_id] = runtime
-            logger.info("记忆库 runtime 已加载：library_id=%s", library_id)
+            runtime = await self._load_runtime_locked(library_id)
+            self._runtime_residency[library_id].last_used_at = time.monotonic()
             return runtime
+
+    async def acquire_runtime(
+        self, library_id: str, *, touch: bool = True
+    ) -> PersonalityRAGService:
+        async with self._runtime_lock:
+            runtime = await self._load_runtime_locked(library_id)
+            state = self._runtime_residency[library_id]
+            state.lease_count += 1
+            if touch:
+                state.last_used_at = time.monotonic()
+            return runtime
+
+    async def release_runtime(self, library_id: str, *, touch: bool = True) -> None:
+        should_converge = False
+        async with self._runtime_condition:
+            state = self._runtime_residency.get(library_id)
+            if state is None:
+                return
+            state.lease_count = max(0, state.lease_count - 1)
+            if touch:
+                state.last_used_at = time.monotonic()
+            should_converge = state.lease_count == 0
+            self._runtime_condition.notify_all()
+        if should_converge:
+            await self.sweep_runtimes(expire_idle=False)
+
+    @asynccontextmanager
+    async def runtime_lease(self, library_id: str, *, touch: bool = True):
+        runtime = await self.acquire_runtime(library_id, touch=touch)
+        try:
+            yield runtime
+        finally:
+            await self.release_runtime(library_id, touch=touch)
+
+    async def unload_runtime(self, library_id: str, *, reason: str) -> bool:
+        async with self._runtime_condition:
+            while (
+                state := self._runtime_residency.get(library_id)
+            ) is not None and state.lease_count > 0:
+                await self._runtime_condition.wait()
+            return await self._close_runtime_locked(
+                library_id,
+                reason=reason,
+                suppress_errors=False,
+            )
+
+    async def sweep_runtimes(self, *, expire_idle: bool = True) -> list[str]:
+        evicted: list[str] = []
+        async with self._runtime_lock:
+            if expire_idle:
+                now = time.monotonic()
+                idle_seconds = (
+                    max(1, int(self.config.runtime_residency.idle_minutes)) * 60.0
+                )
+                candidates = sorted(
+                    (
+                        library_id
+                        for library_id in self.runtimes
+                        if library_id != self._default_library_id
+                    ),
+                    key=lambda item: self._runtime_residency.get(
+                        item,
+                        RuntimeResidencyState(0, 0.0),
+                    ).last_used_at,
+                )
+                for library_id in candidates:
+                    state = self._runtime_residency.get(library_id)
+                    if state is None or state.lease_count > 0:
+                        continue
+                    if now - state.last_used_at < idle_seconds:
+                        continue
+                    if await self._runtime_has_active_jobs(library_id):
+                        continue
+                    if await self._close_runtime_locked(
+                        library_id,
+                        reason="idle",
+                    ):
+                        evicted.append(library_id)
+            evicted.extend(
+                await self._evict_lru_until_locked(
+                    max(
+                        1,
+                        int(
+                            self.config.runtime_residency.max_non_default_runtimes
+                        ),
+                    ),
+                    reason="capacity",
+                )
+            )
+        return evicted
+
+    async def apply_runtime_residency(self) -> list[str]:
+        self.config.runtime_residency.idle_minutes = max(
+            1, int(self.config.runtime_residency.idle_minutes)
+        )
+        self.config.runtime_residency.max_non_default_runtimes = max(
+            1,
+            int(self.config.runtime_residency.max_non_default_runtimes),
+        )
+        return await self.sweep_runtimes()
+
+    def runtime_residency_status(self) -> dict[str, Any]:
+        return {
+            "default_library_id": self._default_library_id,
+            "loaded_library_ids": list(self.runtimes),
+            "runtimes": {
+                library_id: {
+                    "lease_count": state.lease_count,
+                    "last_used_at": state.last_used_at,
+                }
+                for library_id, state in self._runtime_residency.items()
+            },
+        }
 
     async def default_runtime(self) -> PersonalityRAGService:
         record = await self.control.default_library()
         return await self.get_runtime(record.id)
 
-    async def list_libraries(self) -> list[dict[str, Any]]:
+    @staticmethod
+    def _adapter_busy_summary(job: dict[str, Any] | None) -> dict[str, Any]:
+        return {
+            "busy": bool(job),
+            "job": job,
+        }
+
+    async def list_libraries(
+        self, *, stats_mode: str = "full"
+    ) -> list[dict[str, Any]]:
+        if stats_mode not in {"full", "summary"}:
+            raise ValueError("invalid library stats mode")
         result = []
-        for record in await self.control.list_libraries():
-            provider = await self.control.get_provider(
-                record.provider_id, record.provider_revision
+        records = await self.control.list_libraries()
+        library_ids = [record.id for record in records]
+        provider_bindings = {
+            (record.provider_id, record.provider_revision) for record in records
+        }
+        provider_bindings.update(
+            (record.rerank_provider_id, None)
+            for record in records
+            if record.rerank_provider_id
+        )
+        provider_map = await self.control.get_providers_bulk(provider_bindings)
+        adapter_map = await self.control.active_adapter_connections_map(library_ids)
+        busy_map = (
+            await self.jobs.active_long_jobs_map(library_ids)
+            if self.jobs is not None
+            else await self.control.active_long_jobs_map(library_ids)
+        )
+        for record in records:
+            provider = provider_map.get(
+                (record.provider_id, record.provider_revision)
             )
             rerank_provider = (
-                await self.control.get_provider(record.rerank_provider_id)
+                provider_map.get((record.rerank_provider_id, None))
                 if record.rerank_provider_id
                 else None
             )
             runtime = self.runtimes.get(record.id)
             if runtime is not None:
-                stats = await runtime.storage.statistics()
+                stats = (
+                    await runtime.storage.summary_statistics()
+                    if stats_mode == "summary"
+                    else await runtime.storage.statistics()
+                )
                 indexes = self._normalize_indexes_for_response(
                     stats, runtime.indexes.status()
                 )
             else:
                 library_dir = self.data_dir / "libraries" / record.id
                 storage = Storage(library_dir, system_path=self.system_path)
-                stats = await storage.statistics()
+                stats = (
+                    await storage.summary_statistics()
+                    if stats_mode == "summary"
+                    else await storage.statistics()
+                )
                 indexes = self._normalize_indexes_for_response(
                     stats, self._offline_index_status(library_dir, record)
                 )
@@ -390,6 +921,10 @@ class LibraryManager:
                     "provider": provider.public() if provider else None,
                     "rerank_provider": (
                         rerank_provider.public() if rerank_provider else None
+                    ),
+                    "adapter_connections": adapter_map.get(record.id, []),
+                    "adapter_busy": self._adapter_busy_summary(
+                        busy_map.get(record.id)
                     ),
                     "compatibility": dict(COMPATIBILITY_PAYLOAD),
                 }
@@ -432,7 +967,6 @@ class LibraryManager:
         record = await self.control.get_library(library_id)
         if not record:
             raise KeyError(library_id)
-        runtime = await self.get_runtime(library_id)
         provider = await self.control.get_provider(
             record.provider_id, record.provider_revision
         )
@@ -441,20 +975,38 @@ class LibraryManager:
             if record.rerank_provider_id
             else None
         )
-        stats = await runtime.storage.statistics()
+        library_dir = self.data_dir / "libraries" / record.id
+        stats = await Storage(
+            library_dir,
+            system_path=self.system_path,
+        ).statistics()
         return {
             **record.public(),
             "stats": stats,
             "indexes": self._normalize_indexes_for_response(
-                stats, runtime.indexes.status()
+                stats, self._offline_index_status(library_dir, record)
             ),
             "provider": provider.public() if provider else None,
             "rerank_provider": rerank_provider.public() if rerank_provider else None,
+            "adapter_connections": await self.control.active_adapter_connections(
+                record.id
+            ),
+            "adapter_busy": self._adapter_busy_summary(
+                await self.jobs.active_long_job(record.id)
+                if self.jobs is not None
+                else await self.control.active_long_job(record.id)
+            ),
             "compatibility": dict(COMPATIBILITY_PAYLOAD),
         }
 
+    async def list_library_backups(self, library_id: str) -> list[dict[str, Any]]:
+        library_dir = self.data_dir / "libraries" / library_id
+        return await run_blocking(scan_library_backups, library_dir)
+
     async def create_library(self, payload: dict[str, Any]) -> dict[str, Any]:
-        provider_id = str(payload.get("provider_id") or "").strip()
+        provider_id = validate_identifier(
+            payload.get("provider_id"), field="Provider ID"
+        )
         provider = await self.control.get_provider(provider_id)
         if provider and provider_kind(provider.config.type) != "embedding":
             raise ValueError("记忆库必须绑定 Embedding Provider")
@@ -462,8 +1014,11 @@ class LibraryManager:
             raise ValueError("指定的 Provider 不存在")
         if not provider.config.enabled:
             raise ValueError("指定的 Provider 未启用")
-        rerank_provider_id = str(payload.get("rerank_provider_id") or "").strip()
+        rerank_provider_id = str(payload.get("rerank_provider_id") or "")
         if rerank_provider_id:
+            rerank_provider_id = validate_identifier(
+                rerank_provider_id, field="Provider ID"
+            )
             rerank_provider = await self.control.get_provider(rerank_provider_id)
             if not rerank_provider:
                 raise ValueError("指定的 Rerank Provider 不存在")
@@ -476,6 +1031,8 @@ class LibraryManager:
             payload["rerank_provider_id"] = ""
         payload = {
             **payload,
+            "conversation_settings": payload.get("conversation_settings")
+            or asdict(self.config.conversation),
             "recall_settings": payload.get("recall_settings")
             or asdict(self.config.recall),
             "maintenance_settings": payload.get("maintenance_settings")
@@ -492,9 +1049,7 @@ class LibraryManager:
             )
         except Exception:
             logger.exception("新记忆库初始化失败，正在清理：library_id=%s", record.id)
-            failed_runtime = self.runtimes.pop(record.id, None)
-            if failed_runtime is not None:
-                await failed_runtime.close()
+            await self.unload_runtime(record.id, reason="create_failed")
             await self.control.mark_library_deleted(record.id)
             shutil.rmtree(
                 self.data_dir / "libraries" / record.id, ignore_errors=True
@@ -508,9 +1063,17 @@ class LibraryManager:
         record = await self.control.get_library(library_id)
         if not record:
             raise KeyError(library_id)
-        next_library_id = str(payload.get("id", record.id) or "").strip() or record.id
+        next_library_id = (
+            validate_identifier(payload["id"], field="记忆库 ID")
+            if "id" in payload
+            else record.id
+        )
         rename_requested = next_library_id != record.id
-        requested_provider_id = str(payload.pop("provider_id", "") or "").strip()
+        requested_provider_id = payload.pop("provider_id", None)
+        if requested_provider_id is not None:
+            requested_provider_id = validate_identifier(
+                requested_provider_id, field="Provider ID"
+            )
         if requested_provider_id and requested_provider_id != record.provider_id:
             provider = await self.control.get_provider(requested_provider_id)
             if not provider:
@@ -520,8 +1083,11 @@ class LibraryManager:
             if not provider.config.enabled:
                 raise ValueError("指定的 Embedding Provider 未启用")
         if "rerank_provider_id" in payload:
-            rerank_provider_id = str(payload.get("rerank_provider_id") or "").strip()
+            rerank_provider_id = str(payload.get("rerank_provider_id") or "")
             if rerank_provider_id:
+                rerank_provider_id = validate_identifier(
+                    rerank_provider_id, field="Provider ID"
+                )
                 rerank_provider = await self.control.get_provider(rerank_provider_id)
                 if not rerank_provider:
                     raise ValueError("指定的 Rerank Provider 不存在")
@@ -538,7 +1104,8 @@ class LibraryManager:
             != str(record.rerank_provider_id or "")
         )
         settings_changed = (
-            "recall_settings" in payload
+            "conversation_settings" in payload
+            or "recall_settings" in payload
             or "maintenance_settings" in payload
         )
         reload_runtime = (
@@ -546,15 +1113,14 @@ class LibraryManager:
             or settings_changed
         )
         if rename_requested:
-            if record.is_default:
-                raise ValueError("默认记忆库 ID 不能修改")
+            if await self.control.active_adapter_connections(record.id):
+                raise ValueError("记忆库已被适配器连接，不能修改 ID")
             if await self.control.has_running_jobs(record.id):
                 raise ValueError("记忆库存在进行中的任务，暂时不能修改 ID")
             if await self._library_copy_target_reserved(next_library_id):
                 raise ValueError(f"记忆库 ID 已存在：{next_library_id}")
-        runtime = self.runtimes.pop(record.id, None) if reload_runtime else None
-        if runtime is not None:
-            await runtime.close()
+        if reload_runtime:
+            await self.unload_runtime(record.id, reason="library_settings_changed")
         if rename_requested:
             source_dir = self.data_dir / "libraries" / record.id
             target_dir = self.data_dir / "libraries" / next_library_id
@@ -581,9 +1147,12 @@ class LibraryManager:
                 raise
         else:
             await self.control.update_library(record.id, payload)
+            if "default_persona_id" in payload and record.id in self.runtimes:
+                self.runtimes[record.id].default_persona_id = str(
+                    payload.get("default_persona_id") or ""
+                ).strip()
             if rerank_changed and not reload_runtime:
-                runtime = self.runtimes.get(record.id)
-                if runtime is not None:
+                if record.id in self.runtimes:
                     provider = (
                         await self.control.get_provider(
                             str(payload.get("rerank_provider_id") or "")
@@ -591,12 +1160,26 @@ class LibraryManager:
                         if payload.get("rerank_provider_id")
                         else None
                     )
-                    await runtime.set_rerank_provider(provider)
+                    async with self.runtime_lease(record.id) as runtime:
+                        await runtime.set_rerank_provider(provider)
+        if record.is_default:
+            self._default_library_id = next_library_id
+            await self.get_runtime(next_library_id)
         return await self.library_detail(next_library_id)
 
     async def set_default(self, library_id: str) -> dict[str, Any]:
         await self.control.set_default_library(library_id)
+        self._default_library_id = library_id
+        await self.get_runtime(library_id)
+        await self.sweep_runtimes(expire_idle=False)
         return await self.library_detail(library_id)
+
+    async def refresh_default_library(self, *, load: bool = False) -> str:
+        record = await self.control.default_library()
+        self._default_library_id = record.id
+        if load:
+            await self.get_runtime(record.id)
+        return record.id
 
     async def copy_library(self, library_id: str, progress=None) -> dict[str, Any]:
         source = await self.control.get_library(library_id)
@@ -629,7 +1212,7 @@ class LibraryManager:
         try:
             if progress:
                 await progress(0.2, "正在复制记忆库目录和 SQLite 快照")
-            await asyncio.to_thread(self._copy_library_directory, source_dir, tmp_dir)
+            await run_blocking(self._copy_library_directory, source_dir, tmp_dir)
             if progress:
                 await progress(0.72, "正在重写副本索引 manifest")
             self._rewrite_library_manifests(tmp_dir, target_id)
@@ -645,6 +1228,7 @@ class LibraryManager:
                     "description": source.description,
                     "default_persona_id": source.default_persona_id,
                     "rerank_provider_id": source.rerank_provider_id,
+                    "conversation_settings": source.conversation_settings,
                     "recall_settings": source.recall_settings,
                     "maintenance_settings": source.maintenance_settings,
                     "metadata": source.metadata,
@@ -675,8 +1259,8 @@ class LibraryManager:
             }
         except Exception:
             logger.exception("复制记忆库失败，正在清理副本：source=%s target=%s", source.id, target_id)
-            shutil.rmtree(target_dir, ignore_errors=True)
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            await run_blocking(shutil.rmtree, target_dir, ignore_errors=True)
+            await run_blocking(shutil.rmtree, tmp_dir, ignore_errors=True)
             if record_created:
                 try:
                     await self.control.mark_library_deleted(target_id)
@@ -744,13 +1328,13 @@ class LibraryManager:
             )
 
     async def backup_library(self, library_id: str) -> dict[str, Any]:
-        runtime = await self.get_runtime(library_id)
-        path = await runtime.backup()
+        async with self.runtime_lease(library_id) as runtime:
+            path = await runtime.backup()
         return {"library_id": library_id, "path": str(path)}
 
     async def library_is_empty(self, library_id: str) -> bool:
-        runtime = await self.get_runtime(library_id)
-        stats = await runtime.storage.statistics()
+        async with self.runtime_lease(library_id) as runtime:
+            stats = await runtime.storage.statistics()
         return all(
             int(value or 0) == 0
             for value in (
@@ -768,16 +1352,26 @@ class LibraryManager:
         library_id: str,
         source_db: Path,
         progress=None,
+        *,
+        conversations_db: Path | None = None,
     ) -> dict[str, Any]:
         record = await self.control.get_library(library_id)
         if not record:
             raise KeyError(library_id)
-        source_report = await asyncio.to_thread(
+        source_report = await run_blocking(
             validate_livingmemory_db_file,
             source_db,
         )
+        conversations_report = (
+            await run_blocking(validate_conversations_db_file, conversations_db)
+            if conversations_db is not None
+            else None
+        )
         if progress:
-            await progress(0.02, "已验证 LivingMemory 核心数据库")
+            validated_message = "已验证 LivingMemory 核心数据库"
+            if conversations_report is not None:
+                validated_message += "与消息记录数据库"
+            await progress(0.02, validated_message)
         runtime = await self.get_runtime(library_id)
         if not await self.library_is_empty(library_id):
             raise ValueError("只有全新空记忆库可以导入 livingmemory.db")
@@ -790,34 +1384,60 @@ class LibraryManager:
         archive_dir.mkdir(parents=True, exist_ok=False)
         report_dir.mkdir(parents=True, exist_ok=True)
         target_db = library_dir / "livingmemory.db"
+        target_conversations_db = library_dir / "conversations.db"
         rollback_db = import_dir / "pre_import_empty_livingmemory.db"
+        rollback_conversations_db = import_dir / "pre_import_empty_conversations.db"
         report_path = report_dir / f"livingmemory-db-import-{run_id}.json"
         logger.warning(
-            "LivingMemory 单文件导入开始：library_id=%s source=%s run_id=%s",
+            "LivingMemory 单文件导入开始：library_id=%s source=%s conversations=%s run_id=%s",
             library_id,
             source_db,
+            conversations_db or "",
             run_id,
         )
         try:
             if progress:
                 await progress(0.04, "正在归档上传的 livingmemory.db")
-            await asyncio.to_thread(
+            await run_blocking(
                 sqlite_backup,
                 source_db,
                 archive_dir / "livingmemory.db",
             )
+            if conversations_db is not None:
+                await run_blocking(
+                    sqlite_backup,
+                    conversations_db,
+                    archive_dir / "conversations.db",
+                )
             if target_db.exists():
-                await asyncio.to_thread(sqlite_backup, target_db, rollback_db)
+                await run_blocking(sqlite_backup, target_db, rollback_db)
+            if target_conversations_db.exists():
+                await run_blocking(
+                    sqlite_backup,
+                    target_conversations_db,
+                    rollback_conversations_db,
+                )
             if progress:
                 await progress(0.06, "正在替换目标空库核心数据库")
-            await runtime.close()
-            self.runtimes.pop(library_id, None)
-            for suffix in ("-wal", "-shm"):
-                Path(str(target_db) + suffix).unlink(missing_ok=True)
+            await self.unload_runtime(library_id, reason="livingmemory_import")
+            for db_path in (target_db, target_conversations_db):
+                for suffix in ("-wal", "-shm"):
+                    Path(str(db_path) + suffix).unlink(missing_ok=True)
             tmp_db = target_db.with_suffix(".db.importing")
             tmp_db.unlink(missing_ok=True)
-            await asyncio.to_thread(sqlite_backup, source_db, tmp_db)
+            await run_blocking(sqlite_backup, source_db, tmp_db)
             tmp_db.replace(target_db)
+            if conversations_db is not None:
+                tmp_conversations_db = target_conversations_db.with_suffix(
+                    ".db.importing"
+                )
+                tmp_conversations_db.unlink(missing_ok=True)
+                await run_blocking(
+                    sqlite_backup,
+                    conversations_db,
+                    tmp_conversations_db,
+                )
+                tmp_conversations_db.replace(target_conversations_db)
             if progress:
                 await progress(0.08, "正在初始化兼容表与 FTS")
             runtime = await self.get_runtime(library_id)
@@ -844,7 +1464,9 @@ class LibraryManager:
                 "run_id": run_id,
                 "library_id": library_id,
                 "source": source_report,
+                "conversations_source": conversations_report,
                 "stats": stats,
+                "graph_recovery": rebuild.get("graph_recovery"),
                 "rebuild": rebuild,
                 "completed_at": time.time(),
             }
@@ -864,7 +1486,9 @@ class LibraryManager:
                 "run_id": run_id,
                 "library_id": library_id,
                 "source": source_report,
+                "conversations_source": conversations_report,
                 "stats": stats,
+                "graph_recovery": rebuild.get("graph_recovery"),
                 "rebuild": rebuild,
                 "report_path": str(report_path),
             }
@@ -874,17 +1498,25 @@ class LibraryManager:
                 library_id,
                 run_id,
             )
-            failed_runtime = self.runtimes.pop(library_id, None)
-            if failed_runtime is not None:
-                await failed_runtime.close()
+            await self.unload_runtime(library_id, reason="livingmemory_import_rollback")
             if rollback_db.exists():
                 for suffix in ("-wal", "-shm"):
                     Path(str(target_db) + suffix).unlink(missing_ok=True)
-                await asyncio.to_thread(sqlite_backup, rollback_db, target_db)
+                await run_blocking(sqlite_backup, rollback_db, target_db)
+            if rollback_conversations_db.exists():
+                for suffix in ("-wal", "-shm"):
+                    Path(str(target_conversations_db) + suffix).unlink(missing_ok=True)
+                await run_blocking(
+                    sqlite_backup,
+                    rollback_conversations_db,
+                    target_conversations_db,
+                )
             await self.get_runtime(library_id)
             raise
         finally:
             source_db.unlink(missing_ok=True)
+            if conversations_db is not None:
+                conversations_db.unlink(missing_ok=True)
 
     async def delete_library(self, library_id: str) -> dict[str, Any]:
         record = await self.control.get_library(library_id)
@@ -892,9 +1524,10 @@ class LibraryManager:
             raise KeyError(library_id)
         if record.is_default:
             raise ValueError("默认记忆库不能删除")
+        if await self.control.active_adapter_connections(library_id):
+            raise ValueError("记忆库已被适配器连接，不能删除")
         if await self.control.has_running_jobs(library_id):
             raise ValueError("记忆库存在运行中的任务，不能删除")
-        runtime = await self.get_runtime(library_id)
         source = self.data_dir / "libraries" / library_id
         trash_dir = (
             self.data_dir
@@ -909,8 +1542,7 @@ class LibraryManager:
             / "libraries"
             / f".{library_id}.deleting-{int(time.time())}-{os.urandom(3).hex()}"
         )
-        await runtime.close()
-        self.runtimes.pop(library_id, None)
+        await self.unload_runtime(library_id, reason="library_delete")
         if not source.exists():
             raise FileNotFoundError(f"记忆库目录不存在：{source}")
 
@@ -919,14 +1551,14 @@ class LibraryManager:
         try:
             if (staging / "livingmemory.db").exists():
                 trash_dir.mkdir(parents=True, exist_ok=True)
-                await asyncio.to_thread(
+                await run_blocking(
                     sqlite_backup,
                     staging / "livingmemory.db",
                     trash_memory_db,
                 )
             if (staging / "conversations.db").exists():
                 trash_dir.mkdir(parents=True, exist_ok=True)
-                await asyncio.to_thread(
+                await run_blocking(
                     sqlite_backup,
                     staging / "conversations.db",
                     trash_conversations_db,
@@ -980,6 +1612,39 @@ class LibraryManager:
         )
         logger.warning(
             "记忆库索引重建并绑定完成：library_id=%s provider=%s revision=%s generation=%s",
+            library_id,
+            provider.provider_id,
+            provider.revision,
+            (result.get("manifest") or {}).get("generation"),
+        )
+        return result
+
+    async def rebuild_graph(self, library_id: str, progress=None) -> dict[str, Any]:
+        runtime = await self.get_runtime(library_id)
+        record = await self.control.get_library(library_id)
+        if not record:
+            raise KeyError(library_id)
+        provider = await self.control.get_provider(record.provider_id)
+        if provider and provider_kind(provider.config.type) != "embedding":
+            raise ValueError("图记忆重建必须使用 Embedding Provider")
+        if not provider:
+            raise ValueError("Provider 不存在")
+        if not provider.config.enabled:
+            raise ValueError("Provider 未启用")
+        logger.warning(
+            "开始重建记忆库图数据与索引：library_id=%s provider=%s revision=%s",
+            library_id,
+            provider.provider_id,
+            provider.revision,
+        )
+        result = await runtime.rebuild_graph(progress)
+        await self.control.bind_library(
+            library_id,
+            provider,
+            result["manifest"],
+        )
+        logger.warning(
+            "记忆库图数据与索引重建完成：library_id=%s provider=%s revision=%s generation=%s",
             library_id,
             provider.provider_id,
             provider.revision,

@@ -12,7 +12,8 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .config import ProviderConfig
+from .config import IndexRebuildSettings, ProviderConfig
+from .identifiers import validate_identifier
 from .logger import logger, safe_summary
 
 
@@ -157,8 +158,18 @@ def provider_kind(provider_type: str) -> str:
 
 
 def provider_config_hash(config: ProviderConfig) -> str:
+    payload = asdict(config)
+    # Index rebuild throttling is an operational setting, not an embedding
+    # semantics setting. Keep it out of the revision hash used for index drift.
+    payload.pop("index_rebuild_settings", None)
+    payload.pop("batch_size", None)
+    payload.pop("concurrency", None)
+    payload.pop("max_retries", None)
+    payload.pop("display_name", None)
+    payload.pop("max_context_tokens", None)
+    payload.pop("max_context_tokens_source", None)
     payload = json.dumps(
-        asdict(config), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -172,8 +183,7 @@ def masked_config(config: ProviderConfig) -> dict[str, Any]:
 
 
 def validate_provider_config(config: ProviderConfig) -> None:
-    if not config.id or not config.id.replace("_", "").replace("-", "").isalnum():
-        raise ValueError("Provider ID 只能包含字母、数字、下划线和连字符")
+    validate_identifier(config.id, field="Provider ID")
     if config.type not in PROVIDER_TEMPLATES:
         raise ValueError(f"不支持的 Provider 类型: {config.type}")
     if not config.api_base:
@@ -190,6 +200,21 @@ def validate_provider_config(config: ProviderConfig) -> None:
         raise ValueError("批量大小和并发数必须大于 0")
     if config.max_retries <= 0:
         raise ValueError("最大重试次数必须大于 0")
+    rebuild = config.index_rebuild_settings
+    if (
+        rebuild.batch_size <= 0
+        or rebuild.embedding_batch_size <= 0
+        or rebuild.tasks_limit <= 0
+        or rebuild.max_retries <= 0
+    ):
+        raise ValueError("index rebuild batch, concurrency, and retries must be positive")
+    if (
+        rebuild.retry_base_delay < 0
+        or rebuild.batch_delay < 0
+        or rebuild.request_delay < 0
+        or rebuild.max_failure_ratio < 0
+    ):
+        raise ValueError("index rebuild delays and failure ratio must not be negative")
 
 
 def config_from_dict(
@@ -200,12 +225,38 @@ def config_from_dict(
 ) -> ProviderConfig:
     source = asdict(base) if base else {}
     allowed = set(ProviderConfig.__dataclass_fields__)
+    had_nested_rebuild_settings = isinstance(
+        source.get("index_rebuild_settings"), dict
+    )
     for key, value in payload.items():
         if key in allowed:
             source[key] = value
     if keep_secret and base and payload.get("api_key", None) in {None, "", "********"}:
         source["api_key"] = base.api_key
     source.pop("has_api_key", None)
+    raw_rebuild_settings = source.get("index_rebuild_settings")
+    if isinstance(raw_rebuild_settings, IndexRebuildSettings):
+        pass
+    elif isinstance(raw_rebuild_settings, dict):
+        defaults = asdict(IndexRebuildSettings())
+        defaults.update(
+            {
+                key: value
+                for key, value in raw_rebuild_settings.items()
+                if key in defaults
+            }
+        )
+        source["index_rebuild_settings"] = IndexRebuildSettings(**defaults)
+    else:
+        defaults = asdict(IndexRebuildSettings())
+        if not had_nested_rebuild_settings:
+            if "batch_size" in source:
+                defaults["batch_size"] = source["batch_size"]
+            if "concurrency" in source:
+                defaults["tasks_limit"] = source["concurrency"]
+            if "max_retries" in source:
+                defaults["max_retries"] = source["max_retries"]
+        source["index_rebuild_settings"] = IndexRebuildSettings(**defaults)
     config = ProviderConfig(**source)
     validate_provider_config(config)
     return config
