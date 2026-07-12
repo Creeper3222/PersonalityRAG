@@ -1,5 +1,5 @@
-# Generated and verified with CPython 3.12.1 x64 on 2026-07-10.
-# Regenerate only after a clean Python 3.12 runtime install and full validation.
+# Cross-version Windows x64 runtime lock for CPython 3.10+.
+# CPython 3.12.1 x64 is the primary development and regression-test baseline.
 aiosqlite==0.22.1
 annotated-doc==0.0.4
 annotated-types==0.7.0
@@ -15,7 +15,10 @@ httptools==0.8.0
 httpx==0.28.1
 idna==3.18
 jieba==0.42.1
-numpy==2.5.1
+exceptiongroup==1.3.1 ; python_version < "3.11"
+numpy==2.2.6 ; python_version == "3.10"
+numpy==2.4.6 ; python_version == "3.11"
+numpy==2.5.1 ; python_version >= "3.12"
 packaging==26.2
 pycryptodomex==3.23.0
 pydantic==2.13.4

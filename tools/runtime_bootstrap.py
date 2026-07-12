@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Sequence
 
 
-REQUIRED_PYTHON = (3, 12)
+MINIMUM_PYTHON = (3, 10)
 MARKER_FORMAT = 1
 
 
@@ -24,7 +24,7 @@ def python_supported(
     runtime = implementation or sys.implementation.name
     return (
         runtime == "cpython"
-        and version[:2] == REQUIRED_PYTHON
+        and version[:2] >= MINIMUM_PYTHON
         and bits == 64
     )
 
@@ -111,7 +111,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if not python_supported():
         print(
-            "PersonalityRAG requires CPython 3.12 x64; "
+            "PersonalityRAG requires CPython 3.10+ x64; "
             f"current runtime is {sys.version.split()[0]} "
             f"({struct.calcsize('P') * 8}-bit).",
             file=sys.stderr,

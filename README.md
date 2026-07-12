@@ -24,7 +24,7 @@ AstrBot 接入请使用配套插件：[astrbot_plugin_personality_rag_adapter](h
 
 ## 启动
 
-运行环境固定为 **CPython 3.12 x64**。启动器会校验已有 `.venv`；如果发现其它 Python 版本，会明确拒绝启动，且不会删除或覆盖现有环境。
+运行环境支持 **CPython 3.10+ x64**。CPython 3.12 是项目开发与主要回归测试版本，不是启动硬门槛。启动器会校验已有 `.venv`；如果发现低于 3.10、32 位或非 CPython 环境，会明确拒绝启动，且不会删除或覆盖现有环境。
 
 双击：
 
@@ -34,8 +34,8 @@ launcher.bat
 
 启动器会自动完成：
 
-1. 在不存在 `.venv` 时创建 Python 3.12 x64 虚拟环境。
-2. 按 `requirements-runtime.lock` 安装经过 Python 3.12 验证的运行依赖。
+1. 在不存在 `.venv` 时优先使用 Python 3.12 创建虚拟环境，并在不可用时回退到其它兼容的 CPython 3.10+ x64。
+2. 按 `requirements-runtime.lock` 安装与当前 Python 版本匹配的运行依赖。
 3. 根据 Python 版本、`requirements.txt` 和锁文件生成依赖指纹；三者未变化时后续启动会跳过 `pip install`。
 4. 生成 `config/config.json`、随机 API Key、会话密钥和库级 PSK 派生密钥。
 5. 启动 WebUI，默认地址为 `http://127.0.0.1:8765/`。

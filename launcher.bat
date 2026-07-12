@@ -1,5 +1,5 @@
 @echo off
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 chcp 65001 >nul
 
@@ -12,28 +12,32 @@ set "DEPENDENCY_MARKER=.venv\.personalityrag-dependencies.json"
 if exist "%VENV_PYTHON%" (
   "%VENV_PYTHON%" tools\runtime_bootstrap.py validate
   if errorlevel 1 (
-    echo [PersonalityRAG] Existing .venv is not CPython 3.12 x64.
-    echo [PersonalityRAG] The launcher will not delete or overwrite it. Preserve or rename it, then create a Python 3.12 environment.
+    echo [PersonalityRAG] Existing .venv is not CPython 3.10+ x64.
+    echo [PersonalityRAG] The launcher will not delete or overwrite it. Preserve or rename it, then create a compatible environment.
     pause
     exit /b 1
   )
 ) else (
-  echo [PersonalityRAG] Creating Python 3.12 virtual environment...
-  py -3.12 -c "import struct,sys;raise SystemExit(0 if sys.version_info[:2]==(3,12) and struct.calcsize('P')==8 else 1)"
-  if errorlevel 1 (
-    echo [PersonalityRAG] CPython 3.12 x64 was not found. Please install it first.
+  set "PYTHON_SPEC="
+  call :select_python -3.12
+  call :select_python -3
+  call :select_python -3.11
+  call :select_python -3.10
+  if not defined PYTHON_SPEC (
+    echo [PersonalityRAG] CPython 3.10+ x64 was not found. Please install a compatible version first.
     pause
     exit /b 1
   )
-  py -3.12 -m venv .venv
+  echo [PersonalityRAG] Creating a virtual environment with !PYTHON_SPEC!...
+  py !PYTHON_SPEC! -m venv .venv
   if errorlevel 1 (
-    echo [PersonalityRAG] Python 3.12 virtual environment creation failed.
+    echo [PersonalityRAG] Compatible Python virtual environment creation failed.
     pause
     exit /b 1
   )
   "%VENV_PYTHON%" tools\runtime_bootstrap.py validate
   if errorlevel 1 (
-    echo [PersonalityRAG] The new virtual environment failed Python 3.12 x64 validation.
+    echo [PersonalityRAG] The new virtual environment failed CPython 3.10+ x64 validation.
     pause
     exit /b 1
   )
@@ -74,3 +78,9 @@ echo [PersonalityRAG] Starting WebUI...
 set EXIT_CODE=%ERRORLEVEL%
 if not "%EXIT_CODE%"=="0" pause
 exit /b %EXIT_CODE%
+
+:select_python
+if defined PYTHON_SPEC exit /b 0
+py %~1 -c "import struct,sys;raise SystemExit(0 if sys.implementation.name=='cpython' and sys.version_info[:2]>=(3,10) and struct.calcsize('P')==8 else 1)" >nul 2>&1
+if not errorlevel 1 set "PYTHON_SPEC=%~1"
+exit /b 0

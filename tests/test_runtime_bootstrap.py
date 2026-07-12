@@ -11,11 +11,13 @@ from tools.runtime_bootstrap import (
 )
 
 
-def test_python_runtime_requires_cpython_312_x64_shape() -> None:
+def test_python_runtime_accepts_cpython_310_or_newer_x64() -> None:
+    assert python_supported((3, 10, 0), 64)
+    assert python_supported((3, 11, 9), 64)
     assert python_supported((3, 12, 1), 64)
-    assert not python_supported((3, 11, 9), 64)
+    assert python_supported((3, 13, 0), 64)
+    assert not python_supported((3, 9, 18), 64)
     assert not python_supported((3, 12, 1), 32)
-    assert not python_supported((3, 13, 0), 64)
     assert not python_supported((3, 12, 1), 64, "pypy")
 
 
@@ -70,8 +72,12 @@ def test_runtime_lock_is_fully_pinned() -> None:
     ]
 
     assert len(lines) >= 20
-    assert all("==" in line for line in lines)
-    assert not any(" >=" in line or "<" in line or "~=" in line for line in lines)
+    requirements = [line.split(";", 1)[0].strip() for line in lines]
+    assert all("==" in requirement for requirement in requirements)
+    assert not any(
+        " >=" in requirement or "<" in requirement or "~=" in requirement
+        for requirement in requirements
+    )
 
 
 def test_launcher_refuses_mismatched_existing_environment() -> None:
@@ -85,3 +91,16 @@ def test_launcher_refuses_mismatched_existing_environment() -> None:
     assert "tools\\runtime_bootstrap.py check" in source
     assert "tools\\runtime_bootstrap.py mark" in source
     assert "pip install" in source
+    assert "sys.version_info[:2]>=(3,10)" in source
+    assert "setlocal EnableExtensions EnableDelayedExpansion" in source
+    assert "py !PYTHON_SPEC! -m venv .venv" in source
+    lines = [line.strip() for line in source.splitlines()]
+    candidates = [
+        "call :select_python -3.12",
+        "call :select_python -3",
+        "call :select_python -3.11",
+        "call :select_python -3.10",
+    ]
+    assert [lines.index(candidate) for candidate in candidates] == sorted(
+        lines.index(candidate) for candidate in candidates
+    )
