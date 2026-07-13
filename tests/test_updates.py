@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import zipfile
 from pathlib import Path
@@ -236,3 +237,9 @@ def test_startup_recovery_marks_pre_replace_crash_safe_without_backup(tmp_path: 
     payload = json.loads(transaction_file.read_text(encoding="utf-8"))
     assert payload["status"] == "failed"
     assert payload["stage"] == "recovery_not_required"
+
+
+def test_update_helper_pid_detection() -> None:
+    assert update_helper._pid_is_running(os.getpid()) is True
+    assert update_helper._pid_is_running(-1) is False
+    assert update_helper._pid_is_running(2_147_483_647) is False
