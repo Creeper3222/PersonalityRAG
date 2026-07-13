@@ -176,10 +176,15 @@ def _terminate_tree(process: subprocess.Popen[Any]) -> None:
 
 def _health_matches(urls: list[str], expected_version: str, timeout: float = 120.0) -> bool:
     deadline = time.time() + timeout
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     while time.time() < deadline:
         for url in urls:
             try:
-                with urllib.request.urlopen(url.rstrip("/") + "/api/v1/health", timeout=2) as response:
+                request = urllib.request.Request(
+                    url.rstrip("/") + "/api/v1/health",
+                    headers={"Cache-Control": "no-cache"},
+                )
+                with opener.open(request, timeout=1) as response:
                     payload = json.loads(response.read().decode("utf-8"))
                 if payload.get("status") == "ok" and payload.get("version") == expected_version:
                     return True

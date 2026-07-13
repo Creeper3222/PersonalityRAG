@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import stat
+import threading
 import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -243,3 +245,31 @@ def test_update_helper_pid_detection() -> None:
     assert update_helper._pid_is_running(os.getpid()) is True
     assert update_helper._pid_is_running(-1) is False
     assert update_helper._pid_is_running(2_147_483_647) is False
+
+
+def test_update_helper_loopback_health_ignores_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            body = json.dumps({"status": "ok", "version": "0.1.0"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("NO_PROXY", "")
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}/"
+        assert update_helper._health_matches([url], "0.1.0", timeout=3) is True
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
