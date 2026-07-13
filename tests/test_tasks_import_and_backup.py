@@ -71,7 +71,7 @@ async def _clear_graph_tables(storage: Storage) -> None:
 
 
 @pytest.mark.asyncio
-async def test_job_manager_runs_tasks_fifo_and_clears_finished_history_on_restart(
+async def test_job_manager_runs_tasks_fifo_and_retains_finished_history_on_restart(
     tmp_path: Path,
 ):
     storage = Storage(tmp_path)
@@ -114,7 +114,7 @@ async def test_job_manager_runs_tasks_fifo_and_clears_finished_history_on_restar
     assert [item["id"] for item in finished] == [second_id, first_id]
     await jobs.clear_for_startup()
     retained = await jobs.list(scope="all")
-    assert retained == []
+    assert [item["id"] for item in retained] == [second_id, first_id]
     await jobs.close()
 
 

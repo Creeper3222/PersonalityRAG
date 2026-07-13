@@ -3,7 +3,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 chcp 65001 >nul
 
-echo [PersonalityRAG] Windows v0.1.0 launcher
+echo [PersonalityRAG] Windows launcher
 
 set "VENV_PYTHON=.venv\Scripts\python.exe"
 set "RUNTIME_LOCK=requirements-runtime.lock"
@@ -49,6 +49,15 @@ if not exist "%RUNTIME_LOCK%" (
   exit /b 1
 )
 
+set "PERSONALITYRAG_RECOVERY_STATE_ROOT=%PERSONALITYRAG_STATE_ROOT%"
+if not defined PERSONALITYRAG_RECOVERY_STATE_ROOT set "PERSONALITYRAG_RECOVERY_STATE_ROOT=%CD%"
+"%VENV_PYTHON%" tools\update_helper.py recover "%PERSONALITYRAG_RECOVERY_STATE_ROOT%" --active-transaction "%PERSONALITYRAG_UPDATE_TRANSACTION%"
+if errorlevel 1 (
+  echo [PersonalityRAG] Update transaction recovery failed. Startup was stopped to protect the installation.
+  pause
+  exit /b 1
+)
+
 "%VENV_PYTHON%" tools\runtime_bootstrap.py check --marker "%DEPENDENCY_MARKER%" --lock "%RUNTIME_LOCK%" --requirements requirements.txt
 if errorlevel 2 (
   echo [PersonalityRAG] Dependency fingerprint validation failed.
@@ -73,7 +82,9 @@ if errorlevel 1 (
   echo [PersonalityRAG] Verified dependencies are current.
 )
 
-echo [PersonalityRAG] Starting WebUI...
+for /f "usebackq delims=" %%V in (`"%VENV_PYTHON%" -c "from personalityrag.version import display_version; print(display_version())" 2^>nul`) do set "PERSONALITYRAG_VERSION=%%V"
+if not defined PERSONALITYRAG_VERSION set "PERSONALITYRAG_VERSION=unknown"
+echo [PersonalityRAG] Starting WebUI %PERSONALITYRAG_VERSION%...
 "%VENV_PYTHON%" run.py
 set EXIT_CODE=%ERRORLEVEL%
 if not "%EXIT_CODE%"=="0" pause

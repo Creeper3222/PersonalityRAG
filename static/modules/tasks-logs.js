@@ -1,7 +1,8 @@
-export function createTaskLogController({ $, state, t, api, toast, escapeHtml, formatBytes, selectedLibrary, loadLibraries, loadGraph, loadMemories, loadSystem, confirmDialog, clearLibraryIndexConflict, refreshLibraryContext }) {
+export function createTaskLogController({ $, state, t, api, toast, escapeHtml, formatBytes, selectedLibrary, loadLibraries, loadGraph, loadMemories, loadSystem, confirmDialog, markLibraryIndexConflict, clearLibraryIndexConflict, refreshLibraryContext }) {
 function taskKindLabel(kind) {
   return {
     index_rebuild: t("taskKindIndexRebuild"),
+    graph_rebuild: t("taskKindGraphRebuild"),
     library_copy: t("taskKindLibraryCopy"),
     livingmemory_import: t("taskKindImport"),
     livingmemory_migration: t("taskKindMigration"),
@@ -15,16 +16,22 @@ function taskStatusLabel(status) {
   return {
     queued: t("taskQueued"),
     running: t("taskRunning"),
+    pausing: t("taskPausing"),
+    paused: t("taskPaused"),
+    interrupted: t("taskInterrupted"),
+    stopping: t("taskStopping"),
     completed: t("taskCompleted"),
     failed: t("taskFailed"),
+    stopped: t("taskStopped"),
     cancelled: t("taskCancelled"),
   }[status] || status || "";
 }
 
 function taskStatusMark(status) {
   if (status === "completed") return "✅";
-  if (status === "failed" || status === "cancelled") return "❌";
+  if (status === "failed" || status === "cancelled" || status === "stopped") return "⏹";
   if (status === "running") return "▶";
+  if (status === "paused" || status === "interrupted") return "⏸";
   return "⏳";
 }
 
@@ -33,7 +40,33 @@ function taskTimestamp() {
 }
 
 function isActiveTask(job) {
-  return ["queued", "running"].includes(String(job?.status || ""));
+  return ["queued", "running", "pausing", "paused", "interrupted", "stopping"].includes(String(job?.status || ""));
+}
+
+function taskReasonLabel(reason) {
+  return {
+    manual: t("taskReasonManual"),
+    shutdown: t("taskReasonShutdown"),
+    process_interrupted: t("taskReasonProcessInterrupted"),
+    provider_unavailable: t("taskReasonProviderUnavailable"),
+    rollback_failed: t("taskReasonRollbackFailed"),
+    checkpoint_conflict: t("taskReasonCheckpointConflict"),
+    checkpoint_corrupt: t("taskReasonCheckpointCorrupt"),
+    source_changed: t("taskReasonSourceChanged"),
+  }[String(reason || "")] || "";
+}
+
+function taskActionButtons(job) {
+  const capabilities = job?.capabilities || {};
+  const buttons = [];
+  if (capabilities.pause) buttons.push(["pause", t("taskPause"), "ghost"]);
+  if (capabilities.resume) buttons.push(["resume", t("taskResume"), "primary"]);
+  if (capabilities.stop) buttons.push(["stop", t("taskStop"), "danger"]);
+  if (capabilities.cancel) buttons.push(["cancel", t("taskCancel"), "ghost"]);
+  if (!buttons.length) return "";
+  return `<div class="task-actions">${buttons.map(([action, label, style]) =>
+    `<button class="${style}" type="button" data-job-action="${action}" data-job-id="${escapeHtml(String(job.id || ""))}">${escapeHtml(label)}</button>`,
+  ).join("")}</div>`;
 }
 
 function mergeTaskList(fetched = [], scope = "active") {
@@ -168,6 +201,15 @@ function applyTaskHistoryCollapseState() {
   toggle.setAttribute("aria-expanded", state.tasks.finishedExpanded ? "true" : "false");
 }
 
+function renderFinishedTaskClearButton() {
+  const button = $("tasks-finished-clear");
+  if (!button) return;
+  const finishedScope = state.tasks.scope === "finished";
+  const hasItems = state.tasks.finished.length > 0;
+  button.classList.toggle("hidden", !finishedScope);
+  button.disabled = !finishedScope || !hasItems;
+}
+
 function hideTrackedJobProgress() {
   const box = $("job-progress");
   if (!box) return;
@@ -209,6 +251,7 @@ function renderTasks() {
   document.querySelectorAll("[data-task-scope]").forEach((button) => {
     button.classList.toggle("active", button.dataset.taskScope === state.tasks.scope);
   });
+  renderFinishedTaskClearButton();
   if (!items.length) {
     list.innerHTML = `<div class="task-empty">${escapeHtml(t(state.tasks.scope === "finished" ? "noFinishedTasks" : "noActiveTasks"))}</div>`;
     applyTaskHistoryCollapseState();
@@ -220,6 +263,14 @@ function renderTasks() {
       const status = String(job.status || "");
       const message = job.error || job.message || "";
       const library = job.library_id || "—";
+      const reason = taskReasonLabel(job.status_reason);
+      const checkpoint = job.checkpoint || {};
+      const checkpointText = checkpoint.phase
+        ? t("taskCheckpoint", {
+            phase: checkpoint.phase,
+            completed: checkpoint.completed_documents ?? checkpoint.completed_graph_entries ?? 0,
+          })
+        : "";
       return `<article class="task-item task-status-${escapeHtml(status)}">
         <div class="task-head">
           <div>
@@ -228,16 +279,87 @@ function renderTasks() {
               <span>job ${escapeHtml(String(job.id || "").slice(0, 8))}</span>
               <span>${escapeHtml(library)}</span>
               <span>${escapeHtml(taskStatusLabel(status))}</span>
+              ${reason ? `<span>${escapeHtml(reason)}</span>` : ""}
+              ${checkpointText ? `<span>${escapeHtml(checkpointText)}</span>` : ""}
             </div>
           </div>
           <b>${Math.round(progress * 100)}%</b>
         </div>
         <div class="task-progress"><div style="width:${progress * 100}%"></div><span>${escapeHtml(message)}</span></div>
+        ${taskActionButtons(job)}
       </article>`;
     })
     .join("");
   applyTaskHistoryCollapseState();
 }
+
+async function controlTask(jobId, action, button) {
+  if (!jobId || !action) return;
+  if (action === "stop") {
+    if (!(await confirmDialog({
+      title: t("confirmStopTaskTitle"),
+      message: t("confirmStopTask"),
+      confirmText: t("taskStop"),
+      danger: true,
+    }))) return;
+  }
+  if (action === "cancel") {
+    if (!(await confirmDialog({
+      title: t("confirmCancelTaskTitle"),
+      message: t("confirmCancelTask"),
+      confirmText: t("taskCancel"),
+    }))) return;
+  }
+  if (button) button.disabled = true;
+  try {
+    const job = await api(`/jobs/${encodeURIComponent(jobId)}/${action}`, { method: "POST" });
+    upsertJobSnapshot(job);
+    toast(t("taskControlAccepted"));
+    watchJob(jobId);
+    await loadTasks(state.tasks.scope);
+  } catch (error) {
+    toast(error.message || String(error), true);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+$("task-list")?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-job-action]");
+  if (!button) return;
+  controlTask(button.dataset.jobId, button.dataset.jobAction, button);
+});
+
+async function clearFinishedTasks() {
+  const button = $("tasks-finished-clear");
+  if (!(await confirmDialog({
+    title: t("confirmClearFinishedTasksTitle"),
+    message: t("confirmClearFinishedTasks"),
+    confirmText: t("clearFinishedTasks"),
+    danger: true,
+  }))) return;
+  if (button) button.disabled = true;
+  try {
+    const payload = await api("/jobs/finished/clear", { method: "POST" });
+    state.tasks.finished = [];
+    state.tasks.finishedExpanded = false;
+    renderTasks();
+    toast(t("finishedTasksCleared", { count: payload.cleared || 0 }));
+    if (state.page === "logs") {
+      await loadTasks("finished");
+    }
+  } catch (error) {
+    toast(error.message || String(error), true);
+  } finally {
+    renderFinishedTaskClearButton();
+  }
+}
+
+$("tasks-finished-clear")?.addEventListener("click", () => {
+  clearFinishedTasks().catch((error) => {
+    toast(error.message || String(error), true);
+  });
+});
 
 async function loadTasks(scope = state.tasks.scope) {
   const data = await api(`/jobs?scope=${encodeURIComponent(scope)}`, {
@@ -468,7 +590,9 @@ async function finishTrackedJob(job) {
       ? t("jobCompleted")
       : job.status === "failed"
         ? t("jobFailed")
-        : t("jobCancelled");
+        : job.status === "stopped"
+          ? t("jobStopped")
+          : t("jobCancelled");
   toast(terminalMessage, job.status !== "completed");
   await loadLibraries(state.page === "libraries");
   await loadSystem();
@@ -492,7 +616,7 @@ function watchJob(id) {
     if (!job || watcher.done) return;
     upsertJobSnapshot(job);
     renderTrackedJobProgress(job);
-    if (!["completed", "failed", "cancelled"].includes(job.status)) return;
+    if (!["completed", "failed", "stopped", "cancelled"].includes(job.status)) return;
     watcher.done = true;
     watcher.source?.close();
     state.tasks.watchers.delete(id);

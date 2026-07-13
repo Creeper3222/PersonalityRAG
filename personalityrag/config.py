@@ -73,6 +73,7 @@ class ProviderConfig:
     instruct: str = ""
     model_endpoint: str = ""
     truncate: str = ""
+    input_type: str = ""
     launch_model_if_not_running: bool = False
     index_rebuild_settings: IndexRebuildSettings = field(
         default_factory=IndexRebuildSettings

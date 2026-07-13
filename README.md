@@ -11,7 +11,7 @@ AstrBot 接入请使用配套插件：[astrbot_plugin_personality_rag_adapter](h
 - 独立 Windows Shell 版本，双击 `launcher.bat` 启动。
 - FastAPI + Uvicorn 后端和本地 WebUI。
 - 多记忆库管理，每个记忆库独立保存 LivingMemory 兼容数据库、会话库、FTS、FAISS 索引、备份、导入归档和报告。
-- 全局 Embedding Provider 池，支持 OpenAI-compatible、Ollama、vLLM。
+- 全局 Embedding Provider 池，支持 OpenAI-compatible、Gemini、NVIDIA NIM、Ollama、vLLM。
 - 全局 Rerank Provider 池，支持 vLLM/OpenAI-compatible Rerank、Xinference Rerank、阿里云百炼 qwen3-rerank/DashScope 分支、NVIDIA NIM Rerank。
 - Provider revision 与 FAISS generation 绑定；切换 embedding 模型会提示并重建索引，重建验证成功后再原子切换。
 - 最大上下文长度自动检测和手动设置；切换到更低上下文模型时会提示潜在截断风险，但不会修改或截断源文本。
@@ -49,6 +49,8 @@ WebUI 的“模型提供商”页面可以新增、编辑、复制、测试、�
 | 类型 | 默认接口 | 说明 |
 |---|---|---|
 | OpenAI Embedding | `/v1/models`, `/v1/embeddings` | 支持 OpenAI 官方和兼容接口；维度大于 0 时发送 `dimensions`。 |
+| Gemini Embedding | `/v1beta/models`, `batchEmbedContents` | 对齐 Gemini Embedding 批量接口；维度大于 0 时发送 `outputDimensionality`。 |
+| NVIDIA Embedding | `/v1/models`, `/v1/embeddings` | 对齐 NVIDIA NIM 接口；发送 `input_type` 和 float 编码。 |
 | Ollama Embedding | `/api/tags`, `/api/embed` | 支持单条和批量嵌入。 |
 | vLLM Embedding | `/v1/models`, `/v1/embeddings` | 自动匹配 `served-model-name`；不会向 vLLM 发送 `dimensions`。 |
 | vLLM Rerank | 自定义 `api_suffix`，默认 `/v1/rerank` | 发送 `query`、`documents`、`model` 和 `top_n`。 |
@@ -170,6 +172,14 @@ POST       /api/v1/libraries/{library_id}/graph/query
 POST       /api/v1/libraries/{library_id}/indexes/rebuild
 GET        /api/v1/jobs
 GET        /api/v1/jobs/{job_id}
+POST       /api/v1/jobs/{job_id}/pause
+POST       /api/v1/jobs/{job_id}/resume
+GET        /api/v1/updates/status
+GET        /api/v1/updates/releases
+POST       /api/v1/updates/switch
+GET        /api/v1/updates/transactions/{transaction_id}
+POST       /api/v1/jobs/{job_id}/stop
+POST       /api/v1/jobs/{job_id}/cancel
 
 GET        /api/v1/files
 POST       /api/v1/files/read
@@ -181,6 +191,8 @@ POST       /api/v1/files/move
 POST       /api/v1/files/delete
 GET/POST   /api/v1/files/download
 ```
+
+索引重建、图重建和 LivingMemory 导入/迁移任务支持安全断点暂停与继续。运行中的任务可停止并回滚到执行前状态，尚未开始的排队任务可取消；暂停或可恢复中断的任务会阻塞后续队列，直到继续、完成或停止。
 
 旧的 `/api/v1/memories`、`/api/v1/recall`、`/api/v1/graph/...` 会代理到默认记忆库，用于早期脚本兼容。
 
@@ -195,6 +207,16 @@ Authorization: Bearer psk-...
 ```
 
 PSK 只在包含 `{library_id}` 的记忆库路径上生效，新安装的默认库 ID 为 `Default`，例如 `/api/v1/libraries/Default/recall`。适配器必须手动配置正确的记忆库 ID 和对应 PSK，否则会返回 `401 Unauthorized`。全局 API Key 仍保留给本机管理脚本和旧版兼容。
+
+## 版本管理
+
+Windows WebUI 的“基础设置”页提供版本管理，可读取官方 [PersonalityRAG Releases](https://github.com/Creeper3222/PersonalityRAG/releases) 中带有精确 Windows 资产的版本，并执行更新、兼容旧版本回退或当前版本重新安装。
+
+- 版本切换只替换 Release Manifest 声明的运行代码；`.git`、`.venv`、`config/`、`data/`、数据库、索引、密钥、备份和用户文件始终受保护。
+- 切换前会校验 GitHub 资产摘要、单一 ZIP 根目录、每个文件的 SHA-256、Python 兼容范围和持久化结构兼容范围。
+- 有运行中、排队、暂停或异常中断的任务时不会开始版本切换。
+- 新版本无法启动或健康版本不匹配时，独立更新助手会自动恢复原代码并重新启动原版本。
+- GitHub 暂时不可用不会影响登录和记忆库功能；界面保留最近一次成功的版本列表。
 
 ## 发布版内容
 

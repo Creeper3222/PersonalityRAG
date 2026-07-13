@@ -150,6 +150,7 @@ def _settings_payload() -> dict[str, Any]:
         "api_key_fingerprint": config.api_key_fingerprint,
         "port_change_requires_restart": True,
         "access_port_change_requires_restart": True,
+        "version": __version__,
         "runtime_residency": {
             "idle_minutes": config.runtime_residency.idle_minutes,
             "max_non_default_runtimes": (

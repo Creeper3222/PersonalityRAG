@@ -1,0 +1,53 @@
+{
+  "version": "v0.1.0",
+  "platform": "windows-live",
+  "source_counts": {
+    "documents": 175,
+    "graph_entries": 10188
+  },
+  "automated_tests": {
+    "pytest_passed": 211,
+    "javascript_syntax": true,
+    "python_compile": true,
+    "diff_check": true
+  },
+  "manual_flow": {
+    "manual_pause_checkpoint": {
+      "documents": 175,
+      "graph_entries": 3000
+    },
+    "restart_preserved_pause": true,
+    "restart_cancelled_queued_job": true,
+    "provider_failure_checkpoint": {
+      "documents": 175,
+      "graph_entries": 4000,
+      "status": "interrupted",
+      "reason": "provider_unavailable"
+    },
+    "resumed_same_job_to_completion": true,
+    "stop_restored_empty_library": true,
+    "queued_cancelled_without_execution": true
+  },
+  "integrity": {
+    "protected_source_content_equal": true,
+    "document_id_order_equal": true,
+    "graph_id_order_equal": true,
+    "float32_bytes_equal_between_independent_vllm_runs": false,
+    "maximum_vector_absolute_delta": 0.0007764371,
+    "maximum_a1_score_delta": 0.001239,
+    "minimum_livingmemory_set_overlap": 0.99375
+  },
+  "aba": {
+    "queries": 12,
+    "b_changed_top5": 12,
+    "b_changed_top10": 12,
+    "b_changed_top20": 12,
+    "a2_exact_top5": 12,
+    "a2_exact_top10": 12,
+    "a2_exact_top20": 11,
+    "a2_top20_set_overlap_for_non_exact_case": 1.0,
+    "a2_maximum_score_delta": 0.002654
+  },
+  "query_text_in_report": false,
+  "passed": true
+}

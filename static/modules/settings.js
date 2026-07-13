@@ -9,6 +9,8 @@ export function createSettingsController({
   resetTaskState = () => {},
   isValidPage,
   restartReturnPage,
+  escapeHtml,
+  confirmDialog,
 }) {
 function normalizePragFilename(name) {
   const value = String(name || "personalityrag.prag");
@@ -247,8 +249,8 @@ function restartRedirectUrl(url) {
 function updateRestartScreen(phaseKey, detailText = "") {
   const phaseText = t(phaseKey);
   $("restart-phase").textContent = phaseText;
-  $("restart-title").textContent = t("restartTitle");
-  $("restart-message").textContent = t("restartMessage");
+  $("restart-title").textContent = state.restart.updateTransaction ? t("updateRestartTitle") : t("restartTitle");
+  $("restart-message").textContent = state.restart.updateTransaction ? t("updateRestartMessage") : t("restartMessage");
   $("restart-status-detail").textContent = detailText || phaseText;
 }
 
@@ -324,6 +326,7 @@ function showRestartScreen(payload) {
   resetTaskState({ render: false });
   state.restarting = true;
   state.restart.startedAt = Date.now();
+  state.restart.updateTransaction = payload.transaction_id || "";
   state.restart.targetUrl =
     payload.configured_webui_url || payload.webui_url || window.location.origin + "/";
   state.restart.probeUrls = normalizeRestartProbeUrls(
@@ -339,7 +342,10 @@ function showRestartScreen(payload) {
   );
   $("restart-open-link").classList.add("hidden");
   $("restart-screen").classList.remove("hidden");
-  updateRestartScreen("restartPhaseStopping", t("restartStatusPreparing"));
+  updateRestartScreen(
+    payload.transaction_id ? "updateRestartPhase" : "restartPhaseStopping",
+    payload.transaction_id ? t("updateRestartPreparing") : t("restartStatusPreparing"),
+  );
   updateRestartElapsed();
   state.restart.timer = setTimeout(pollRestartStatus, 700);
 }
@@ -352,6 +358,7 @@ async function loadSettings() {
     }
     const data = await api("/settings");
     state.settings = data;
+    if ($("sidebar-version")) $("sidebar-version").textContent = data.version ? `v${data.version}` : "v—";
     $("settings-access-url").textContent = formatRuntimePendingValue(
       data.webui_url || data.access_url || "—",
       data.configured_webui_url || data.webui_url || data.access_url || "—",
@@ -378,8 +385,151 @@ async function loadSettings() {
     $("settings-runtime-idle-minutes").value = data.runtime_residency?.idle_minutes || 30;
     $("settings-runtime-max-non-default").value = data.runtime_residency?.max_non_default_runtimes || 4;
     $("settings-note").textContent = t("settingsPortRestartHint");
+    await loadUpdateStatus();
   } catch (error) {
     toast(error.message, true);
+  }
+}
+
+function updateRelation(tag, currentTag) {
+  const parse = (value) => String(value || "").replace(/^v/, "").split(/[.-]/).map((part) => /^\d+$/.test(part) ? Number(part) : part);
+  const left = parse(tag);
+  const right = parse(currentTag);
+  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+    const a = left[index] ?? 0;
+    const b = right[index] ?? 0;
+    if (a === b) continue;
+    if (typeof a === "number" && typeof b === "number") return a > b ? 1 : -1;
+    return String(a).localeCompare(String(b));
+  }
+  return 0;
+}
+
+function updateAction(tag, currentTag) {
+  const relation = updateRelation(tag, currentTag);
+  return relation > 0 ? "update" : relation < 0 ? "rollback" : "reinstall";
+}
+
+function renderUpdateStatus(payload) {
+  state.updates.status = payload;
+  const currentTag = payload.current_tag || (payload.current_version ? `v${payload.current_version}` : "v—");
+  if ($("sidebar-version")) $("sidebar-version").textContent = currentTag;
+  if ($("update-current-version")) $("update-current-version").textContent = currentTag;
+  if ($("update-latest-version")) $("update-latest-version").textContent = payload.latest_tag || currentTag;
+  if ($("update-checked-at")) {
+    $("update-checked-at").textContent = payload.checked_at
+      ? new Date(payload.checked_at * 1000).toLocaleString()
+      : "—";
+  }
+  if ($("update-check-state")) {
+    $("update-check-state").textContent = payload.error
+      ? t("updateCheckUnavailable")
+      : payload.update_available
+        ? t("updateAvailable")
+        : t("upToDate");
+  }
+  $("update-available-badge")?.classList.toggle("hidden", !payload.update_available);
+}
+
+async function loadUpdateStatus({ refresh = false } = {}) {
+  const payload = await api(`/updates/status${refresh ? "?refresh=true" : ""}`);
+  renderUpdateStatus(payload);
+  return payload;
+}
+
+function renderReleaseList() {
+  const currentTag = state.updates.status?.current_tag || "v—";
+  const target = $("updates-release-list");
+  if (!state.updates.releases.length) {
+    target.innerHTML = `<div class="empty">${escapeHtml(t("noCompatibleReleases"))}</div>`;
+    return;
+  }
+  target.innerHTML = state.updates.releases.map((release) => {
+    const action = updateAction(release.tag_name, currentTag);
+    const actionKey = action === "update" ? "updateAction" : action === "rollback" ? "rollbackAction" : "reinstallAction";
+    return `<article class="update-release-card">
+      <div class="update-release-main">
+        <div class="update-release-title"><strong>${escapeHtml(release.tag_name)}</strong>${release.prerelease ? `<span class="pill warning">${escapeHtml(t("prerelease"))}</span>` : ""}</div>
+        <time>${escapeHtml(release.published_at ? new Date(release.published_at).toLocaleString() : "—")}</time>
+        <p>${escapeHtml(release.notes || t("noReleaseNotes"))}</p>
+      </div>
+      <button type="button" class="${action === "rollback" ? "ghost" : "primary"}" data-update-tag="${escapeHtml(release.tag_name)}" data-update-action="${action}">${escapeHtml(t(actionKey))}</button>
+    </article>`;
+  }).join("");
+  target.querySelectorAll("[data-update-tag]").forEach((button) => {
+    button.onclick = () => switchVersion(button.dataset.updateTag, button.dataset.updateAction);
+  });
+}
+
+async function refreshUpdateReleases({ refresh = true } = {}) {
+  const query = refresh ? "?refresh=true" : "";
+  const payload = await api(`/updates/releases${query}`);
+  state.updates.releases = payload.releases || [];
+  await loadUpdateStatus({ refresh: false });
+  renderReleaseList();
+  return payload;
+}
+
+async function openVersionSelector() {
+  const overlay = $("updates-modal");
+  overlay.classList.remove("hidden");
+  $("updates-release-list").innerHTML = `<div class="empty">${escapeHtml(t("updateLoading"))}</div>`;
+  try {
+    await refreshUpdateReleases({ refresh: false });
+  } catch (error) {
+    overlay.classList.add("hidden");
+    throw error;
+  }
+}
+
+async function switchVersion(tag, action) {
+  if (state.updates.switching) return;
+  const actionKey = action === "update" ? "updateAction" : action === "rollback" ? "rollbackAction" : "reinstallAction";
+  const confirmed = await confirmDialog({
+    title: t("switchVersionTitle"),
+    message: t("switchVersionConfirm", { action: t(actionKey), tag }),
+    confirmText: t(actionKey),
+    danger: action === "rollback",
+  });
+  if (!confirmed) return;
+  state.updates.switching = true;
+  $("updates-modal").classList.add("update-switching");
+  $("updates-modal-busy").classList.remove("hidden");
+  $("updates-release-list").querySelectorAll("button").forEach((button) => { button.disabled = true; });
+  try {
+    const payload = await api("/updates/switch", {
+      method: "POST",
+      body: JSON.stringify({ tag_name: tag }),
+    });
+    localStorage.setItem("personalityrag_update_transaction", payload.transaction_id || "");
+    showRestartScreen(payload);
+  } catch (error) {
+    state.updates.switching = false;
+    $("updates-modal").classList.remove("update-switching");
+    $("updates-modal-busy").classList.add("hidden");
+    renderReleaseList();
+    throw error;
+  }
+}
+
+async function checkLastUpdateTransaction() {
+  const transactionId = localStorage.getItem("personalityrag_update_transaction") || "";
+  if (!transactionId) return null;
+  try {
+    const payload = await api(`/updates/transactions/${encodeURIComponent(transactionId)}`);
+    if (payload.status === "completed") {
+      localStorage.removeItem("personalityrag_update_transaction");
+      toast(t("versionSwitchCompleted", { tag: payload.target_tag || payload.target_version }));
+    } else if (payload.status === "rolled_back" || payload.status === "failed") {
+      localStorage.removeItem("personalityrag_update_transaction");
+      toast(t("versionSwitchRolledBack"), true);
+    } else if (payload.status === "recovery_required") {
+      toast(t("versionSwitchRecoveryRequired"), true);
+    }
+    return payload;
+  } catch (error) {
+    if (error?.status === 404) localStorage.removeItem("personalityrag_update_transaction");
+    return null;
   }
 }
 
@@ -404,5 +554,9 @@ function formatRuntimePendingValue(currentValue, nextValue) {
     hasUnsavedSettingsChanges,
     showRestartScreen,
     loadSettings,
+    loadUpdateStatus,
+    openVersionSelector,
+    refreshUpdateReleases,
+    checkLastUpdateTransaction,
   };
 }
