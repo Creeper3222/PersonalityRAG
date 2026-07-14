@@ -19,6 +19,14 @@ from personalityrag.update_manifest import (  # noqa: E402
 )
 from personalityrag.version import RELEASE_ROOT_NAME, release_asset_name  # noqa: E402
 
+RELEASE_COPY_IGNORE = shutil.ignore_patterns(
+    "__pycache__",
+    "*.pyc",
+    "*.pyo",
+    ".pytest_cache",
+    ".ruff_cache",
+)
+
 
 def build(args: argparse.Namespace) -> Path:
     source = args.source.resolve()
@@ -30,7 +38,11 @@ def build(args: argparse.Namespace) -> Path:
         staging = Path(temporary) / RELEASE_ROOT_NAME
         staging.mkdir()
         for directory in RELEASE_DIRECTORIES:
-            shutil.copytree(source / directory, staging / directory)
+            shutil.copytree(
+                source / directory,
+                staging / directory,
+                ignore=RELEASE_COPY_IGNORE,
+            )
         for relative in RELEASE_FILES:
             target = staging / relative
             target.parent.mkdir(parents=True, exist_ok=True)
