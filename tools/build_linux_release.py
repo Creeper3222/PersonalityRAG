@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import sys
 import tempfile
 import zipfile
 from pathlib import Path
 
-from personalityrag.update_manifest import (
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SOURCE_ROOT))
+
+from personalityrag.update_manifest import (  # noqa: E402
     MANIFEST_NAME,
     RELEASE_DIRECTORIES,
     RELEASE_FILES,
     inspect_and_extract_zip,
     write_manifest,
 )
-from personalityrag.version import RELEASE_ROOT_NAME, release_asset_name
+from personalityrag.version import RELEASE_ROOT_NAME, release_asset_name  # noqa: E402
 
 
 def build(args: argparse.Namespace) -> Path:
