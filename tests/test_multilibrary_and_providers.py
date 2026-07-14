@@ -21,6 +21,8 @@ from personalityrag.indexes import IndexManager
 from personalityrag.libraries import DEFAULT_LIBRARY_ID, LibraryManager
 from personalityrag.providers import (
     EmbeddingProvider,
+    GeminiEmbeddingProvider,
+    NvidiaEmbeddingProvider,
     OllamaEmbeddingProvider,
     OpenAIEmbeddingProvider,
     VLLMEmbeddingProvider,
@@ -265,6 +267,105 @@ async def test_openai_sends_configured_dimensions():
     )
     assert len(await provider.get_embedding("hello")) == 3
     assert requests[0]["dimensions"] == 3
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_gemini_lists_models_and_embeds_batches():
+    requests: list[dict] = []
+
+    async def handler(request: httpx.Request):
+        assert request.headers["x-goog-api-key"] == "gemini-secret"
+        if request.url.path == "/v1beta/models":
+            return httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {
+                            "name": "models/gemini-embedding-exp-03-07",
+                            "inputTokenLimit": 8192,
+                        }
+                    ]
+                },
+            )
+        assert request.url.path.endswith(
+            "/models/gemini-embedding-exp-03-07:batchEmbedContents"
+        )
+        payload = json.loads(request.content)
+        requests.append(payload)
+        return httpx.Response(
+            200,
+            json={
+                "embeddings": [
+                    {"values": [1.0, 0.0, 0.0]}
+                    for _ in payload.get("requests", [])
+                ]
+            },
+        )
+
+    provider = GeminiEmbeddingProvider(
+        ProviderConfig(
+            id="gemini",
+            type="gemini_embedding",
+            api_base="https://generativelanguage.googleapis.com/v1beta",
+            api_key="gemini-secret",
+            model="gemini-embedding-exp-03-07",
+            dimensions=3,
+        )
+    )
+    await provider._client.aclose()
+    provider._client = httpx.AsyncClient(
+        base_url="https://test/v1beta",
+        headers={"x-goog-api-key": "gemini-secret"},
+        transport=httpx.MockTransport(handler),
+    )
+    assert (await provider.list_models())[0]["inputTokenLimit"] == 8192
+    detected = await provider.detect_context_length()
+    assert detected["max_context_tokens"] == 8192
+    assert len(await provider.get_embeddings(["a", "b"])) == 2
+    assert requests[0]["requests"][0]["model"].startswith("models/")
+    assert requests[0]["requests"][0]["outputDimensionality"] == 3
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_nvidia_sends_input_type_and_float_encoding():
+    requests: list[dict] = []
+
+    async def handler(request: httpx.Request):
+        payload = json.loads(request.content)
+        requests.append(payload)
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"index": index, "embedding": [1.0, 0.0, 0.0]}
+                    for index, _ in enumerate(payload["input"])
+                ]
+            },
+        )
+
+    provider = NvidiaEmbeddingProvider(
+        ProviderConfig(
+            id="nvidia",
+            type="nvidia_embedding",
+            api_base="https://integrate.api.nvidia.com/v1",
+            api_key="nvapi-secret",
+            model="nvidia/llama-nemotron-embed-1b-v2",
+            dimensions=3,
+            input_type="passage",
+        )
+    )
+    await provider._client.aclose()
+    provider._client = httpx.AsyncClient(
+        base_url="https://test/v1",
+        transport=httpx.MockTransport(handler),
+    )
+    assert len(await provider.get_embeddings(["a", "b"])) == 2
+    assert requests[0]["model"] == "nvidia/llama-nemotron-embed-1b-v2"
+    assert requests[0]["input_type"] == "passage"
+    assert requests[0]["encoding_format"] == "float"
+    assert "dimensions" not in requests[0]
     await provider.close()
 
 
@@ -1015,6 +1116,59 @@ async def test_library_copy_uses_numbered_fallback_after_soft_delete(
 
         libraries = {item["id"] for item in await manager.list_libraries()}
         assert libraries == {"Default", "Default_copy2", "Default_copy3"}
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_library_copy_can_be_loaded_renamed_and_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "PersonalityRAG"
+    provider_config = ProviderConfig(dimensions=8)
+    _patch_fake_providers(monkeypatch)
+
+    manager = LibraryManager(root, AppConfig(provider=provider_config))
+    await manager.initialize()
+    try:
+        source = await manager.create_library(
+            {
+                "id": "empty_source",
+                "name": "Empty source",
+                "provider_id": provider_config.id,
+            }
+        )
+        assert source["stats"]["total_memories"] == 0
+
+        copied = await manager.copy_library(source["id"])
+        copied_id = copied["id"]
+        assert copied_id == "empty_source_copy"
+        assert (await manager.library_detail(copied_id))["id"] == copied_id
+        assert (await manager.get_runtime(copied_id)).library_id == copied_id
+
+        renamed = await manager.update_library(
+            copied_id,
+            {"id": "renamed_empty_copy", "name": "Renamed empty copy"},
+        )
+        assert renamed["id"] == "renamed_empty_copy"
+        assert renamed["name"] == "Renamed empty copy"
+        assert await manager.control.get_library(copied_id) is None
+        assert not (root / "data" / "libraries" / copied_id).exists()
+        assert (root / "data" / "libraries" / renamed["id"]).is_dir()
+
+        deleted = await manager.delete_library(renamed["id"])
+        assert deleted["library_id"] == renamed["id"]
+        assert await manager.control.get_library(renamed["id"]) is None
+        assert not (root / "data" / "libraries" / renamed["id"]).exists()
+
+        copied_again = await manager.copy_library(source["id"])
+        reclaimed = await manager.update_library(
+            copied_again["id"],
+            {"id": renamed["id"], "name": "Reclaimed empty copy"},
+        )
+        assert reclaimed["id"] == renamed["id"]
+        assert reclaimed["name"] == "Reclaimed empty copy"
+        assert (root / "data" / "libraries" / reclaimed["id"]).is_dir()
     finally:
         await manager.close()
 

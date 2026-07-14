@@ -24,6 +24,7 @@ from ..http_shared import (
     runtime,
 )
 from ..logger import logger
+from ..jobs import JobStateConflict
 from ..io_utils import run_blocking, save_upload_file
 from ..migration import validate_conversations_db_file, validate_livingmemory_db_file
 from ..schemas import (
@@ -73,11 +74,9 @@ async def rebuild_indexes(
         provider_id,
         (target.indexes.status() or {}).get("generation") or "",
     )
-    job_id = await jobs().start(
+    job_id = await jobs().start_resumable(
         "index_rebuild",
-        lambda progress: manager.rebuild_library(
-            target.library_id, payload.provider_id, progress
-        ),
+        {"provider_id": payload.provider_id},
         library_id=target.library_id,
     )
     logger.warning("索引重建任务已创建：library_id=%s job_id=%s", target.library_id, job_id)
@@ -93,6 +92,41 @@ async def job_status(job_id: str):
     if not result:
         raise HTTPException(404, "job not found")
     return result
+
+
+async def _control_job(job_id: str, action: str):
+    job_manager = jobs()
+    try:
+        return await getattr(job_manager, action)(job_id)
+    except KeyError as exc:
+        raise HTTPException(404, "job not found") from exc
+    except JobStateConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.post("/api/v1/jobs/{job_id}/pause", dependencies=[Depends(require_auth)])
+async def pause_job(job_id: str):
+    return await _control_job(job_id, "pause")
+
+
+@router.post("/api/v1/jobs/{job_id}/resume", dependencies=[Depends(require_auth)])
+async def resume_job(job_id: str):
+    return await _control_job(job_id, "resume")
+
+
+@router.post("/api/v1/jobs/{job_id}/stop", dependencies=[Depends(require_auth)])
+async def stop_job(job_id: str):
+    return await _control_job(job_id, "stop")
+
+
+@router.post("/api/v1/jobs/{job_id}/cancel", dependencies=[Depends(require_auth)])
+async def cancel_job(job_id: str):
+    return await _control_job(job_id, "cancel")
+
+
+@router.post("/api/v1/jobs/finished/clear", dependencies=[Depends(require_auth)])
+async def clear_finished_jobs():
+    return {"cleared": await jobs().clear_finished()}
 
 @router.get("/api/v1/jobs/{job_id}/events", dependencies=[Depends(require_auth)])
 async def job_events(job_id: str):
@@ -186,16 +220,17 @@ async def import_livingmemory_db_file(
             upload_path,
             conversations_upload_path or "",
         )
-        job_id = await jobs().start(
+        job_id = await jobs().start_resumable(
             "livingmemory_import",
-            lambda progress: manager.import_livingmemory_db(
-                library_id,
-                upload_path,
-                progress,
-                conversations_db=conversations_upload_path,
-            ),
+            {
+                "source_db": str(upload_path),
+                "conversations_db": (
+                    str(conversations_upload_path)
+                    if conversations_upload_path is not None
+                    else None
+                ),
+            },
             library_id=library_id,
-            lease_runtime=False,
         )
         logger.warning("LivingMemory 单文件导入任务已创建：library_id=%s job_id=%s", library_id, job_id)
         return {"job_id": job_id}
@@ -228,37 +263,9 @@ async def migrate_livingmemory(
         payload.mode,
     )
 
-    async def operation(progress):
-        logger.warning(
-            "LivingMemory 迁移开始：library_id=%s source=%s mode=%s",
-            target.library_id,
-            source,
-            payload.mode,
-        )
-        result = await target.migrator.migrate(
-            source, mode=payload.mode, progress=progress
-        )
-        logger.warning(
-            "LivingMemory 数据迁移完成，开始重建索引：library_id=%s run_id=%s",
-            target.library_id,
-            result.get("run_id"),
-        )
-        await target.storage.initialize()
-        target.text = target.text.__class__(target.data_dir / "stopwords")
-        target.retrieval.text = target.text
-        rebuild = await manager.rebuild_library(
-            target.library_id, None, progress
-        )
-        logger.warning(
-            "LivingMemory 迁移与索引重建完成：library_id=%s generation=%s",
-            target.library_id,
-            (rebuild.get("manifest") or {}).get("generation"),
-        )
-        return {"migration": result, "rebuild": rebuild}
-
-    job_id = await jobs().start(
+    job_id = await jobs().start_resumable(
         "livingmemory_migration",
-        operation,
+        {"source_path": str(source), "mode": payload.mode},
         library_id=target.library_id,
     )
     logger.warning("LivingMemory 迁移任务已创建：library_id=%s job_id=%s", target.library_id, job_id)

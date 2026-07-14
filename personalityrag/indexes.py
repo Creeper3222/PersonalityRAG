@@ -18,12 +18,30 @@ import numpy as np
 
 from .providers import EmbeddingProvider
 from .storage import Storage
+from .task_control import JobExecutionContext, JobInterrupted
 
 
 DEFAULT_DOCUMENT_EMBED_CHARS = 4000
 DEFAULT_QUERY_EMBED_CHARS = 2000
 CONTEXT_CHAR_SAFETY_RATIO = 0.9
 MIN_CONTEXT_CLIP_CHARS = 64
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    os.replace(temp, path)
 
 
 def _configured_faiss_threads() -> int:
@@ -556,7 +574,30 @@ class IndexManager:
         provider_revision: int | None = None,
         provider_config_sha256: str | None = None,
         provider_model: str | None = None,
+        job_context: JobExecutionContext | None = None,
+        checkpoint_dir: Path | None = None,
     ) -> dict[str, Any]:
+        if job_context is not None and checkpoint_dir is not None:
+            return await self._rebuild_resumable(
+                batch_size=batch_size,
+                concurrency=concurrency,
+                embedding_batch_size=embedding_batch_size,
+                tasks_limit=tasks_limit,
+                max_retries=max_retries,
+                retry_base_delay=retry_base_delay,
+                batch_delay=batch_delay,
+                request_delay=request_delay,
+                max_failure_ratio=max_failure_ratio,
+                progress=progress,
+                provider=provider,
+                library_id=library_id,
+                provider_id=provider_id,
+                provider_revision=provider_revision,
+                provider_config_sha256=provider_config_sha256,
+                provider_model=provider_model,
+                job_context=job_context,
+                checkpoint_dir=checkpoint_dir,
+            )
         candidate = provider or self.provider
         read_batch_size = max(1, int(batch_size))
         embed_batch_size = max(1, int(embedding_batch_size or batch_size))
@@ -797,6 +838,521 @@ class IndexManager:
 
                 shutil.rmtree(temp_dir, ignore_errors=True)
             raise
+
+    async def _embedding_source_fingerprint(self) -> dict[str, Any]:
+        document_hash = hashlib.sha256()
+        graph_hash = hashlib.sha256()
+        document_ids = hashlib.sha256()
+        graph_ids = hashlib.sha256()
+        document_count = 0
+        graph_count = 0
+        async for batch in self.storage.iter_documents(batch_size=500):
+            for item in batch:
+                item_id = int(item["id"])
+                text = str(item["text"])
+                document_ids.update(f"{item_id},".encode())
+                document_hash.update(f"{item_id}:{len(text)}:".encode())
+                document_hash.update(text.encode("utf-8"))
+                document_hash.update(b"\0")
+                document_count += 1
+        async for batch in self.storage.iter_graph_entries(batch_size=500):
+            for item in batch:
+                item_id = int(item["id"])
+                content = str(item["content"])
+                graph_ids.update(f"{item_id},".encode())
+                graph_hash.update(f"{item_id}:{len(content)}:".encode())
+                graph_hash.update(content.encode("utf-8"))
+                graph_hash.update(b"\0")
+                graph_count += 1
+        return {
+            "document_count": document_count,
+            "graph_count": graph_count,
+            "document_ids_sha256": document_ids.hexdigest(),
+            "graph_ids_sha256": graph_ids.hexdigest(),
+            "document_text_sha256": document_hash.hexdigest(),
+            "graph_content_sha256": graph_hash.hexdigest(),
+        }
+
+    async def _rebuild_resumable(
+        self,
+        *,
+        batch_size: int,
+        concurrency: int,
+        embedding_batch_size: int | None,
+        tasks_limit: int | None,
+        max_retries: int,
+        retry_base_delay: float,
+        batch_delay: float,
+        request_delay: float,
+        max_failure_ratio: float,
+        progress: Callable[[float, str], Any] | None,
+        provider: EmbeddingProvider | None,
+        library_id: str | None,
+        provider_id: str | None,
+        provider_revision: int | None,
+        provider_config_sha256: str | None,
+        provider_model: str | None,
+        job_context: JobExecutionContext,
+        checkpoint_dir: Path,
+    ) -> dict[str, Any]:
+        del max_failure_ratio
+        candidate = provider or self.provider
+        read_batch_size = max(1, int(batch_size))
+        embed_batch_size = max(1, int(embedding_batch_size or batch_size))
+        worker_limit = max(1, int(tasks_limit or concurrency))
+        max_retries = max(1, int(max_retries))
+        retry_base_delay = max(0.0, float(retry_base_delay))
+        batch_delay = max(0.0, float(batch_delay))
+        request_delay = max(0.0, float(request_delay))
+        effective_library = library_id if library_id is not None else self.library_id
+        effective_provider = provider_id if provider_id is not None else self.provider_id
+        effective_revision = (
+            provider_revision
+            if provider_revision is not None
+            else self.provider_revision
+        )
+        effective_config_hash = (
+            provider_config_sha256
+            if provider_config_sha256 is not None
+            else self.provider_config_sha256
+        )
+        effective_model = (
+            provider_model
+            or getattr(getattr(candidate, "config", None), "model", "")
+            or self.provider_model
+        )
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        segments_dir = checkpoint_dir / "segments"
+        segments_dir.mkdir(parents=True, exist_ok=True)
+        state_path = checkpoint_dir / "checkpoint.json"
+        previous_state_path = checkpoint_dir / "checkpoint.prev.json"
+        activation_journal_path = checkpoint_dir / "activation-journal.json"
+
+        async def save_state(state: dict[str, Any], message: str) -> None:
+            state["saved_at"] = time.time()
+            if state_path.exists():
+                shutil.copy2(state_path, previous_state_path)
+            _atomic_json(state_path, state)
+            completed = int(state.get("completed_documents", 0)) + int(
+                state.get("completed_graph_entries", 0)
+            )
+            total = max(
+                1,
+                int(state.get("total_documents", 0))
+                + int(state.get("total_graph_entries", 0)),
+            )
+            await job_context.checkpoint(
+                {
+                    "phase": state.get("phase", "indexing"),
+                    "completed_documents": int(
+                        state.get("completed_documents", 0)
+                    ),
+                    "completed_graph_entries": int(
+                        state.get("completed_graph_entries", 0)
+                    ),
+                    "total_documents": int(state.get("total_documents", 0)),
+                    "total_graph_entries": int(
+                        state.get("total_graph_entries", 0)
+                    ),
+                    "saved_at": state["saved_at"],
+                },
+                progress=completed / total,
+                message=message,
+            )
+
+        fingerprint = await self._embedding_source_fingerprint()
+        if state_path.exists():
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+            except Exception:
+                if not previous_state_path.exists():
+                    raise JobInterrupted(
+                        "checkpoint_corrupt",
+                        "索引断点已损坏，已保留任务锁，需停止任务以回滚",
+                    )
+                try:
+                    state = json.loads(previous_state_path.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    raise JobInterrupted(
+                        "checkpoint_corrupt",
+                        "最近两份索引断点均已损坏，需停止任务以回滚",
+                        error=str(exc),
+                    ) from exc
+                _atomic_json(state_path, state)
+            expected_identity = {
+                "library_id": effective_library,
+                "provider_id": effective_provider,
+                "provider_revision": effective_revision,
+                "provider_config_sha256": effective_config_hash,
+                "provider_model": effective_model,
+            }
+            actual_identity = {key: state.get(key) for key in expected_identity}
+            if actual_identity != expected_identity:
+                raise JobInterrupted(
+                    "checkpoint_conflict",
+                    "Provider revision 或记忆库身份已变化，拒绝不安全续跑",
+                )
+            if state.get("source_fingerprint") != fingerprint:
+                raise JobInterrupted(
+                    "source_changed",
+                    "暂停期间源数据已变化，拒绝不安全续跑",
+                )
+        else:
+            generation = time.strftime("gen-%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8]
+            state = {
+                "version": 1,
+                "phase": "indexing_documents",
+                "generation": generation,
+                "library_id": effective_library,
+                "provider_id": effective_provider,
+                "provider_revision": effective_revision,
+                "provider_config_sha256": effective_config_hash,
+                "provider_model": effective_model,
+                "source_fingerprint": fingerprint,
+                "total_documents": int(fingerprint["document_count"]),
+                "total_graph_entries": int(fingerprint["graph_count"]),
+                "completed_documents": 0,
+                "completed_graph_entries": 0,
+                "last_document_id": 0,
+                "last_graph_id": 0,
+                "segments": [],
+                "norm_min": None,
+                "norm_max": 0.0,
+                "norm_sum": 0.0,
+                "norm_count": 0,
+            }
+            await save_state(state, "索引安全断点已初始化")
+
+        generation = str(state["generation"])
+        final_dir = self.root / generation
+        if state.get("phase") == "index_activated":
+            manifest_path = final_dir / "manifest.json"
+            if not manifest_path.exists():
+                raise RuntimeError("activated checkpoint is missing its manifest")
+            if activation_journal_path.exists():
+                journal = json.loads(
+                    activation_journal_path.read_text(encoding="utf-8")
+                )
+                if (
+                    journal.get("candidate_generation") != generation
+                    or journal.get("phase") != "activated"
+                ):
+                    raise JobInterrupted(
+                        "checkpoint_corrupt",
+                        "索引激活 journal 与断点不一致，需停止任务以回滚",
+                    )
+            return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        try:
+            dimension = await candidate.get_dimension()
+            provider_status = await candidate.test_connection()
+        except Exception as exc:
+            raise JobInterrupted(
+                "provider_unavailable",
+                "Embedding 服务不可用，任务已回退到最近安全断点",
+                error=str(exc),
+            ) from exc
+        if not provider_status.get("available"):
+            raise JobInterrupted(
+                "provider_unavailable",
+                "Embedding 服务不可用，任务已回退到最近安全断点",
+                error=str(provider_status.get("error") or "provider unavailable"),
+            )
+        if state.get("dimension") not in {None, dimension}:
+            raise JobInterrupted(
+                "checkpoint_conflict",
+                "Embedding 维度与断点不一致，拒绝不安全续跑",
+            )
+        state["dimension"] = dimension
+
+        doc_index = self._empty_index(dimension)
+        graph_index = self._empty_index(dimension)
+        document_ids: list[int] = []
+        graph_ids: list[int] = []
+        for segment in state.get("segments", []):
+            path = segments_dir / str(segment["file"])
+            if not path.exists() or _sha256_file(path) != segment.get("sha256"):
+                raise JobInterrupted(
+                    "checkpoint_corrupt",
+                    f"索引断点分段缺失或损坏：{path.name}",
+                )
+            with np.load(path, allow_pickle=False) as payload:
+                ids = np.asarray(payload["ids"], dtype=np.int64)
+                vectors = np.asarray(payload["vectors"], dtype=np.float32)
+            target = doc_index if segment["kind"] == "documents" else graph_index
+            target.add_with_ids(vectors, ids)
+            if segment["kind"] == "documents":
+                document_ids.extend(map(int, ids))
+            else:
+                graph_ids.extend(map(int, ids))
+
+        semaphore = asyncio.Semaphore(worker_limit)
+
+        async def embed_batch(texts: list[str], ids: list[int]) -> np.ndarray:
+            chunks = [
+                (texts[i : i + embed_batch_size], ids[i : i + embed_batch_size])
+                for i in range(0, len(texts), embed_batch_size)
+            ]
+
+            async def run(chunk_texts: list[str], chunk_ids: list[int]):
+                async with semaphore:
+                    last_exc: Exception | None = None
+                    for attempt in range(max_retries):
+                        try:
+                            vectors = await candidate.get_embeddings(chunk_texts)
+                            matrix = np.asarray(vectors, dtype=np.float32)
+                            minimum, maximum, total_norm = self._validate_matrix(
+                                matrix,
+                                expected_rows=len(chunk_ids),
+                                dimension=dimension,
+                            )
+                            faiss.normalize_L2(matrix)
+                            if request_delay > 0:
+                                await asyncio.sleep(request_delay)
+                            return matrix, minimum, maximum, total_norm
+                        except Exception as exc:
+                            last_exc = exc
+                            if attempt + 1 < max_retries:
+                                await asyncio.sleep(retry_base_delay * (2**attempt))
+                    assert last_exc is not None
+                    raise JobInterrupted(
+                        "provider_unavailable",
+                        "Embedding 服务请求失败，任务已回退到最近安全断点",
+                        error=str(last_exc),
+                    ) from last_exc
+
+            results: list[tuple[np.ndarray, float, float, float]] = []
+            for start in range(0, len(chunks), worker_limit):
+                results.extend(
+                    await asyncio.gather(
+                        *[
+                            run(chunk_texts, chunk_ids)
+                            for chunk_texts, chunk_ids in chunks[
+                                start : start + worker_limit
+                            ]
+                        ]
+                    )
+                )
+            matrices = [item[0] for item in results]
+            state["norm_min"] = min(
+                [
+                    float(state["norm_min"])
+                    if state.get("norm_min") is not None
+                    else math.inf
+                ]
+                + [item[1] for item in results]
+            )
+            state["norm_max"] = max(
+                [float(state.get("norm_max", 0.0))]
+                + [item[2] for item in results]
+            )
+            state["norm_sum"] = float(state.get("norm_sum", 0.0)) + sum(
+                item[3] for item in results
+            )
+            state["norm_count"] = int(state.get("norm_count", 0)) + len(ids)
+            return np.concatenate(matrices, axis=0) if matrices else np.empty((0, dimension), dtype=np.float32)
+
+        async def persist_segment(kind: str, ids: list[int], matrix: np.ndarray) -> None:
+            sequence = len(state.get("segments", [])) + 1
+            filename = f"{sequence:06d}-{kind}.npz"
+            final_path = segments_dir / filename
+            temp_path = segments_dir / f".{filename}.tmp"
+            with temp_path.open("wb") as handle:
+                np.savez(handle, ids=np.asarray(ids, dtype=np.int64), vectors=matrix)
+            os.replace(temp_path, final_path)
+            state.setdefault("segments", []).append(
+                {
+                    "kind": kind,
+                    "file": filename,
+                    "sha256": _sha256_file(final_path),
+                    "count": len(ids),
+                    "first_id": ids[0],
+                    "last_id": ids[-1],
+                }
+            )
+
+        total = max(1, int(state["total_documents"]) + int(state["total_graph_entries"]))
+        await job_context.control_point()
+        async for batch in self.storage.iter_documents(
+            batch_size=read_batch_size, after_id=int(state.get("last_document_id", 0))
+        ):
+            ids = [int(item["id"]) for item in batch]
+            texts = [
+                _clip_for_embedding(item["text"], candidate, DEFAULT_DOCUMENT_EMBED_CHARS)
+                for item in batch
+            ]
+            matrix = await embed_batch(texts, ids)
+            await persist_segment("documents", ids, matrix)
+            doc_index.add_with_ids(matrix, np.asarray(ids, dtype=np.int64))
+            document_ids.extend(ids)
+            state["completed_documents"] = int(state["completed_documents"]) + len(ids)
+            state["last_document_id"] = ids[-1]
+            state["phase"] = "indexing_documents"
+            done = int(state["completed_documents"]) + int(state["completed_graph_entries"])
+            await save_state(state, f"已生成 {done}/{total} 条向量")
+            if progress:
+                await progress(done / total, f"已生成 {done}/{total} 条向量")
+            if batch_delay > 0:
+                await asyncio.sleep(batch_delay)
+
+        state["phase"] = "indexing_graph"
+        async for batch in self.storage.iter_graph_entries(
+            batch_size=read_batch_size, after_id=int(state.get("last_graph_id", 0))
+        ):
+            ids = [int(item["id"]) for item in batch]
+            texts = [
+                _clip_for_embedding(item["content"], candidate, DEFAULT_DOCUMENT_EMBED_CHARS)
+                for item in batch
+            ]
+            matrix = await embed_batch(texts, ids)
+            await persist_segment("graph", ids, matrix)
+            graph_index.add_with_ids(matrix, np.asarray(ids, dtype=np.int64))
+            graph_ids.extend(ids)
+            state["completed_graph_entries"] = int(state["completed_graph_entries"]) + len(ids)
+            state["last_graph_id"] = ids[-1]
+            done = int(state["completed_documents"]) + int(state["completed_graph_entries"])
+            await save_state(state, f"已生成 {done}/{total} 条向量")
+            if progress:
+                await progress(done / total, f"已生成 {done}/{total} 条向量")
+            if batch_delay > 0:
+                await asyncio.sleep(batch_delay)
+
+        if doc_index.ntotal != int(state["total_documents"]) or graph_index.ntotal != int(state["total_graph_entries"]):
+            raise RuntimeError("zero-loss resumable rebuild vector count mismatch")
+        final_fingerprint = await self._embedding_source_fingerprint()
+        if final_fingerprint != state["source_fingerprint"]:
+            raise JobInterrupted(
+                "source_changed",
+                "索引激活前源数据发生变化，候选 generation 未激活",
+            )
+        if set(map(int, faiss.vector_to_array(doc_index.id_map))) != set(document_ids):
+            raise RuntimeError("document vector ID set mismatch")
+        if set(map(int, faiss.vector_to_array(graph_index.id_map))) != set(graph_ids):
+            raise RuntimeError("graph vector ID set mismatch")
+
+        async with self.storage.connect() as db:
+            document_samples = [
+                (int(row["id"]), str(row["text"]))
+                for row in await (
+                    await db.execute("SELECT id,text FROM documents ORDER BY id LIMIT 3")
+                ).fetchall()
+            ]
+            graph_samples = [
+                (int(row["id"]), str(row["content"]))
+                for row in await (
+                    await db.execute("SELECT id,content FROM graph_entries ORDER BY id LIMIT 3")
+                ).fetchall()
+            ]
+        try:
+            await self._validate_sample_recall(candidate, doc_index, document_samples, "文档索引")
+            await self._validate_sample_recall(candidate, graph_index, graph_samples, "图记忆索引")
+        except Exception as exc:
+            raise JobInterrupted(
+                "provider_unavailable",
+                "Embedding 服务验证失败，任务保留在提交前安全断点",
+                error=str(exc),
+            ) from exc
+
+        manifest = GenerationManifest(
+            generation=generation,
+            created_at=time.time(),
+            library_id=effective_library,
+            provider_id=effective_provider,
+            provider_revision=effective_revision,
+            provider_config_sha256=effective_config_hash,
+            provider_type=type(candidate).__name__,
+            configured_model=effective_model,
+            resolved_model=str(provider_status.get("resolved_model") or ""),
+            dimension=dimension,
+            metric="IndexIDMap(IndexFlatL2)",
+            document_count=int(state["total_documents"]),
+            graph_entry_count=int(state["total_graph_entries"]),
+            document_ids_sha256=hashlib.sha256(
+                ",".join(map(str, document_ids)).encode()
+            ).hexdigest(),
+            graph_ids_sha256=hashlib.sha256(
+                ",".join(map(str, graph_ids)).encode()
+            ).hexdigest(),
+            vector_norm_min=round(
+                0.0 if not int(state["norm_count"]) else float(state["norm_min"]), 8
+            ),
+            vector_norm_max=round(float(state["norm_max"]), 8),
+            vector_norm_mean=round(
+                0.0
+                if not int(state["norm_count"])
+                else float(state["norm_sum"]) / int(state["norm_count"]),
+                8,
+            ),
+        )
+        state["phase"] = "ready_to_commit"
+        await save_state(state, "候选索引已完成，等待原子激活")
+        temp_dir = self.root / f".{generation}.tmp"
+        if not final_dir.exists():
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            temp_dir.mkdir(parents=True, exist_ok=False)
+            _write_faiss_index(doc_index, temp_dir / "documents.index")
+            _write_faiss_index(graph_index, temp_dir / "graph.index")
+            (temp_dir / "manifest.json").write_text(
+                json.dumps(asdict(manifest), ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            os.replace(temp_dir, final_dir)
+        existing_journal = None
+        if activation_journal_path.exists():
+            try:
+                existing_journal = json.loads(
+                    activation_journal_path.read_text(encoding="utf-8")
+                )
+            except Exception as exc:
+                raise JobInterrupted(
+                    "checkpoint_corrupt",
+                    "索引激活 journal 已损坏，需停止任务以回滚",
+                    error=str(exc),
+                ) from exc
+        previous_generation = (
+            str(existing_journal.get("previous_generation") or "")
+            if existing_journal
+            and existing_journal.get("candidate_generation") == generation
+            else (
+                self.current_file.read_text(encoding="utf-8").strip()
+                if self.current_file.exists()
+                else ""
+            )
+        )
+        _atomic_json(
+            activation_journal_path,
+            {
+                "phase": "prepared",
+                "previous_generation": previous_generation,
+                "candidate_generation": generation,
+                "saved_at": time.time(),
+            },
+        )
+        await job_context.control_point()
+        async with self._swap_lock:
+            pointer = self.current_file.with_suffix(".tmp")
+            pointer.write_text(generation, encoding="utf-8")
+            os.replace(pointer, self.current_file)
+            self._snapshot = IndexSnapshot(doc_index, graph_index, asdict(manifest), candidate)
+            self.library_id = manifest.library_id
+            self.provider_id = manifest.provider_id
+            self.provider_revision = manifest.provider_revision
+            self.provider_config_sha256 = manifest.provider_config_sha256
+            self.provider_model = manifest.configured_model
+        _atomic_json(
+            activation_journal_path,
+            {
+                "phase": "activated",
+                "previous_generation": previous_generation,
+                "candidate_generation": generation,
+                "saved_at": time.time(),
+            },
+        )
+        state["phase"] = "index_activated"
+        await save_state(state, "索引 generation 已激活，正在提交 Provider 绑定")
+        if progress:
+            await progress(1.0, "索引 generation 与 Provider 已原子切换")
+        return asdict(manifest)
 
     async def search_documents(
         self, query: str, k: int, fetch_k: int | None = None

@@ -23,7 +23,7 @@
     <aside class="sidebar">
       <div class="brand">
         <div class="brand-mark"><img src="/static/logo.png" alt="PersonalityRAG"></div>
-        <div><strong>PersonalityRAG</strong><small>v0.1.0</small></div>
+        <div><strong>PersonalityRAG</strong><small id="sidebar-version">v—</small></div>
       </div>
       <button id="sidebar-current-library" class="sidebar-library hidden" type="button">
         <span data-i18n="currentLibrary">当前记忆库</span>
@@ -61,6 +61,7 @@
         </div>
         <div class="top-actions">
           <button id="library-context" class="context-chip hidden" type="button"></button>
+          <button id="update-available-badge" class="update-available-badge hidden" type="button" data-i18n="updateAvailableBadge">检测到有新版本</button>
           <span id="service-state" class="pill success" data-i18n="online">在线</span>
           <button id="logout" class="ghost" data-i18n="logout">退出</button>
         </div>
@@ -371,6 +372,22 @@
           </div>
           <button id="settings-refresh" class="ghost" data-i18n="refresh">刷新</button>
         </div>
+        <section class="panel settings-panel update-panel">
+          <div class="update-panel-copy">
+            <h3 data-i18n="versionManagementTitle">版本管理</h3>
+            <p class="form-help" data-i18n="versionManagementHint">通过官方 GitHub Release 安全更新、回退或重新安装运行代码，持久化数据不会被覆盖。</p>
+          </div>
+          <dl class="update-summary">
+            <div><dt data-i18n="currentVersion">当前版本</dt><dd id="update-current-version">—</dd></div>
+            <div><dt data-i18n="latestVersion">最新可用版本</dt><dd id="update-latest-version">—</dd></div>
+            <div><dt data-i18n="lastUpdateCheck">上次检查</dt><dd id="update-checked-at">—</dd></div>
+            <div><dt data-i18n="updateCheckStatus">检查状态</dt><dd id="update-check-state">—</dd></div>
+          </dl>
+          <footer>
+            <button id="updates-refresh" class="ghost" type="button" data-i18n="checkUpdates">检查更新</button>
+            <button id="updates-select" class="primary" type="button" data-i18n="selectVersion">选择版本</button>
+          </footer>
+        </section>
         <dl class="panel settings-info-grid">
           <dt data-i18n="currentAccessUrl">当前 WebUI 地址</dt><dd id="settings-access-url">—</dd>
           <dt data-i18n="actualPort">WebUI 本次实际端口</dt><dd id="settings-actual-port">—</dd>
@@ -432,6 +449,7 @@
             <div class="task-tabs">
               <button id="tasks-active-tab" class="log-filter active" type="button" data-task-scope="active" data-i18n="activeTasks">进行中</button>
               <button id="tasks-finished-tab" class="log-filter" type="button" data-task-scope="finished" data-i18n="finishedTasks">已结束任务</button>
+              <button id="tasks-finished-clear" class="ghost hidden" type="button" data-i18n="clearFinishedTasks">清空已结束任务</button>
             </div>
           </div>
           <div id="task-history-panel" class="task-history-panel">
@@ -668,6 +686,14 @@
         <label id="provider-instruct-row" class="hidden"><span>Instruct</span><input id="provider-instruct" placeholder="可选的 rerank 指令"></label>
         <label id="provider-model-endpoint-row" class="hidden"><span>Model Endpoint</span><input id="provider-model-endpoint" placeholder="/reranking"></label>
         <label id="provider-truncate-row" class="hidden"><span data-i18n="truncateLabel">截断策略</span><input id="provider-truncate" placeholder="NONE / END"></label>
+        <label id="provider-input-type-row" class="hidden">
+          <span>Input Type</span>
+          <select id="provider-input-type">
+            <option value="passage">passage（索引文档）</option>
+            <option value="query">query（检索查询）</option>
+          </select>
+          <small>NVIDIA NIM 的输入用途。用于构建记忆索引时请选择 passage。</small>
+        </label>
         <label id="provider-launch-model-row" class="switch-row hidden"><span>Launch Model If Needed</span><input id="provider-launch-model" type="checkbox"></label>
         <label><span data-i18n="timeoutSeconds">超时时间（秒）</span><input id="provider-timeout" type="number" min="1"></label>
         <label><span data-i18n="proxyAddress">代理地址</span><input id="provider-proxy" data-i18n-placeholder="proxyPlaceholder" placeholder="例如 http://127.0.0.1:7890"></label>
@@ -828,6 +854,21 @@
         <strong data-i18n="configPackageExporting">正在导出配置...</strong>
       </div>
     </form>
+  </div>
+  <div id="updates-modal" class="modal-overlay hidden">
+    <div class="modal update-modal">
+      <header>
+        <div><p class="eyebrow">PersonalityRAG</p><h2 data-i18n="selectVersionTitle">选择版本</h2></div>
+        <button type="button" class="icon modal-dismiss">×</button>
+      </header>
+      <p class="form-help" data-i18n="selectVersionHint">可更新到新版本、回退到兼容的旧版本，或重新安装当前版本。</p>
+      <div id="updates-release-list" class="updates-release-list"></div>
+      <div id="updates-modal-busy" class="update-modal-busy hidden" aria-live="polite" aria-busy="true">
+        <span class="update-spinner"></span>
+        <strong id="updates-modal-busy-text" data-i18n="updatePreparing">正在下载并验证版本包…</strong>
+      </div>
+      <footer><button type="button" class="ghost modal-dismiss" data-i18n="cancel">取消</button></footer>
+    </div>
   </div>
   <div id="restart-screen" class="restart-screen hidden" aria-live="polite" aria-busy="true">
     <div class="restart-screen-bg"></div>

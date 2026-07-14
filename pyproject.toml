@@ -2,10 +2,9 @@
 name = "personalityrag"
 version = "0.1.0"
 description = "Independent, LivingMemory-compatible personality memory RAG service"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.10"
 license = { text = "AGPL-3.0-only" }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-

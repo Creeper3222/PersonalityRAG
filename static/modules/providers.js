@@ -1,5 +1,7 @@
 export function createProvidersController({ $, state, t, toast, api, escapeHtml, validateIdentifierInput, confirmSensitiveProviderEdit, navigate, loadLibraries, confirmDialog, closeOverlay, selectLibrary }) {
 const PROVIDER_ICON_SVG = {
+  gemini_embedding: `<img src="/static/icons/google_gemini.svg" alt="" aria-hidden="true">`,
+  nvidia_embedding: `<img src="/static/icons/nvidia.svg" alt="" aria-hidden="true">`,
   openai_embedding: `<svg viewBox="0 0 1024 1024" aria-hidden="true"><path d="M565.265 954.52c-22.29 0-48.4-8.153-67.952-14.84a103.425 103.425 0 0 1-26.876-11.272c-12.737-7.77-15.411-8.343-19.806-24.774 21.972-5.158 81.581-41.905 103.871-55.342 148.897-89.16 119.029-10.445 119.029-364.982 15.03 3.566 82.79 32.416 82.79 57.317 0 133.103 20.571 273.848-52.603 354.92-22.8 25.474-91.835 58.972-138.39 58.972zM132.204 655.196c258.627 136.86 184.37 157.049 357.721 52.095 44.58-27.194 90.434-49.293 132.593-77.57V731.62C526.99 753.846 350.2 958.659 203.468 832.307L177.61 807.15c-37.32-43.943-45.344-72.41-45.344-151.89z m375.744-19.106c-19.933-13.31-79.48-51.33-101.897-57.317v-133.74a1158.312 1158.312 0 0 0 101.897-57.316c43.943 10.19 70.691 47.064 114.634 57.317v127.37c-17.832 12.101-95.847 58.719-114.634 63.75zM81.255 457.772c0-63.686-4.267-90.306 38.848-145.776 23.946-30.888 47.51-39.613 82.091-57.954v261.11c44.134 23.373 83.874 49.039 129.345 74.449l131.766 78.397c-59.546 15.921-63.686 61.33-109.603 33.753-104.7-62.73-272.383-129.345-272.383-243.915z m866.123 127.371c0 79.543-47.573 161.188-121.002 178.32V597.88c0-82.791 9.744-84.574-48.91-116.608l-212.2-118.9c15.793-23.628 22.608-19.107 48.145-34.837 41.714-25.474 39.04-16.112 117.054 28.786 94.191 54.196 216.85 100.56 216.85 228.886zM406.051 387.718V292.19c43.752-23.182 90.689-50.949 133.358-76.805 82.154-49.547 95.528-63.304 185.006-63.304 48.465 0 102.534 36.747 125.652 65.406 42.223 52.222 39.93 92.662 39.93 151.125C858.92 352.118 697.605 247.61 667.099 247.61s-229.65 123.422-261.11 140.108z m-50.948 159.214c-16.367-10.954-63.112-39.995-82.791-44.58 0-168.321-33.88-314.607 67.952-390.52 56.043-41.714 113.17-53.814 181.377-30.696 25.474 8.661 35.536 20.889 56.361 26.43-11.782 16.048-80.69 50.31-102.279 63.303-154.564 93.235-120.62 7.45-120.62 376.063zM62.15 667.934c0 169.149 115.143 280.853 274.293 273.848 59.8-2.675 26.812-7.706 69.417 25.474 97.821 76.741 228.822 73.748 319.638 1.02a251.94 251.94 0 0 0 52.604-55.662c58.209-85.275-10.954-45.599 81.963-83.62 130.237-53.24 199.4-217.358 128.645-355.428-27.448-53.56-40.249-28.85-28.276-104.699 18.723-118.582-63.176-230.032-157.622-269.772-98.903-41.587-129.09 12.737-178.892-37.574a161.889 161.889 0 0 0-43.816-32.607c-106.1-56.68-248.82-27.385-321.676 64.768-81.326 102.98 9.49 54.706-92.407 98.649C15.15 257.354-33.251 439.176 41.579 561.07c56.808 92.599 20.57 4.967 20.57 106.8z"/></svg>`,
   ollama_embedding: `<svg viewBox="0 0 1024 1024" aria-hidden="true"><path d="M287.922 79.6c-42.4 25.6-68.8 118-59.2 205.6l3.6 34.8-20 20c-64.8 64-81.2 163.2-40.4 243.2l10.8 21.2-10 24.8c-26 65.2-24 144 4.4 200.8l11.6 22.8-7.2 14.8c-16.4 33.6-24.4 107.6-14.8 141.2l4 15.2h60.4l-3.2-13.2c-2-6.8-3.6-30.8-3.6-52.8 0-38 0.8-41.6 15.2-71.6 8-17.2 14.8-34.4 14.8-38 0-3.6-5.6-15.6-12.8-26.8-35.6-55.6-36.4-123.6-2.8-190.4 14.8-29.6 14.4-38.8-2-58.8-22.4-26.4-33.2-69.2-26.4-104.4 9.6-50.4 40.4-92.8 82-112.4 20-9.6 29.2-11.6 54.8-11.6h31.2l8-16c18.4-36.4 50.4-61.6 93.6-74 55.6-16.4 124.4 14.8 154.8 70.4l9.6 17.6 34 2c58 4 93.2 27.2 118.4 78 25.6 52 22.4 107.2-8.4 147.6-17.2 22.4-17.2 32-2.4 61.6 33.6 66.8 32.8 134.8-2.8 190.4-7.2 11.2-12.8 23.2-12.8 26.8 0 3.6 6.8 20.8 14.8 38 14.4 30 15.2 33.6 15.2 71.6 0 22-1.6 46-3.6 52.8l-3.2 13.2h60.4l4-14.8c9.6-34 1.6-108-14.8-141.6l-7.2-14.8 11.6-22.8c28.4-56.8 30.4-135.6 4-201.6l-10-25.2 10.8-22c24-49.6 27.2-108.8 8-164.8-10.8-32-25.2-54.8-50.8-79.2l-17.2-17.2 3.6-34.8c7.2-66-8.8-148.4-35.6-183.6-21.2-28-49.6-36.4-79.2-24-27.2 11.2-50.8 51.6-62 106.4-5.2 26-8 31.6-12.8 29.6-34-15.6-60.4-21.6-94.8-21.6-35.2 0-53.2 4.4-93.2 21.6-4.8 2-7.6-3.6-12.8-29.6-11.2-54.8-34.8-95.2-62-106.4-18.4-8-41.2-6.8-55.6 2z m45.6 73.6c16 32.8 27.2 110.8 17.6 125.2-1.6 2.4-13.6 5.6-26.8 7.2-13.2 1.6-27.2 3.6-30.8 4.8-6.4 2-7.2-1.6-7.2-37.2 0-21.6 2.8-50.4 6-64.4 7.2-30 20.8-58 27.2-55.6 2.4 0.8 8.8 10 14 20z m384.8-5.2c12.8 24.8 20 62.8 20 105.6 0 30.8-1.2 38.8-5.2 37.2-3.2-1.2-17.6-3.2-32-4.8-32-3.6-33.2-5.6-29.6-54 3.6-43.2 23.2-100 35.2-100 2 0 7.2 7.2 11.6 16z"/><path d="M453.522 479.6c-44.8 18-75.2 47.6-85.6 83.6-15.6 54 8.4 101.2 64.4 127.6 22.8 10.4 27.2 11.2 80 11.2s57.2-0.8 80-11.2c41.2-19.2 64-48 68.8-86.4 5.2-46.4-24-92.4-74-117.2-24.4-12.4-30-13.2-70.8-14-35.2-0.8-47.6 0.4-62.8 6.4z m102 38.8c10 3.2 26.4 13.2 36.4 22 35.2 31.2 38 68.4 6.8 96.8-21.6 19.6-40 24.8-86.4 24.8-46.4 0-64.8-5.2-86.4-24.8-31.2-28.4-28.4-65.6 6.8-96.8 10-8.8 25.6-18.4 34.8-22 22.4-7.6 65.2-8 88 0z"/><path d="M480.722 558.8c-5.6 5.6-2 25.2 5.2 30 4.8 3.6 8.4 11.2 9.2 21.2 1.2 15.6 1.6 16 17.2 16s16-0.4 16.4-15.2c0-10 3.2-17.6 8.8-22.8 9.6-9.2 11.6-20.8 4-26.8-5.6-4.4-56.8-6-60.8-2.4z m-168.8-78.4c-18.4 9.2-28 44.8-16.4 60 7.2 9.2 20.8 15.6 34 15.6 17.2 0 36.8-23.2 36.8-43.2 0-8-2.4-17.6-5.2-21.2-11.2-14.4-32-19.2-49.2-11.2z m364.4 0.4c-12.8 7.2-17.6 16-18 32 0 20 19.6 43.2 36.8 43.2 23.2 0 38.8-14 39.2-35.2 0-32.8-32-54.8-58-40z"/></svg>`,
   vllm_embedding: `<svg viewBox="0 0 1024 1024" aria-hidden="true"><path d="M412.16 922.688L64 249.664h348.16v673.024z"/><path d="M667.392 922.688H412.096L586.24 226.432 899.392 64 667.328 922.688z"/></svg>`,
@@ -28,6 +30,8 @@ function providerIconSvg(type) {
 function providerTypeName(type) {
   return {
     openai_embedding: "OpenAI Embedding",
+    gemini_embedding: "Gemini Embedding",
+    nvidia_embedding: "NVIDIA Embedding",
     ollama_embedding: "Ollama Embedding",
     vllm_embedding: "vLLM Embedding",
     vllm_rerank: "vLLM Rerank",
@@ -40,6 +44,8 @@ function providerTypeName(type) {
 function providerTypeDescription(type) {
   return {
     openai_embedding: "连接 OpenAI 官方或兼容 Embedding 接口。",
+    gemini_embedding: "连接 Google Gemini Embedding API，支持指定输出向量维度。",
+    nvidia_embedding: "连接 NVIDIA NIM Embedding API，支持 input_type。",
     ollama_embedding: "连接 Ollama /api/embed 接口。",
     vllm_embedding: "适配 vLLM OpenAI-compatible Embedding，自动对齐 served-model-name。",
     vllm_rerank: "适配 vLLM / OpenAI-compatible Rerank 接口。",
@@ -339,6 +345,7 @@ function applyProviderFormKind(provider) {
   setProviderRowVisible("provider-instruct-row", type === "bailian_rerank");
   setProviderRowVisible("provider-model-endpoint-row", type === "nvidia_rerank");
   setProviderRowVisible("provider-truncate-row", type === "nvidia_rerank");
+  setProviderRowVisible("provider-input-type-row", type === "nvidia_embedding");
   setProviderRowVisible("provider-launch-model-row", type === "xinference_rerank");
 }
 
@@ -392,6 +399,8 @@ function refreshProviderContextDraftLock() {
 
 function providerHintText(type) {
   return {
+    gemini_embedding: "Gemini Embedding 使用 batchEmbedContents，并按嵌入维度发送 outputDimensionality。",
+    nvidia_embedding: "NVIDIA Embedding 使用 OpenAI-compatible /embeddings，并额外发送 input_type 与 float 编码。",
     vllm_embedding: "vLLM Provider 会自动忽略 dimensions，并尝试将模型名对齐到 served-model-name。",
     ollama_embedding: "Ollama Provider 使用 /api/tags 获取模型，并通过 /api/embed 生成向量。",
     openai_embedding: "OpenAI Provider 支持官方及兼容接口；维度大于 0 时会发送 dimensions。",
@@ -404,7 +413,9 @@ function providerHintText(type) {
 
 function openProviderEditor(provider, creating = false) {
   const kind = providerKindOf(provider);
-  const blankEmbeddingDraft = creating && kind !== "rerank";
+  const blankEmbeddingDraft = creating
+    && kind !== "rerank"
+    && !["gemini_embedding", "nvidia_embedding"].includes(provider.type);
   const apiBaseValue = blankEmbeddingDraft ? "" : (provider.api_base || "");
   const modelValue = blankEmbeddingDraft ? "" : (provider.model || "");
   const dimensionsValue = blankEmbeddingDraft ? "" : (provider.dimensions ?? 0);
@@ -430,6 +441,7 @@ function openProviderEditor(provider, creating = false) {
   $("provider-instruct").value = provider.instruct || "";
   $("provider-model-endpoint").value = provider.model_endpoint || "";
   $("provider-truncate").value = provider.truncate || "";
+  $("provider-input-type").value = provider.input_type || "passage";
   $("provider-launch-model").checked = Boolean(provider.launch_model_if_not_running);
   $("provider-timeout").value = provider.timeout_seconds || 30;
   $("provider-proxy").value = provider.proxy || "";
@@ -472,6 +484,7 @@ function providerFormPayload() {
     instruct: $("provider-instruct").value.trim(),
     model_endpoint: $("provider-model-endpoint").value.trim(),
     truncate: $("provider-truncate").value.trim(),
+    input_type: type === "nvidia_embedding" ? $("provider-input-type").value : "",
     launch_model_if_not_running: $("provider-launch-model").checked,
     timeout_seconds: Number($("provider-timeout").value),
     proxy: $("provider-proxy").value.trim(),

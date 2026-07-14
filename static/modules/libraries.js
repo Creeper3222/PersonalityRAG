@@ -981,6 +981,7 @@ $("import-form")?.addEventListener("submit", async (event) => {
     navigate,
     bindUsedListDetails,
     confirmSensitiveProviderEdit,
+    markLibraryIndexConflict,
     clearLibraryIndexConflict,
   };
 }

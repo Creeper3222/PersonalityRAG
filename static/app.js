@@ -72,6 +72,12 @@ const state = {
     summary: null,
   },
   settings: null,
+  updates: {
+    status: null,
+    releases: [],
+    timer: null,
+    switching: false,
+  },
   loginMode: "api_key",
   authGeneration: 0,
   systemProviderExpanded: false,
@@ -320,6 +326,8 @@ const api = createApiClient({
 const {
   requestBackupPassword, requestBackupExportScope,
   settingsDraft, hasUnsavedSettingsChanges, showRestartScreen, loadSettings,
+  loadUpdateStatus, openVersionSelector, refreshUpdateReleases,
+  checkLastUpdateTransaction,
 } = createSettingsController({
   $, state, t, api, toast,
   stopLogPolling: (...args) => stopLogPolling(...args),
@@ -327,6 +335,8 @@ const {
   resetTaskState: (...args) => resetTaskState(...args),
   isValidPage,
   restartReturnPage: RESTART_RETURN_PAGE,
+  escapeHtml,
+  confirmDialog,
 });
 function libraryApi(path, options = {}) {
   if (!state.selectedLibraryId) {
@@ -435,6 +445,8 @@ function showLogin() {
   if (!$("app").classList.contains("hidden")) {
     state.authGeneration += 1;
   }
+  if (state.updates.timer) clearInterval(state.updates.timer);
+  state.updates.timer = null;
   $("login").classList.remove("hidden");
   $("app").classList.add("hidden");
 }
@@ -442,6 +454,11 @@ function showLogin() {
 function showApp() {
   $("login").classList.add("hidden");
   $("app").classList.remove("hidden");
+  loadUpdateStatus().catch(() => {});
+  checkLastUpdateTransaction().catch(() => {});
+  if (!state.updates.timer) {
+    state.updates.timer = setInterval(() => loadUpdateStatus().catch(() => {}), 15 * 60 * 1000);
+  }
 }
 
 function displayStatus(status) {
@@ -776,10 +793,11 @@ const {
   loadLibraries: (...args) => loadLibraries(...args),
   loadGraph, loadMemories, loadSystem,
   confirmDialog,
+  markLibraryIndexConflict: (...args) => markLibraryIndexConflict(...args),
   clearLibraryIndexConflict: (...args) => clearLibraryIndexConflict(...args),
   refreshLibraryContext,
 });
-const { loadLibraries, ensureLibrarySelection, navigate, bindUsedListDetails, confirmSensitiveProviderEdit, clearLibraryIndexConflict } = createLibrariesController({
+const { loadLibraries, ensureLibrarySelection, navigate, bindUsedListDetails, confirmSensitiveProviderEdit, markLibraryIndexConflict, clearLibraryIndexConflict } = createLibrariesController({
   $, state, t, toast, api, libraryApi, selectedLibrary, selectLibrary, refreshLibraryContext,
   escapeHtml, confirmDialog, addOptimisticTask, removeOptimisticTask, trackQueuedJob,
   validateIdentifierInput, LIBRARY_EXPAND_ICON,
@@ -925,6 +943,28 @@ $("settings-restart")?.addEventListener("click", async () => {
   } catch (error) {
     toast(error.message, true);
   }
+});
+
+$("updates-refresh")?.addEventListener("click", async () => {
+  try {
+    await refreshUpdateReleases();
+    toast(t("updateCheckComplete"));
+  } catch (error) {
+    toast(error.message, true);
+  }
+});
+
+$("updates-select")?.addEventListener("click", async () => {
+  try {
+    await openVersionSelector();
+  } catch (error) {
+    toast(error.message, true);
+  }
+});
+
+$("update-available-badge")?.addEventListener("click", async () => {
+  await activatePage("settings");
+  await openVersionSelector();
 });
 
 function closeOverlay(id) {

@@ -12,6 +12,7 @@ import uvicorn
 import personalityrag.app as app_module
 from personalityrag.config import build_access_url
 from personalityrag.instance_lock import InstanceLock, SingleInstanceError
+from personalityrag.version import display_version
 
 
 ROOT = Path(__file__).resolve().parent
@@ -135,7 +136,7 @@ if __name__ == "__main__":
 
         url = build_access_url(config.access_base_url, actual_port)
         api_url = build_access_url(config.access_base_url, actual_access_port)
-        print("[PersonalityRAG] v0.1.0")
+        print(f"[PersonalityRAG] {display_version()}")
         print(f"[PersonalityRAG] WebUI: {url}")
         print(f"[PersonalityRAG] 记忆库接入: {api_url}")
         if config.webui_password_hash:

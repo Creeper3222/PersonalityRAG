@@ -56,9 +56,9 @@ def test_http_route_contract() -> None:
         if method != "HEAD"
     )
 
-    assert len(routes) == 96
+    assert len(routes) == 105
     assert _stable_hash(routes) == (
-        "f07c733ea8bd1436d62db4f4c6db0557b8e5b4e11b8ddafa658e1db934e60422"
+        "25cfebc76b7fffc7770c430964f8cc3cf51131775796a6bff9729cf7458c4ec4"
     )
     assert ("POST", "/api/v1/providers/test", "provider_test_compat") in routes
     assert ("POST", "/api/v1/recall", "recall") in routes
@@ -74,11 +74,14 @@ def test_http_route_contract() -> None:
     ) in routes
     assert ("GET", "/api/v1/files", "list_files") in routes
     assert ("POST", "/api/v1/files/download", "download_files") in routes
+    assert ("GET", "/api/v1/updates/status", "update_status") in routes
+    assert ("GET", "/api/v1/updates/releases", "update_releases") in routes
+    assert ("POST", "/api/v1/updates/switch", "switch_version") in routes
 
 
 def test_openapi_contract() -> None:
     assert _stable_hash(app_module.app.openapi()) == (
-        "97e17153d0a4246fdae84cda4d36ed8574351a78fb203ccb388bc8614caaa9e2"
+        "e19aa8f5b24e0db352621f6cac24bb6709898aabb3940f5c8a491af2e3b4b727"
     )
 
 
@@ -96,9 +99,9 @@ def test_webui_dom_id_contract() -> None:
     html = (REPO_ROOT / "static" / "index.html").read_text(encoding="utf-8")
     dom_ids = sorted(set(re.findall(r'\bid="([^"]+)"', html)))
 
-    assert len(dom_ids) == 348
+    assert len(dom_ids) == 363
     assert _stable_hash(dom_ids) == (
-        "9b27ab61938e767dcd39f68a30b98e394ff73d4e31dac8a34b962c3e54620cee"
+        "6291a566225033555dfc9eb0c8bce2854dd2e32b0d914840c738775871d20b23"
     )
     assert "page-files" in dom_ids
     assert "file-table-body" in dom_ids
@@ -106,6 +109,9 @@ def test_webui_dom_id_contract() -> None:
     assert "task-history-panel" in dom_ids
     assert "task-history-primary" in dom_ids
     assert "task-history-toggle" in dom_ids
+    assert "tasks-finished-clear" in dom_ids
+    assert "update-available-badge" in dom_ids
+    assert "updates-modal" in dom_ids
 
 
 def test_settings_panels_keep_consistent_vertical_spacing() -> None:
@@ -191,6 +197,7 @@ async def test_health_and_settings_core_fields_remain_stable() -> None:
         "deployment_mode",
         "managed_settings",
         "runtime_residency",
+        "version",
     }
 
     assert set(app_module._settings_payload()) == settings_fields

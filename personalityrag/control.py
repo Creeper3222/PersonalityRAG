@@ -23,6 +23,7 @@ from .providers import (
     provider_kind,
     provider_config_hash,
 )
+from .version import VERSION
 from .repositories import (
     AdapterRepository,
     JobRepository,
@@ -213,6 +214,11 @@ class ControlStore:
                     message TEXT NOT NULL DEFAULT '',
                     result TEXT,
                     error TEXT,
+                    operation TEXT,
+                    checkpoint TEXT,
+                    status_reason TEXT NOT NULL DEFAULT '',
+                    control_requested TEXT,
+                    resumable INTEGER NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -250,6 +256,15 @@ class ControlStore:
                 """
             )
             await self._ensure_column(db, "jobs", "library_id", "TEXT")
+            await self._ensure_column(db, "jobs", "operation", "TEXT")
+            await self._ensure_column(db, "jobs", "checkpoint", "TEXT")
+            await self._ensure_column(
+                db, "jobs", "status_reason", "TEXT NOT NULL DEFAULT ''"
+            )
+            await self._ensure_column(db, "jobs", "control_requested", "TEXT")
+            await self._ensure_column(
+                db, "jobs", "resumable", "INTEGER NOT NULL DEFAULT 0"
+            )
             await self._ensure_column(db, "migration_runs", "library_id", "TEXT")
             await self._ensure_column(db, "libraries", "rerank_provider_id", "TEXT")
             await self._ensure_column(
@@ -280,7 +295,8 @@ class ControlStore:
                 "TEXT",
             )
             await db.execute(
-                "INSERT OR REPLACE INTO schema_info(key,value) VALUES('service_version','0.1.0')"
+                "INSERT OR REPLACE INTO schema_info(key,value) VALUES('service_version',?)",
+                (VERSION,),
             )
             columns = {
                 row["name"]
@@ -1605,26 +1621,7 @@ class ControlStore:
                 )
             ).fetchone()
             if deleted_row and deleted_row["deleted_at"] is not None:
-                await db.execute(
-                    "DELETE FROM library_generation_bindings WHERE library_id=?",
-                    (library_id,),
-                )
-                await db.execute(
-                    "DELETE FROM index_generations WHERE library_id=?",
-                    (library_id,),
-                )
-                await db.execute(
-                    "DELETE FROM migration_runs WHERE library_id=?",
-                    (library_id,),
-                )
-                await db.execute(
-                    "DELETE FROM jobs WHERE library_id=?",
-                    (library_id,),
-                )
-                await db.execute(
-                    "DELETE FROM libraries WHERE id=? AND deleted_at IS NOT NULL",
-                    (library_id,),
-                )
+                await self._delete_soft_deleted_library_row(db, library_id)
             await db.execute(
                 """INSERT INTO libraries
                 (id,name,description,default_persona_id,is_default,provider_id,
@@ -1713,6 +1710,34 @@ class ControlStore:
         finally:
             await db.close()
 
+    async def _delete_soft_deleted_library_row(
+        self, db: aiosqlite.Connection, library_id: str
+    ) -> None:
+        await db.execute(
+            "DELETE FROM library_generation_bindings WHERE library_id=?",
+            (library_id,),
+        )
+        await db.execute(
+            "DELETE FROM index_generations WHERE library_id=?",
+            (library_id,),
+        )
+        await db.execute(
+            "DELETE FROM migration_runs WHERE library_id=?",
+            (library_id,),
+        )
+        await db.execute(
+            "DELETE FROM jobs WHERE library_id=?",
+            (library_id,),
+        )
+        await db.execute(
+            "DELETE FROM adapter_connections WHERE library_id=?",
+            (library_id,),
+        )
+        await db.execute(
+            "DELETE FROM libraries WHERE id=? AND deleted_at IS NOT NULL",
+            (library_id,),
+        )
+
     async def list_libraries(self) -> list[LibraryRecord]:
         rows = await self.library_repository.list_rows()
         return [self._library_row(row) for row in rows]
@@ -1760,8 +1785,12 @@ class ControlStore:
                         (next_library_id,),
                     )
                 ).fetchone()
-                if occupied:
+                if occupied and occupied["deleted_at"] is None:
                     raise ValueError(f"记忆库 ID 已存在：{next_library_id}")
+                if occupied:
+                    await self._delete_soft_deleted_library_row(
+                        db, next_library_id
+                    )
                 for table, column in (
                     ("library_generation_bindings", "manifest_json"),
                     ("index_generations", "manifest"),
@@ -1947,7 +1976,7 @@ class ControlStore:
                     await (
                         await db.execute(
                             """SELECT COUNT(*) FROM jobs WHERE library_id=?
-                            AND status IN ('queued','running')""",
+                            AND status IN ('queued','running','pausing','paused','interrupted','stopping')""",
                             (library_id,),
                         )
                     ).fetchone()
@@ -1965,7 +1994,7 @@ class ControlStore:
                     await (
                         await db.execute(
                             """SELECT COUNT(*) FROM jobs
-                            WHERE status IN ('queued','running')"""
+                            WHERE status IN ('queued','running','pausing','paused','interrupted','stopping')"""
                         )
                     ).fetchone()
                 )[0]

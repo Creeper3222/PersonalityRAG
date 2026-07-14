@@ -20,11 +20,15 @@ services:
       - type: bind
         source: ${PERSONALITYRAG_STATE_DIR:-./runtime}
         target: /app/state
+      - type: bind
+        source: ${PERSONALITYRAG_DOCKER_SOCKET:-/var/run/docker.sock}
+        target: /var/run/docker.sock
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       PERSONALITYRAG_DEPLOYMENT: docker
       PERSONALITYRAG_STATE_ROOT: /app/state
+      PERSONALITYRAG_DOCKER_SOCKET: /var/run/docker.sock
       PERSONALITYRAG_SUPPRESS_BROWSER: "1"
       PERSONALITYRAG_DEFAULT_EMBEDDING_API_BASE: ${PERSONALITYRAG_DEFAULT_EMBEDDING_API_BASE:-http://host.docker.internal:8001/v1}

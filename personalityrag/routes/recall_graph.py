@@ -9,7 +9,6 @@ from fastapi import (
     HTTPException,
 )
 
-from ..application_context import manager
 from ..http_shared import (
     jobs,
     require_auth,
@@ -203,9 +202,9 @@ async def rebuild_graph(library_id: str | None = None):
         target.library_id,
         (target.indexes.status() or {}).get("generation") or "",
     )
-    job_id = await jobs().start(
+    job_id = await jobs().start_resumable(
         "graph_rebuild",
-        lambda progress: manager.rebuild_graph(target.library_id, progress),
+        {},
         library_id=target.library_id,
     )
     logger.warning("图记忆重建任务已创建：library_id=%s job_id=%s", target.library_id, job_id)

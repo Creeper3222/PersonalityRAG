@@ -19,6 +19,7 @@ from .control import ProviderRevision
 from .providers import build_provider, build_rerank_provider, provider_config_hash
 from .retrieval import RetrievalEngine, SearchResult
 from .storage import Storage
+from .task_control import JobControlSignal
 from .text import TextProcessor
 
 
@@ -633,9 +634,13 @@ class PersonalityRAGService:
             f"{evidence}"
         )
 
-    async def rebuild_indexes(self, progress=None) -> dict[str, Any]:
+    async def rebuild_indexes(
+        self, progress=None, *, job_context=None, checkpoint_dir=None
+    ) -> dict[str, Any]:
         async with self._mutation_lock:
-            return await self._rebuild_indexes_unlocked(progress)
+            return await self._rebuild_indexes_unlocked(
+                progress, job_context=job_context, checkpoint_dir=checkpoint_dir
+            )
 
     @staticmethod
     def _graph_recovery_reason(report: dict[str, Any]) -> str:
@@ -753,7 +758,9 @@ class PersonalityRAGService:
         )
         return {"graph": graph, "before": before, "after": after}
 
-    async def _rebuild_indexes_unlocked(self, progress=None) -> dict[str, Any]:
+    async def _rebuild_indexes_unlocked(
+        self, progress=None, *, job_context=None, checkpoint_dir=None
+    ) -> dict[str, Any]:
         started = time.perf_counter()
         logger.warning(
             "索引重建开始：library_id=%s provider=%s revision=%s",
@@ -782,6 +789,8 @@ class PersonalityRAGService:
                 self.provider_revision.config.index_rebuild_settings
             ),
             progress=index_progress if progress else None,
+            job_context=job_context,
+            checkpoint_dir=checkpoint_dir,
         )
         self.retrieval.invalidate()
         logger.warning(
@@ -792,7 +801,9 @@ class PersonalityRAGService:
         )
         return {"graph_recovery": graph_recovery, "fts": fts, "manifest": manifest}
 
-    async def rebuild_graph(self, progress=None) -> dict[str, Any]:
+    async def rebuild_graph(
+        self, progress=None, *, job_context=None, checkpoint_dir=None
+    ) -> dict[str, Any]:
         async with self._mutation_lock:
             started = time.perf_counter()
             logger.warning("图记忆重建开始：library_id=%s", self.library_id)
@@ -815,6 +826,8 @@ class PersonalityRAGService:
                     self.provider_revision.config.index_rebuild_settings
                 ),
                 progress=index_progress if progress else None,
+                job_context=job_context,
+                checkpoint_dir=checkpoint_dir,
             )
             self.retrieval.invalidate()
             logger.warning(
@@ -829,6 +842,9 @@ class PersonalityRAGService:
         self,
         provider_revision: ProviderRevision,
         progress=None,
+        *,
+        job_context=None,
+        checkpoint_dir=None,
     ) -> dict[str, Any]:
         started = time.perf_counter()
         logger.warning(
@@ -872,7 +888,18 @@ class PersonalityRAGService:
                     provider_revision=provider_revision.revision,
                     provider_config_sha256=provider_revision.config_sha256,
                     provider_model=provider_revision.config.model,
+                    job_context=job_context,
+                    checkpoint_dir=checkpoint_dir,
                 )
+            except JobControlSignal:
+                logger.info(
+                    "Provider 切换重建已到达任务控制边界：library_id=%s provider=%s revision=%s",
+                    self.library_id,
+                    provider_revision.provider_id,
+                    provider_revision.revision,
+                )
+                await candidate.close()
+                raise
             except Exception:
                 logger.exception(
                     "Provider 切换重建失败，保留旧索引：library_id=%s provider=%s revision=%s",

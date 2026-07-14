@@ -9,6 +9,7 @@ from .memories import router as memories_router
 from .providers import router as providers_router
 from .recall_graph import router as recall_graph_router
 from .tasks_migration import router as tasks_migration_router
+from .updates import router as updates_router
 
 
 ROUTERS = (
@@ -21,4 +22,5 @@ ROUTERS = (
     recall_graph_router,
     tasks_migration_router,
     diagnostics_router,
+    updates_router,
 )

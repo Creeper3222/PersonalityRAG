@@ -33,6 +33,37 @@ PROVIDER_TEMPLATES: dict[str, dict[str, Any]] = {
         "concurrency": 2,
         "max_retries": 5,
     },
+    "gemini_embedding": {
+        "type": "gemini_embedding",
+        "display_name": "Gemini Embedding",
+        "api_base": "https://generativelanguage.googleapis.com/v1beta",
+        "api_key": "",
+        "model": "gemini-embedding-exp-03-07",
+        "dimensions": 768,
+        "max_context_tokens": 0,
+        "max_context_tokens_source": "",
+        "timeout_seconds": 20,
+        "proxy": "",
+        "batch_size": 64,
+        "concurrency": 2,
+        "max_retries": 5,
+    },
+    "nvidia_embedding": {
+        "type": "nvidia_embedding",
+        "display_name": "NVIDIA Embedding",
+        "api_base": "https://integrate.api.nvidia.com/v1",
+        "api_key": "",
+        "model": "nvidia/llama-nemotron-embed-1b-v2",
+        "dimensions": 1024,
+        "max_context_tokens": 0,
+        "max_context_tokens_source": "",
+        "timeout_seconds": 20,
+        "proxy": "",
+        "batch_size": 64,
+        "concurrency": 2,
+        "max_retries": 5,
+        "input_type": "passage",
+    },
     "ollama_embedding": {
         "type": "ollama_embedding",
         "display_name": "Ollama Embedding",
@@ -134,6 +165,8 @@ PROVIDER_TEMPLATES: dict[str, dict[str, Any]] = {
 
 EMBEDDING_PROVIDER_TYPES = {
     "openai_embedding",
+    "gemini_embedding",
+    "nvidia_embedding",
     "ollama_embedding",
     "vllm_embedding",
     "openai_compatible",
@@ -297,6 +330,7 @@ class HTTPEmbeddingProvider(EmbeddingProvider):
         "max_position_embeddings",
         "n_ctx",
         "num_ctx",
+        "inputTokenLimit",
     )
 
     def __init__(self, config: ProviderConfig):
@@ -340,6 +374,9 @@ class HTTPEmbeddingProvider(EmbeddingProvider):
             str(item.get("name") or "").casefold(),
             str(item.get("model") or "").casefold(),
         }
+        candidates.update(
+            value.rsplit("/", 1)[-1] for value in tuple(candidates) if value
+        )
         return configured in candidates or basename in candidates
 
     @classmethod
@@ -530,6 +567,104 @@ class OpenAIEmbeddingProvider(HTTPEmbeddingProvider):
 
         vectors = await self._retry(request)
         self._resolved_model = self.config.model
+        return self._validate_vectors(vectors, len(texts))
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+
+class GeminiEmbeddingProvider(HTTPEmbeddingProvider):
+    def __init__(self, config: ProviderConfig):
+        super().__init__(config)
+        api_base = config.api_base.rstrip("/")
+        if not api_base.endswith(("/v1", "/v1beta")):
+            api_base += "/v1beta"
+        self.api_base = api_base
+        self.model = config.model.strip().removeprefix("models/")
+        kwargs: dict[str, Any] = {
+            "base_url": api_base,
+            "timeout": config.timeout_seconds,
+            "trust_env": not self._is_local_or_private(api_base),
+        }
+        if config.proxy:
+            kwargs["proxy"] = config.proxy
+            kwargs["trust_env"] = False
+        if config.api_key:
+            kwargs["headers"] = {"x-goog-api-key": config.api_key}
+        self._client = httpx.AsyncClient(**kwargs)
+        self._resolved_model = self.model
+
+    async def list_models(self) -> list[dict[str, Any]]:
+        response = await self._client.get("/models", params={"pageSize": 1000})
+        response.raise_for_status()
+        return list(response.json().get("models") or [])
+
+    async def get_embeddings(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+
+        async def request():
+            model_path = f"models/{self.model}"
+            requests = []
+            for text in texts:
+                item: dict[str, Any] = {
+                    "model": model_path,
+                    "content": {"parts": [{"text": text}]},
+                }
+                if self.config.dimensions > 0:
+                    item["outputDimensionality"] = self.config.dimensions
+                requests.append(item)
+            response = await self._client.post(
+                f"/models/{self.model}:batchEmbedContents",
+                json={"requests": requests},
+            )
+            response.raise_for_status()
+            return [
+                list(map(float, item.get("values") or []))
+                for item in response.json().get("embeddings") or []
+            ]
+
+        vectors = await self._retry(request)
+        return self._validate_vectors(vectors, len(texts))
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+
+class NvidiaEmbeddingProvider(HTTPEmbeddingProvider):
+    def __init__(self, config: ProviderConfig):
+        super().__init__(config)
+        self.api_base = config.api_base.rstrip("/").removesuffix("/embeddings")
+        self._client = self._http_client(base_url=self.api_base)
+        self._resolved_model = config.model
+
+    async def list_models(self) -> list[dict[str, Any]]:
+        response = await self._client.get("/models")
+        response.raise_for_status()
+        return list(response.json().get("data") or [])
+
+    async def get_embeddings(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+
+        async def request():
+            response = await self._client.post(
+                "/embeddings",
+                json={
+                    "input": texts,
+                    "model": self.config.model,
+                    "input_type": self.config.input_type or "passage",
+                    "encoding_format": "float",
+                },
+            )
+            response.raise_for_status()
+            data = sorted(
+                response.json().get("data") or [],
+                key=lambda item: int(item.get("index", 0)),
+            )
+            return [list(map(float, item.get("embedding") or [])) for item in data]
+
+        vectors = await self._retry(request)
         return self._validate_vectors(vectors, len(texts))
 
     async def close(self) -> None:
@@ -1047,6 +1182,10 @@ def build_provider(config: ProviderConfig) -> EmbeddingProvider:
         raise ValueError(f"Provider 类型不是 Embedding: {config.type}")
     if config.type == "openai_embedding":
         return OpenAIEmbeddingProvider(config)
+    if config.type == "gemini_embedding":
+        return GeminiEmbeddingProvider(config)
+    if config.type == "nvidia_embedding":
+        return NvidiaEmbeddingProvider(config)
     if config.type == "ollama_embedding":
         return OllamaEmbeddingProvider(config)
     if config.type in {"vllm_embedding", "openai_compatible"}:

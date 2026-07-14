@@ -1,4 +1,6 @@
 """Independent personality-memory RAG service."""
 
-__version__ = "0.1.0"
+from .version import VERSION
 
+
+__version__ = VERSION

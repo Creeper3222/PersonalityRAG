@@ -11,6 +11,7 @@ from .config import AppConfig, load_config
 from .file_manager import FileManager
 from .libraries import LibraryManager
 from .logger import configure_logging
+from .updates import UpdateService
 
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +56,7 @@ class ApplicationContext:
     auth: AuthManager
     manager: LibraryManager
     file_manager: FileManager
+    updates: UpdateService
     process_shutdown_callback: Callable[[], None] | None = None
     restart_in_progress: bool = False
 
@@ -100,6 +102,7 @@ class ApplicationContext:
             auth=auth,
             manager=LibraryManager(state, app_config),
             file_manager=file_manager,
+            updates=UpdateService(source, state),
         )
 
 

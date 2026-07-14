@@ -129,7 +129,7 @@ class JobRepository(_Repository):
                     f"""SELECT * FROM jobs
                     WHERE library_id IN ({library_placeholders})
                     AND kind IN ({kind_placeholders})
-                    AND status IN ('queued','running')
+                    AND status IN ('queued','running','pausing','paused','interrupted','stopping')
                     ORDER BY created_at""",
                     (*library_ids, *ADAPTER_BUSY_JOB_KINDS),
                 )

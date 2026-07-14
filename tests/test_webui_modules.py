@@ -86,10 +86,45 @@ def test_finished_task_history_uses_collapsible_panel() -> None:
     assert 'finishedExpanded: false' in app_source
     assert 'id="task-history-panel"' in html
     assert 'id="task-history-toggle"' in html
+    assert 'id="tasks-finished-clear"' in html
     assert 'class="library-expand-toggle task-history-toggle hidden"' in html
     assert ".task-history-panel.task-history-panel-collapsed" in styles
+    assert ".task-tabs #tasks-finished-clear{margin-left:auto}" in styles
     assert "function applyTaskHistoryCollapseState()" in tasks_logs_source
+    assert 'api("/jobs/finished/clear", { method: "POST" })' in tasks_logs_source
+    assert 'renderFinishedTaskClearButton()' in tasks_logs_source
     assert 'state.tasks.finishedExpanded = !state.tasks.finishedExpanded;' in tasks_logs_source
+
+
+def test_task_controller_receives_both_library_index_conflict_callbacks() -> None:
+    app_source = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    libraries_source = (STATIC_ROOT / "modules" / "libraries.js").read_text(
+        encoding="utf-8"
+    )
+    tasks_logs_source = (STATIC_ROOT / "modules" / "tasks-logs.js").read_text(
+        encoding="utf-8"
+    )
+
+    controller_signature = tasks_logs_source.split("{", 1)[1].split("}", 1)[0]
+    assert "markLibraryIndexConflict" in controller_signature
+    assert "clearLibraryIndexConflict" in controller_signature
+    assert (
+        "markLibraryIndexConflict: (...args) => markLibraryIndexConflict(...args)"
+        in app_source
+    )
+    assert (
+        "clearLibraryIndexConflict: (...args) => clearLibraryIndexConflict(...args)"
+        in app_source
+    )
+    library_controller_return = libraries_source.rsplit("return {", 1)[1].split(
+        "};", 1
+    )[0]
+    assert "markLibraryIndexConflict" in library_controller_return
+    assert "clearLibraryIndexConflict" in library_controller_return
+    assert (
+        "confirmSensitiveProviderEdit, markLibraryIndexConflict, clearLibraryIndexConflict"
+        in app_source
+    )
 
 
 def test_log_window_hides_debug_by_default() -> None:
@@ -248,3 +283,15 @@ def test_memory_source_types_have_localized_display_labels() -> None:
     assert 'MANUAL: t("typeManual")' in source
     for value in ("GENERAL", "GROUP_CHAT", "PRIVATE_CHAT", "MANUAL"):
         assert f'<option value="{value}"' in html
+
+
+def test_settings_module_exposes_version_switch_workflow() -> None:
+    source = (STATIC_ROOT / "modules" / "settings.js").read_text(encoding="utf-8")
+    html = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
+
+    assert 'api("/updates/switch"' in source
+    assert 'api(`/updates/status' in source
+    assert 'api(`/updates/releases' in source
+    assert "data-update-tag" in source
+    assert 'id="update-available-badge"' in html
+    assert 'id="updates-modal-busy"' in html

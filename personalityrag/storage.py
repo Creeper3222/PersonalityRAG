@@ -13,6 +13,7 @@ import aiosqlite
 
 from .atoms import compute_atom_ttl
 from .migration import sha256_file
+from .version import VERSION
 
 
 def normalize_metadata(value: Any) -> dict[str, Any]:
@@ -183,6 +184,11 @@ class Storage:
                     message TEXT NOT NULL DEFAULT '',
                     result TEXT,
                     error TEXT,
+                    operation TEXT,
+                    checkpoint TEXT,
+                    status_reason TEXT NOT NULL DEFAULT '',
+                    control_requested TEXT,
+                    resumable INTEGER NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -204,6 +210,15 @@ class Storage:
             }
             if "library_id" not in job_columns:
                 await db.execute("ALTER TABLE jobs ADD COLUMN library_id TEXT")
+            for name, sql_type in (
+                ("operation", "TEXT"),
+                ("checkpoint", "TEXT"),
+                ("status_reason", "TEXT NOT NULL DEFAULT ''"),
+                ("control_requested", "TEXT"),
+                ("resumable", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if name not in job_columns:
+                    await db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {sql_type}")
             migration_columns = {
                 row["name"]
                 for row in await (
@@ -215,7 +230,8 @@ class Storage:
                     "ALTER TABLE migration_runs ADD COLUMN library_id TEXT"
                 )
             await db.execute(
-                "INSERT OR REPLACE INTO schema_info(key,value) VALUES('service_version','0.1.0')"
+                "INSERT OR REPLACE INTO schema_info(key,value) VALUES('service_version',?)",
+                (VERSION,),
             )
             await db.commit()
         await self._initialize_conversations()
@@ -888,8 +904,8 @@ class Storage:
             ).fetchall()
         return [self._document_row(row) for row in rows]
 
-    async def iter_documents(self, batch_size: int = 500):
-        last_id = 0
+    async def iter_documents(self, batch_size: int = 500, *, after_id: int = 0):
+        last_id = max(0, int(after_id))
         while True:
             async with self.connect() as db:
                 rows = await (
@@ -904,8 +920,10 @@ class Storage:
             yield [self._document_row(row) for row in rows]
             last_id = int(rows[-1]["id"])
 
-    async def iter_graph_entries(self, batch_size: int = 500):
-        last_id = 0
+    async def iter_graph_entries(
+        self, batch_size: int = 500, *, after_id: int = 0
+    ):
+        last_id = max(0, int(after_id))
         while True:
             async with self.connect() as db:
                 rows = await (

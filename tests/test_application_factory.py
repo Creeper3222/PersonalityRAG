@@ -91,6 +91,37 @@ async def test_request_id_is_preserved_or_generated(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_update_status_is_authenticated_and_context_scoped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context(tmp_path, "updates", AppConfig(api_key="fixture-key"))
+    application = create_app(context)
+
+    async def status(*, refresh: bool = False):
+        return {"current_version": "0.1.0", "update_available": False, "refresh": refresh}
+
+    monkeypatch.setattr(context.updates, "status", status)
+    async with AsyncClient(
+        transport=ASGITransport(app=application),
+        base_url="http://test:8765",
+    ) as client:
+        rejected = await client.get("/api/v1/updates/status")
+        accepted = await client.get(
+            "/api/v1/updates/status?refresh=true",
+            headers={"Authorization": "Bearer fixture-key"},
+        )
+
+    assert rejected.status_code == 401
+    assert accepted.status_code == 200
+    assert accepted.json() == {
+        "current_version": "0.1.0",
+        "update_available": False,
+        "refresh": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_log_poll_is_silent_and_heartbeat_does_not_raise_slow_warning(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

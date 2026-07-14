@@ -32,7 +32,8 @@ ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="PersonalityRAG Linux" \
       org.opencontainers.image.version="${PERSONALITYRAG_VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.source="https://github.com/Creeper3222/PersonalityRAG/tree/Linux-Docker"
+      org.opencontainers.image.source="https://github.com/Creeper3222/PersonalityRAG/tree/Linux-Docker" \
+      io.personalityrag.platform="linux-docker"
 
 COPY personalityrag ./personalityrag
 COPY static ./static

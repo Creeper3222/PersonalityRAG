@@ -36,8 +36,10 @@ from .providers import (
     config_from_dict,
     provider_kind,
 )
+from .resumable_tasks import ResumableLibraryTasks
 from .service import PersonalityRAGService, scan_library_backups
 from .storage import Storage
+from .task_control import JobControlSignal, JobInterrupted
 
 
 DEFAULT_LIBRARY_ID = "Default"
@@ -81,6 +83,7 @@ class LibraryManager:
         self._runtime_sweeper_task: asyncio.Task[None] | None = None
         self._closing = False
         self.jobs: JobManager | None = None
+        self.resumable_tasks = ResumableLibraryTasks(self)
         self._provider_health_cache: dict[
             tuple[str, int, str], tuple[float, dict[str, Any]]
         ] = {}
@@ -114,7 +117,8 @@ class LibraryManager:
                 Storage(self.data_dir, system_path=self.system_path),
                 runtime_lease_factory=self.runtime_lease,
             )
-            await self.jobs.clear_for_startup()
+            self.jobs.set_operation_resolver(self.resumable_tasks.resolve)
+            await self.jobs.recover_for_startup()
             seed = await self.control.get_provider(self.config.provider.id)
             if not seed:
                 raise RuntimeError("默认 Provider 初始化失败")
@@ -1117,7 +1121,12 @@ class LibraryManager:
                 raise ValueError("记忆库已被适配器连接，不能修改 ID")
             if await self.control.has_running_jobs(record.id):
                 raise ValueError("记忆库存在进行中的任务，暂时不能修改 ID")
-            if await self._library_copy_target_reserved(next_library_id):
+            library_root = self.data_dir / "libraries"
+            if (
+                await self.control.get_library(next_library_id)
+                or (library_root / next_library_id).exists()
+                or any(library_root.glob(f".{next_library_id}.copying-*"))
+            ):
                 raise ValueError(f"记忆库 ID 已存在：{next_library_id}")
         if reload_runtime:
             await self.unload_runtime(record.id, reason="library_settings_changed")
@@ -1354,7 +1363,10 @@ class LibraryManager:
         progress=None,
         *,
         conversations_db: Path | None = None,
+        task_context=None,
+        checkpoint_dir: Path | None = None,
     ) -> dict[str, Any]:
+        controlled = task_context is not None and checkpoint_dir is not None
         record = await self.control.get_library(library_id)
         if not record:
             raise KeyError(library_id)
@@ -1373,15 +1385,24 @@ class LibraryManager:
                 validated_message += "与消息记录数据库"
             await progress(0.02, validated_message)
         runtime = await self.get_runtime(library_id)
-        if not await self.library_is_empty(library_id):
+        is_resume = bool(
+            controlled
+            and checkpoint_dir is not None
+            and (checkpoint_dir / "import-state.json").exists()
+        )
+        if not is_resume and not await self.library_is_empty(library_id):
             raise ValueError("只有全新空记忆库可以导入 livingmemory.db")
 
-        run_id = time.strftime("%Y%m%d-%H%M%S-") + os.urandom(4).hex()
+        run_id = (
+            str(task_context.job_id)
+            if controlled
+            else time.strftime("%Y%m%d-%H%M%S-") + os.urandom(4).hex()
+        )
         library_dir = self.data_dir / "libraries" / library_id
-        import_dir = library_dir / "imports" / run_id
+        import_dir = checkpoint_dir if controlled else library_dir / "imports" / run_id
         archive_dir = import_dir / "source_archive"
         report_dir = library_dir / "reports"
-        archive_dir.mkdir(parents=True, exist_ok=False)
+        archive_dir.mkdir(parents=True, exist_ok=True)
         report_dir.mkdir(parents=True, exist_ok=True)
         target_db = library_dir / "livingmemory.db"
         target_conversations_db = library_dir / "conversations.db"
@@ -1396,48 +1417,109 @@ class LibraryManager:
             run_id,
         )
         try:
+            phase_path = import_dir / "import-state.json"
+            phase = (
+                json.loads(phase_path.read_text(encoding="utf-8"))
+                if controlled and phase_path.exists()
+                else {"phase": "created"}
+            )
             if progress:
                 await progress(0.04, "正在归档上传的 livingmemory.db")
-            await run_blocking(
-                sqlite_backup,
-                source_db,
-                archive_dir / "livingmemory.db",
-            )
-            if conversations_db is not None:
-                await run_blocking(
-                    sqlite_backup,
-                    conversations_db,
-                    archive_dir / "conversations.db",
+            archived_db = archive_dir / "livingmemory.db"
+            archived_conversations = archive_dir / "conversations.db"
+            if phase.get("phase") == "created":
+                await run_blocking(sqlite_backup, source_db, archived_db)
+                if conversations_db is not None:
+                    await run_blocking(
+                        sqlite_backup,
+                        conversations_db,
+                        archived_conversations,
+                    )
+                if not controlled:
+                    if target_db.exists():
+                        await run_blocking(sqlite_backup, target_db, rollback_db)
+                    if target_conversations_db.exists():
+                        await run_blocking(
+                            sqlite_backup,
+                            target_conversations_db,
+                            rollback_conversations_db,
+                        )
+                phase = {
+                    "phase": "source_archived",
+                    "source_sha256": self._sha256(archived_db),
+                    "conversations_sha256": (
+                        self._sha256(archived_conversations)
+                        if archived_conversations.exists()
+                        else ""
+                    ),
+                    "saved_at": time.time(),
+                }
+                phase_path.write_text(
+                    json.dumps(phase, ensure_ascii=False, indent=2), encoding="utf-8"
                 )
-            if target_db.exists():
-                await run_blocking(sqlite_backup, target_db, rollback_db)
-            if target_conversations_db.exists():
-                await run_blocking(
-                    sqlite_backup,
-                    target_conversations_db,
-                    rollback_conversations_db,
-                )
+                if controlled:
+                    await task_context.checkpoint(
+                        {"phase": "source_archived", "saved_at": time.time()},
+                        progress=0.05,
+                        message="导入源与任务前状态已安全归档",
+                    )
             if progress:
                 await progress(0.06, "正在替换目标空库核心数据库")
-            await self.unload_runtime(library_id, reason="livingmemory_import")
-            for db_path in (target_db, target_conversations_db):
-                for suffix in ("-wal", "-shm"):
-                    Path(str(db_path) + suffix).unlink(missing_ok=True)
-            tmp_db = target_db.with_suffix(".db.importing")
-            tmp_db.unlink(missing_ok=True)
-            await run_blocking(sqlite_backup, source_db, tmp_db)
-            tmp_db.replace(target_db)
-            if conversations_db is not None:
-                tmp_conversations_db = target_conversations_db.with_suffix(
-                    ".db.importing"
+            if phase.get("phase") != "created":
+                if (
+                    not archived_db.exists()
+                    or self._sha256(archived_db) != phase.get("source_sha256")
+                ):
+                    raise JobInterrupted(
+                        "checkpoint_corrupt",
+                        "导入源归档缺失或 SHA-256 校验失败，需停止任务以回滚",
+                    )
+                expected_conversations_hash = str(
+                    phase.get("conversations_sha256") or ""
                 )
-                tmp_conversations_db.unlink(missing_ok=True)
-                await run_blocking(
-                    sqlite_backup,
-                    conversations_db,
-                    tmp_conversations_db,
+                if expected_conversations_hash and (
+                    not archived_conversations.exists()
+                    or self._sha256(archived_conversations)
+                    != expected_conversations_hash
+                ):
+                    raise JobInterrupted(
+                        "checkpoint_corrupt",
+                        "消息记录归档缺失或 SHA-256 校验失败，需停止任务以回滚",
+                    )
+            if phase.get("phase") == "source_archived":
+                await self.unload_runtime(library_id, reason="livingmemory_import")
+                for db_path in (target_db, target_conversations_db):
+                    for suffix in ("-wal", "-shm"):
+                        Path(str(db_path) + suffix).unlink(missing_ok=True)
+                tmp_db = target_db.with_suffix(".db.importing")
+                tmp_db.unlink(missing_ok=True)
+                await run_blocking(sqlite_backup, archived_db, tmp_db)
+                tmp_db.replace(target_db)
+                if archived_conversations.exists():
+                    tmp_conversations_db = target_conversations_db.with_suffix(
+                        ".db.importing"
+                    )
+                    tmp_conversations_db.unlink(missing_ok=True)
+                    await run_blocking(
+                        sqlite_backup,
+                        archived_conversations,
+                        tmp_conversations_db,
+                    )
+                    tmp_conversations_db.replace(target_conversations_db)
+                phase = {
+                    **phase,
+                    "phase": "database_installed",
+                    "saved_at": time.time(),
+                }
+                phase_path.write_text(
+                    json.dumps(phase, ensure_ascii=False, indent=2), encoding="utf-8"
                 )
-                tmp_conversations_db.replace(target_conversations_db)
+                if controlled:
+                    await task_context.checkpoint(
+                        {"phase": "database_installed", "saved_at": time.time()},
+                        progress=0.08,
+                        message="导入数据库已原子安装",
+                    )
             if progress:
                 await progress(0.08, "正在初始化兼容表与 FTS")
             runtime = await self.get_runtime(library_id)
@@ -1450,7 +1532,13 @@ class LibraryManager:
                 if progress:
                     await progress(0.10 + max(0.0, min(1.0, value)) * 0.89, message)
 
-            rebuild = await self.rebuild_library(library_id, None, rebuild_progress)
+            rebuild = await self.rebuild_library(
+                library_id,
+                None,
+                rebuild_progress,
+                task_context=task_context,
+                checkpoint_dir=(import_dir / "index") if controlled else None,
+            )
             await self.control.update_library_metadata(
                 library_id,
                 {
@@ -1492,7 +1580,16 @@ class LibraryManager:
                 "rebuild": rebuild,
                 "report_path": str(report_path),
             }
+        except JobControlSignal:
+            # The durable task runner owns pause/interruption/stop semantics.
+            # Preserve the archived source, installed database and verified
+            # index segments so this same job can continue safely.
+            raise
         except Exception:
+            if controlled:
+                # ResumableLibraryTasks restores the complete pre-task state
+                # before the job is allowed to enter a terminal failure state.
+                raise
             logger.exception(
                 "LivingMemory 单文件导入失败，正在回滚：library_id=%s run_id=%s",
                 library_id,
@@ -1514,9 +1611,10 @@ class LibraryManager:
             await self.get_runtime(library_id)
             raise
         finally:
-            source_db.unlink(missing_ok=True)
-            if conversations_db is not None:
-                conversations_db.unlink(missing_ok=True)
+            if not controlled:
+                source_db.unlink(missing_ok=True)
+                if conversations_db is not None:
+                    conversations_db.unlink(missing_ok=True)
 
     async def delete_library(self, library_id: str) -> dict[str, Any]:
         record = await self.control.get_library(library_id)
@@ -1586,6 +1684,9 @@ class LibraryManager:
         library_id: str,
         provider_id: str | None,
         progress=None,
+        *,
+        task_context=None,
+        checkpoint_dir: Path | None = None,
     ) -> dict[str, Any]:
         runtime = await self.get_runtime(library_id)
         record = await self.control.get_library(library_id)
@@ -1606,7 +1707,12 @@ class LibraryManager:
             provider.provider_id,
             provider.revision,
         )
-        result = await runtime.rebuild_with_provider(provider, progress)
+        result = await runtime.rebuild_with_provider(
+            provider,
+            progress,
+            job_context=task_context,
+            checkpoint_dir=checkpoint_dir,
+        )
         await self.control.bind_library(
             library_id, provider, result["manifest"]
         )
@@ -1619,7 +1725,14 @@ class LibraryManager:
         )
         return result
 
-    async def rebuild_graph(self, library_id: str, progress=None) -> dict[str, Any]:
+    async def rebuild_graph(
+        self,
+        library_id: str,
+        progress=None,
+        *,
+        task_context=None,
+        checkpoint_dir: Path | None = None,
+    ) -> dict[str, Any]:
         runtime = await self.get_runtime(library_id)
         record = await self.control.get_library(library_id)
         if not record:
@@ -1637,7 +1750,11 @@ class LibraryManager:
             provider.provider_id,
             provider.revision,
         )
-        result = await runtime.rebuild_graph(progress)
+        result = await runtime.rebuild_graph(
+            progress,
+            job_context=task_context,
+            checkpoint_dir=checkpoint_dir,
+        )
         await self.control.bind_library(
             library_id,
             provider,
