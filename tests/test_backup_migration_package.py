@@ -132,6 +132,53 @@ def _write_fixture_prag(
             )
 
 
+def test_provider_snapshot_context_migration_handles_legacy_and_invalid_values():
+    snapshot = {
+        "provider_revisions": [
+            {
+                "config": {
+                    "type": "vllm_embedding",
+                    "max_context_tokens": 8192,
+                    "max_context_tokens_source": "",
+                }
+            },
+            {
+                "config": {
+                    "type": "openai_embedding",
+                    "context_length_mode": "manual",
+                    "max_context_tokens": 0,
+                    "max_context_tokens_source": "",
+                }
+            },
+            {
+                "config": {
+                    "type": "vllm_embedding",
+                    "max_context_tokens": 0,
+                    "max_context_tokens_source": "",
+                }
+            },
+        ]
+    }
+
+    summary = backup_module._normalize_provider_snapshot_context(snapshot)
+
+    first, second, third = [
+        item["config"] for item in snapshot["provider_revisions"]
+    ]
+    assert first["context_length_mode"] == "manual"
+    assert first["max_context_tokens_source"] == "manual:user"
+    assert second["context_length_mode"] == "manual"
+    assert second["max_context_tokens"] == 512
+    assert second["max_context_tokens_source"] == "manual:fallback-undetected"
+    assert third["context_length_mode"] == "auto"
+    assert third["max_context_tokens"] == 0
+    assert summary == {
+        "auto_pending": 1,
+        "manual_fallback": 1,
+        "legacy_manual": 1,
+    }
+
+
 @pytest.mark.asyncio
 async def test_prag_export_requires_password_and_encrypts_scope(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -216,6 +263,12 @@ async def test_prag_export_requires_password_and_encrypts_scope(
             "idle_minutes": 47,
             "max_non_default_runtimes": 7,
         }
+        provider_snapshot = json.loads(files["providers/providers.json"].decode("utf-8"))
+        assert "context_length_table" in provider_snapshot
+        provider_config = provider_snapshot["provider_revisions"][0]["config"]
+        assert provider_config["context_length_mode"] in {"auto", "manual"}
+        assert "max_context_tokens" in provider_config
+        assert "max_context_tokens_source" in provider_config
     finally:
         await manager.close()
 

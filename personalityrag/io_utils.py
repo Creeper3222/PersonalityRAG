@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 from pathlib import Path
+import time
 from typing import Any, Callable
+import uuid
 
 
 FILE_CHUNK_BYTES = 1024 * 1024
@@ -19,6 +23,46 @@ async def run_blocking(function: Callable, /, *args, **kwargs):
     except asyncio.CancelledError:
         await asyncio.gather(task, return_exceptions=True)
         raise
+
+
+def atomic_write_json(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    retries: int = 8,
+    base_delay: float = 0.05,
+) -> None:
+    """Write JSON through a unique temp file and atomically replace the target.
+
+    Windows can transiently deny replacing a recently written checkpoint file
+    when another reader, indexer, or security scanner still has a handle open.
+    Retrying the final replace keeps resumable task checkpoints deterministic
+    without changing the persisted payload.
+    """
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temp.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        attempts = max(1, int(retries))
+        for attempt in range(attempts):
+            try:
+                os.replace(temp, path)
+                return
+            except PermissionError:
+                if attempt >= attempts - 1:
+                    raise
+                time.sleep(max(0.0, float(base_delay)) * (2**attempt))
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 async def save_upload_file(

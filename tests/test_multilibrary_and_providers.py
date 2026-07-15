@@ -203,6 +203,32 @@ async def test_vllm_detects_context_length_from_models():
 
 
 @pytest.mark.asyncio
+async def test_vllm_falls_back_to_static_context_table():
+    async def handler(request: httpx.Request):
+        if request.url.path == "/v1/models":
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "bge-m3", "root": "BAAI/bge-m3"}]},
+            )
+        if request.url.path == "/tokenize":
+            return httpx.Response(404, json={"error": "not available"})
+        return httpx.Response(404)
+
+    provider = VLLMEmbeddingProvider(
+        ProviderConfig(id="vllm", type="vllm_embedding", model="BAAI/bge-m3")
+    )
+    await provider._client.aclose()
+    provider._client = httpx.AsyncClient(
+        base_url="http://test/v1",
+        transport=httpx.MockTransport(handler),
+    )
+    detected = await provider.detect_context_length()
+    assert detected["max_context_tokens"] == 8192
+    assert "auto:mteb:" in detected["max_context_tokens_source"]
+    await provider.close()
+
+
+@pytest.mark.asyncio
 async def test_ollama_detects_context_length_from_show():
     async def handler(request: httpx.Request):
         assert request.url.path == "/api/show"
@@ -226,6 +252,31 @@ async def test_ollama_detects_context_length_from_show():
 
 
 @pytest.mark.asyncio
+async def test_ollama_context_length_falls_back_to_static_without_model_listing():
+    seen_paths: list[str] = []
+
+    async def handler(request: httpx.Request):
+        seen_paths.append(request.url.path)
+        if request.url.path == "/api/show":
+            return httpx.Response(404, json={"error": "not available"})
+        raise AssertionError(f"unexpected Ollama context probe path: {request.url.path}")
+
+    provider = OllamaEmbeddingProvider(
+        ProviderConfig(id="ollama", type="ollama_embedding", model="bge-m3")
+    )
+    await provider._client.aclose()
+    provider._client = httpx.AsyncClient(
+        base_url="http://test",
+        transport=httpx.MockTransport(handler),
+    )
+    detected = await provider.detect_context_length()
+    assert detected["max_context_tokens"] == 8192
+    assert "auto:mteb:" in detected["max_context_tokens_source"]
+    assert seen_paths == ["/api/show"]
+    await provider.close()
+
+
+@pytest.mark.asyncio
 async def test_openai_uses_known_embedding_context_length_table():
     provider = OpenAIEmbeddingProvider(
         ProviderConfig(
@@ -236,7 +287,30 @@ async def test_openai_uses_known_embedding_context_length_table():
     )
     detected = await provider.detect_context_length()
     assert detected["max_context_tokens"] == 8192
-    assert "known-model-table" in detected["max_context_tokens_source"]
+    assert "auto:mteb:" in detected["max_context_tokens_source"]
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_generic_embedding_context_detection_uses_static_table_without_http_probe():
+    async def handler(request: httpx.Request):
+        raise AssertionError(f"unexpected generic context probe path: {request.url.path}")
+
+    provider = OpenAIEmbeddingProvider(
+        ProviderConfig(
+            id="openai",
+            type="openai_embedding",
+            model="text-embedding-3-small",
+        )
+    )
+    await provider._client.aclose()
+    provider._client = httpx.AsyncClient(
+        base_url="http://test/v1",
+        transport=httpx.MockTransport(handler),
+    )
+    detected = await provider.detect_context_length()
+    assert detected["max_context_tokens"] == 8192
+    assert "auto:mteb:" in detected["max_context_tokens_source"]
     await provider.close()
 
 
@@ -322,6 +396,7 @@ async def test_gemini_lists_models_and_embeds_batches():
     assert (await provider.list_models())[0]["inputTokenLimit"] == 8192
     detected = await provider.detect_context_length()
     assert detected["max_context_tokens"] == 8192
+    assert "auto:mteb:" in detected["max_context_tokens_source"]
     assert len(await provider.get_embeddings(["a", "b"])) == 2
     assert requests[0]["requests"][0]["model"].startswith("models/")
     assert requests[0]["requests"][0]["outputDimensionality"] == 3
@@ -580,7 +655,7 @@ async def test_provider_usage_ignores_display_only_revision_drift(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_provider_usage_ignores_max_context_metadata_drift(tmp_path: Path):
+async def test_provider_usage_marks_rebuild_when_max_context_tokens_changes(tmp_path: Path):
     control = ControlStore(tmp_path / "system.db")
     seed = ProviderConfig(api_key="secret-value")
     await control.initialize(seed)
@@ -598,10 +673,10 @@ async def test_provider_usage_ignores_max_context_metadata_drift(tmp_path: Path)
             "max_context_tokens_source": "auto:vllm_embedding:models.max_model_len",
         },
     )
-    assert updated.revision == 1
+    assert updated.revision == 2
     assert updated.config.max_context_tokens == 8192
     usage = await control.provider_usage(seed.id)
-    assert usage[0]["needs_rebuild"] is False
+    assert usage[0]["needs_rebuild"] is True
 
 
 @pytest.mark.asyncio
@@ -760,6 +835,117 @@ async def test_embedding_provider_index_rebuild_settings_are_non_semantic(
     assert updated.config.index_rebuild_settings.batch_size == 25
     assert updated.config.index_rebuild_settings.embedding_batch_size == 4
     assert updated.config.index_rebuild_settings.max_retries == 7
+
+
+@pytest.mark.asyncio
+async def test_long_rebuild_probes_context_once_and_persists_display_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "PersonalityRAG"
+    provider_config = ProviderConfig(
+        id="long_task_probe",
+        dimensions=8,
+        max_context_tokens=0,
+        max_context_tokens_source="",
+    )
+    detect_calls: list[int] = []
+
+    class LongTaskProbeProvider(FakeProvider):
+        async def detect_context_length(self):
+            detect_calls.append(int(self.config.max_context_tokens or 0))
+            return {
+                "max_context_tokens": 512,
+                "max_context_tokens_source": "auto:long-task-fixture",
+            }
+
+    monkeypatch.setattr(
+        "personalityrag.service.build_provider",
+        lambda config: LongTaskProbeProvider(config),
+    )
+    monkeypatch.setattr(
+        "personalityrag.libraries.build_provider",
+        lambda config: LongTaskProbeProvider(config),
+    )
+    manager = LibraryManager(root, AppConfig(provider=provider_config))
+    await manager.initialize()
+    try:
+        before = await manager.control.get_provider(provider_config.id)
+        assert before is not None
+        before_hash = provider_config_hash(before.config)
+
+        await manager.rebuild_library(DEFAULT_LIBRARY_ID, None)
+
+        updated = await manager.control.get_provider(provider_config.id)
+        assert updated is not None
+        assert detect_calls == [0]
+        assert updated.revision == before.revision + 1
+        assert provider_config_hash(updated.config) != before_hash
+        assert updated.config.context_length_mode == "auto"
+        assert updated.config.max_context_tokens == 512
+        assert (
+            updated.config.max_context_tokens_source
+            == "auto:long-task-fixture"
+        )
+
+        checkpoint_dir = tmp_path / "checkpoint"
+        checkpoint_dir.mkdir()
+        (checkpoint_dir / "checkpoint.json").write_text(
+            json.dumps(
+                {
+                    "embedding_capability": {
+                        "detected_max_context_tokens": 512,
+                        "max_context_tokens_source": "auto:long-task-fixture",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        detect_calls.clear()
+        refreshed, changed = await manager._refresh_context_length_for_long_task(
+            updated,
+            checkpoint_dir=checkpoint_dir,
+        )
+        assert refreshed is updated
+        assert changed is False
+        assert detect_calls == []
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_long_rebuild_falls_back_to_manual_when_context_probe_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "PersonalityRAG"
+    provider_config = ProviderConfig(
+        id="failed_probe",
+        dimensions=8,
+        max_context_tokens=0,
+    )
+
+    class FailedProbeProvider(FakeProvider):
+        async def detect_context_length(self):
+            return {"max_context_tokens": 0, "max_context_tokens_source": ""}
+
+    monkeypatch.setattr(
+        "personalityrag.service.build_provider",
+        lambda config: FailedProbeProvider(config),
+    )
+    monkeypatch.setattr(
+        "personalityrag.libraries.build_provider",
+        lambda config: FailedProbeProvider(config),
+    )
+    manager = LibraryManager(root, AppConfig(provider=provider_config))
+    await manager.initialize()
+    try:
+        await manager.rebuild_library(DEFAULT_LIBRARY_ID, None)
+        persisted = await manager.control.get_provider(provider_config.id)
+        assert persisted is not None
+        assert persisted.config.context_length_mode == "manual"
+        assert persisted.config.max_context_tokens == 512
+        assert persisted.config.max_context_tokens_source == "manual:fallback-undetected"
+    finally:
+        await manager.close()
 
 
 @pytest.mark.asyncio

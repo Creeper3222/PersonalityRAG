@@ -673,15 +673,28 @@
           <div class="inline-field"><input id="provider-dimensions" type="number" min="0"><button id="provider-detect-dimension" class="ghost" type="button" data-i18n="autoDetect">自动检测</button></div>
           <small data-i18n="dimensionHelp">0 表示自动检测。vLLM 不会把此值作为 dimensions 参数发送。</small>
         </label>
-        <label id="provider-context-row">
-          <span data-i18n="maxContextTokens">最大上下文长度</span>
+        <section id="provider-context-row" class="provider-settings-block provider-context-card">
+          <div class="provider-section-heading">
+            <h3 data-i18n="maxContextTokens">最大上下文长度</h3>
+            <p id="provider-context-help" data-i18n="maxContextHelp">自动模式会探测模型能力；手动模式使用你填写的值。</p>
+          </div>
+          <label class="provider-context-mode-row">
+            <span data-i18n="contextLengthMode">上下文策略</span>
+            <select id="provider-context-mode">
+              <option value="auto" data-i18n="contextLengthModeAuto">自动模式</option>
+              <option value="manual" data-i18n="contextLengthModeManual">手动模式</option>
+            </select>
+          </label>
+          <label>
+          <span data-i18n="maxContextTokensValue">最大上下文 Token</span>
           <div class="inline-field">
-            <input id="provider-max-context" type="number" min="0">
+            <input id="provider-max-context" type="number" min="128">
             <button id="provider-detect-context" class="ghost" type="button" data-i18n="detectMaxContextTokens">Probe max context length</button>
           </div>
+          </label>
           <input id="provider-max-context-source" type="hidden">
-          <small id="provider-context-help" data-i18n="maxContextHelp">0 表示未知；若保存时能自动探测到，将锁定为探测值。</small>
-        </label>
+          <small id="provider-context-source-label" class="form-help"></small>
+        </section>
         <label id="provider-return-documents-row" class="switch-row hidden"><span>Return Documents</span><input id="provider-return-documents" type="checkbox"></label>
         <label id="provider-instruct-row" class="hidden"><span>Instruct</span><input id="provider-instruct" placeholder="可选的 rerank 指令"></label>
         <label id="provider-model-endpoint-row" class="hidden"><span>Model Endpoint</span><input id="provider-model-endpoint" placeholder="/reranking"></label>

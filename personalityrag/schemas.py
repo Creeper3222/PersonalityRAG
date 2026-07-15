@@ -195,6 +195,7 @@ class ProviderCreate(BaseModel):
     api_key: str = ""
     model: str
     dimensions: int = Field(default=0, ge=0)
+    context_length_mode: str = Field(default="auto", pattern="^(auto|manual)$")
     max_context_tokens: int = Field(default=0, ge=0)
     max_context_tokens_source: str = ""
     timeout_seconds: int = Field(default=30, gt=0)
@@ -225,6 +226,7 @@ class ProviderUpdate(BaseModel):
     clear_api_key: bool = False
     model: str | None = None
     dimensions: int | None = Field(default=None, ge=0)
+    context_length_mode: str | None = Field(default=None, pattern="^(auto|manual)$")
     max_context_tokens: int | None = Field(default=None, ge=0)
     max_context_tokens_source: str | None = None
     timeout_seconds: int | None = Field(default=None, gt=0)

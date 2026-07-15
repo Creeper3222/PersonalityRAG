@@ -81,7 +81,7 @@ def test_http_route_contract() -> None:
 
 def test_openapi_contract() -> None:
     assert _stable_hash(app_module.app.openapi()) == (
-        "e19aa8f5b24e0db352621f6cac24bb6709898aabb3940f5c8a491af2e3b4b727"
+        "2e7633b4c8ee8d8401e05e992885f935f22e7610f36e58d188583572cd857b0f"
     )
 
 
@@ -99,9 +99,9 @@ def test_webui_dom_id_contract() -> None:
     html = (REPO_ROOT / "static" / "index.html").read_text(encoding="utf-8")
     dom_ids = sorted(set(re.findall(r'\bid="([^"]+)"', html)))
 
-    assert len(dom_ids) == 363
+    assert len(dom_ids) == 365
     assert _stable_hash(dom_ids) == (
-        "6291a566225033555dfc9eb0c8bce2854dd2e32b0d914840c738775871d20b23"
+        "fa6651bec28503fc6daf86f5e00a2e8680c8f4f866ecacb8333be9d8b9592ebe"
     )
     assert "page-files" in dom_ids
     assert "file-table-body" in dom_ids
@@ -112,6 +112,8 @@ def test_webui_dom_id_contract() -> None:
     assert "tasks-finished-clear" in dom_ids
     assert "update-available-badge" in dom_ids
     assert "updates-modal" in dom_ids
+    assert "provider-context-mode" in dom_ids
+    assert "provider-context-source-label" in dom_ids
 
 
 def test_settings_panels_keep_consistent_vertical_spacing() -> None:

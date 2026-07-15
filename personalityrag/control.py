@@ -99,7 +99,7 @@ class ControlStore:
     def _provider_functional_payload(config: ProviderConfig) -> dict[str, Any]:
         payload = asdict(config)
         payload.pop("display_name", None)
-        payload.pop("max_context_tokens", None)
+        payload.pop("context_length_mode", None)
         payload.pop("max_context_tokens_source", None)
         payload.pop("index_rebuild_settings", None)
         payload.pop("batch_size", None)

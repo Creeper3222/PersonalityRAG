@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .io_utils import run_blocking
+from .io_utils import atomic_write_json, run_blocking
 from .migration import sqlite_backup
 from .task_control import JobExecutionContext, ResolvedJobOperation
 
@@ -18,10 +18,7 @@ if TYPE_CHECKING:
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temp, path)
+    atomic_write_json(path, payload)
 
 
 def _sha256_file(path: Path) -> str:

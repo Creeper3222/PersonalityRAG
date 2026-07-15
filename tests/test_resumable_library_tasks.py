@@ -11,6 +11,7 @@ import pytest
 
 from personalityrag.config import AppConfig, IndexRebuildSettings, ProviderConfig
 from personalityrag.graph import GraphBuilder
+from personalityrag.indexes import DEFAULT_DOCUMENT_EMBED_CHARS
 from personalityrag.libraries import LibraryManager
 from personalityrag.migration import sqlite_backup
 from personalityrag.providers import EmbeddingProvider
@@ -26,11 +27,13 @@ class ControlledProvider(EmbeddingProvider):
         self.fail_next_batch = False
         self.batch_started = asyncio.Event()
         self.release_batch = asyncio.Event()
+        self.embedded_texts: list[str] = []
 
     async def get_embedding(self, text: str) -> list[float]:
         return (await self.get_embeddings([text]))[0]
 
     async def get_embeddings(self, texts: list[str]) -> list[list[float]]:
+        self.embedded_texts.extend(texts)
         if self.fail_next_batch:
             self.fail_next_batch = False
             self.batch_started.set()
@@ -124,7 +127,11 @@ async def test_import_pause_resume_matches_uninterrupted_and_stop_restores_empty
 ) -> None:
     source_storage = Storage(tmp_path / "source")
     await source_storage.initialize()
+    long_source_text = "resumable-long-input-" + (
+        "A" * (DEFAULT_DOCUMENT_EMBED_CHARS + 128)
+    )
     for content, topic in (
+        (long_source_text, "long-input"),
         ("贝雷特记得澄月喜欢星空。", "星空"),
         ("凶星和澄月一起完成了模型测试。", "测试"),
         ("雨雀提醒大家保存安全断点。", "断点"),
@@ -170,6 +177,8 @@ async def test_import_pause_resume_matches_uninterrupted_and_stop_restores_empty
             library_id="normal",
         )
         assert (await asyncio.wait_for(manager.jobs.wait(normal_id), timeout=5))["status"] == "completed"
+        assert long_source_text not in provider.embedded_texts
+        assert long_source_text in "".join(provider.embedded_texts)
 
         paused_upload = tmp_path / "paused-upload.db"
         await asyncio.to_thread(sqlite_backup, source_db, paused_upload)

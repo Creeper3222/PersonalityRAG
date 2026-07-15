@@ -16,6 +16,13 @@ from typing import Any, Callable
 import faiss
 import numpy as np
 
+from .context_lengths import (
+    MANUAL_CONTEXT_FALLBACK_TOKENS,
+    MIN_VALID_CONTEXT_TOKENS,
+    static_context_table_metadata,
+)
+from .logger import logger
+from .io_utils import atomic_write_json
 from .providers import EmbeddingProvider
 from .storage import Storage
 from .task_control import JobExecutionContext, JobInterrupted
@@ -23,8 +30,9 @@ from .task_control import JobExecutionContext, JobInterrupted
 
 DEFAULT_DOCUMENT_EMBED_CHARS = 4000
 DEFAULT_QUERY_EMBED_CHARS = 2000
-CONTEXT_CHAR_SAFETY_RATIO = 0.9
-MIN_CONTEXT_CLIP_CHARS = 64
+CONTEXT_CHUNK_CHAR_SAFETY_RATIO = 0.75
+MIN_CONTEXT_CHUNK_CHARS = 64
+EMBEDDING_CHUNKING_POLICY = "stable_char_chunk_mean_pool_v1"
 
 
 def _sha256_file(path: Path) -> str:
@@ -36,12 +44,7 @@ def _sha256_file(path: Path) -> str:
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    os.replace(temp, path)
+    atomic_write_json(path, payload)
 
 
 def _configured_faiss_threads() -> int:
@@ -56,21 +59,170 @@ FAISS_THREAD_COUNT = _configured_faiss_threads()
 faiss.omp_set_num_threads(FAISS_THREAD_COUNT)
 
 
-def _embedding_char_limit(provider: EmbeddingProvider, default_limit: int) -> int:
-    config = getattr(provider, "config", None)
-    tokens = int(getattr(config, "max_context_tokens", 0) or 0)
-    if tokens <= 0:
-        return default_limit
-    safe_chars = max(MIN_CONTEXT_CLIP_CHARS, int(tokens * CONTEXT_CHAR_SAFETY_RATIO))
-    return max(1, min(default_limit, safe_chars))
+@dataclass(slots=True)
+class EmbeddingInputWarningTracker:
+    label: str
+    threshold: int
+    provider_id: str = ""
+    total: int = 0
+    over_limit: int = 0
+    max_chars: int = 0
+    chunked_items: int = 0
+    total_chunks: int = 0
+    max_chunks_per_item: int = 0
+    reported: bool = False
+
+    def prepare(self, text: Any) -> str:
+        value = str(text or "")
+        length = len(value)
+        self.total += 1
+        self.max_chars = max(self.max_chars, length)
+        if length > self.threshold:
+            self.over_limit += 1
+        return value
+
+    def record_chunks(self, chunk_count: int) -> None:
+        chunk_count = max(1, int(chunk_count))
+        self.total_chunks += chunk_count
+        self.max_chunks_per_item = max(self.max_chunks_per_item, chunk_count)
+        if chunk_count > 1:
+            self.chunked_items += 1
+
+    def flush(self) -> None:
+        if self.reported or (self.over_limit <= 0 and self.chunked_items <= 0):
+            return
+        self.reported = True
+        logger.warning(
+            "Embedding 输入较长：label=%s provider=%s over_soft_limit=%s/%s "
+            "threshold_chars=%s max_chars=%s chunked_items=%s total_chunks=%s "
+            "max_chunks_per_item=%s policy=%s",
+            self.label,
+            self.provider_id or "-",
+            self.over_limit,
+            self.total,
+            self.threshold,
+            self.max_chars,
+            self.chunked_items,
+            self.total_chunks,
+            self.max_chunks_per_item,
+            EMBEDDING_CHUNKING_POLICY,
+        )
 
 
-def _clip_for_embedding(
+def _prepare_for_embedding(
     text: Any,
     provider: EmbeddingProvider,
     default_limit: int,
+    tracker: EmbeddingInputWarningTracker | None = None,
 ) -> str:
-    return str(text or "")[: _embedding_char_limit(provider, default_limit)]
+    if tracker is not None:
+        return tracker.prepare(text)
+    return str(text or "")
+
+
+async def _provider_capability_snapshot(
+    provider: EmbeddingProvider,
+    *,
+    provider_id: str,
+    provider_revision: int,
+    provider_config_sha256: str,
+    provider_status: dict[str, Any] | None = None,
+    force_probe: bool = False,
+    minimum_trusted_tokens: int = 128,
+) -> dict[str, Any]:
+    config = getattr(provider, "config", None)
+    detected_tokens = 0
+    detected_source = ""
+    context_length_mode = str(
+        getattr(config, "context_length_mode", "auto") if config is not None else "auto"
+    )
+    minimum_trusted_tokens = max(
+        int(minimum_trusted_tokens or 0), MIN_VALID_CONTEXT_TOKENS
+    )
+    if config is not None and (context_length_mode == "manual" or not force_probe):
+        detected_tokens = int(getattr(config, "max_context_tokens", 0) or 0)
+        detected_source = str(getattr(config, "max_context_tokens_source", "") or "")
+        if detected_tokens >= minimum_trusted_tokens:
+            if not detected_source:
+                detected_source = "config:manual"
+            elif not detected_source.startswith("config:"):
+                detected_source = f"config:{detected_source}"
+    if detected_tokens < minimum_trusted_tokens:
+        try:
+            detected = await provider.detect_context_length()
+            detected_tokens = int(detected.get("max_context_tokens") or 0)
+            detected_source = str(detected.get("max_context_tokens_source") or "")
+        except Exception as exc:
+            logger.warning(
+                f"Embedding Provider 上下文能力探测失败: {exc}"
+            )
+        if detected_tokens < minimum_trusted_tokens:
+            existing_tokens = (
+                int(getattr(config, "max_context_tokens", 0) or 0)
+                if config is not None
+                else 0
+            )
+            detected_tokens = (
+                existing_tokens
+                if existing_tokens >= minimum_trusted_tokens
+                else MANUAL_CONTEXT_FALLBACK_TOKENS
+            )
+            detected_source = "manual:fallback-undetected"
+            context_length_mode = "manual"
+        if detected_tokens < minimum_trusted_tokens:
+            raise RuntimeError(
+                "Embedding Provider 上下文能力探测失败："
+                f"tokens={detected_tokens}, minimum={minimum_trusted_tokens}"
+            )
+    if config is not None and detected_tokens > 0:
+        try:
+            setattr(config, "context_length_mode", context_length_mode)
+            setattr(config, "max_context_tokens", detected_tokens)
+            setattr(config, "max_context_tokens_source", detected_source)
+        except Exception:
+            pass
+    chunk_char_limit = (
+        max(MIN_CONTEXT_CHUNK_CHARS, int(detected_tokens * CONTEXT_CHUNK_CHAR_SAFETY_RATIO))
+        if detected_tokens > 0
+        else 0
+    )
+    status = provider_status or {}
+    static_table = static_context_table_metadata()
+    return {
+        "provider_id": provider_id or getattr(config, "id", "") or "",
+        "provider_revision": int(provider_revision or 0),
+        "provider_config_sha256": provider_config_sha256 or "",
+        "provider_type": type(provider).__name__,
+        "configured_model": str(getattr(config, "model", "") or ""),
+        "resolved_model": str(status.get("resolved_model") or ""),
+        "detected_max_context_tokens": detected_tokens,
+        "max_context_tokens_source": detected_source,
+        "context_length_mode": context_length_mode,
+        "context_length_table_version": static_table.get("version", ""),
+        "context_length_table_sha256": static_table.get("sha256", ""),
+        "detected_at": time.time(),
+        "chunking_policy": EMBEDDING_CHUNKING_POLICY,
+        "chunk_char_limit": chunk_char_limit,
+        "chunk_char_safety_ratio": CONTEXT_CHUNK_CHAR_SAFETY_RATIO,
+    }
+
+
+def _split_for_embedding(
+    text: str,
+    *,
+    capability: dict[str, Any],
+    tracker: EmbeddingInputWarningTracker,
+) -> list[str]:
+    chunk_char_limit = int(capability.get("chunk_char_limit") or 0)
+    if chunk_char_limit <= 0 or len(text) <= chunk_char_limit:
+        tracker.record_chunks(1)
+        return [text]
+    chunks = [
+        text[index : index + chunk_char_limit]
+        for index in range(0, len(text), chunk_char_limit)
+    ]
+    tracker.record_chunks(len(chunks))
+    return chunks
 
 
 def _path_is_ascii(path: Path) -> bool:
@@ -153,6 +305,12 @@ class GenerationManifest:
     vector_norm_min: float
     vector_norm_max: float
     vector_norm_mean: float
+    embedding_capability: dict[str, Any]
+    chunked_document_count: int = 0
+    chunked_graph_entry_count: int = 0
+    chunked_query_count: int = 0
+    total_embedding_chunks: int = 0
+    max_chunks_per_item: int = 1
 
 
 @dataclass(slots=True)
@@ -256,32 +414,103 @@ class IndexManager:
         return float(norms.min()), float(norms.max()), float(norms.sum())
 
     @staticmethod
+    async def _embed_texts_aggregated(
+        provider: EmbeddingProvider,
+        texts: list[str],
+        *,
+        dimension: int,
+        capability: dict[str, Any],
+        tracker: EmbeddingInputWarningTracker,
+        request_embeddings: Callable[[list[str]], Any],
+        request_batch_size: int,
+    ) -> np.ndarray:
+        if not texts:
+            return np.empty((0, dimension), dtype=np.float32)
+        request_batch_size = max(1, int(request_batch_size))
+        fragment_texts: list[str] = []
+        fragment_owner_indexes: list[int] = []
+        for owner_index, text in enumerate(texts):
+            prepared = _prepare_for_embedding(text, provider, tracker.threshold, tracker)
+            fragments = _split_for_embedding(
+                prepared,
+                capability=capability,
+                tracker=tracker,
+            )
+            for fragment in fragments:
+                fragment_texts.append(fragment)
+                fragment_owner_indexes.append(owner_index)
+        owner_vectors: list[list[np.ndarray]] = [[] for _ in texts]
+        for start in range(0, len(fragment_texts), request_batch_size):
+            end = start + request_batch_size
+            batch_texts = fragment_texts[start:end]
+            raw_vectors = await request_embeddings(batch_texts)
+            matrix = np.asarray(raw_vectors, dtype=np.float32)
+            IndexManager._validate_matrix(
+                matrix,
+                expected_rows=len(batch_texts),
+                dimension=dimension,
+            )
+            faiss.normalize_L2(matrix)
+            for offset, vector in enumerate(matrix):
+                owner = fragment_owner_indexes[start + offset]
+                owner_vectors[owner].append(np.asarray(vector, dtype=np.float32))
+        rows: list[np.ndarray] = []
+        for vectors in owner_vectors:
+            if not vectors:
+                raise RuntimeError("embedding chunk aggregation produced no vectors")
+            if len(vectors) == 1:
+                rows.append(vectors[0])
+            else:
+                stacked = np.vstack(vectors).astype(np.float32, copy=False)
+                rows.append(np.mean(stacked, axis=0, dtype=np.float32))
+        return np.vstack(rows).astype(np.float32, copy=False)
+
+    @staticmethod
     async def _validate_sample_recall(
         provider: EmbeddingProvider,
         index: faiss.Index,
         samples: list[tuple[int, str]],
         label: str,
+        *,
+        dimension: int | None = None,
+        capability: dict[str, Any] | None = None,
     ) -> None:
         if not samples:
             return
-        vectors = np.asarray(
-            await provider.get_embeddings(
-                [
-                    _clip_for_embedding(text, provider, DEFAULT_DOCUMENT_EMBED_CHARS)
-                    for _, text in samples
-                ],
-            ),
-            dtype=np.float32,
+        if dimension is None:
+            dimension = await provider.get_dimension()
+        if capability is None:
+            capability = await _provider_capability_snapshot(
+                provider,
+                provider_id=str(getattr(getattr(provider, "config", None), "id", "") or ""),
+                provider_revision=0,
+                provider_config_sha256="",
+                force_probe=False,
+            )
+        tracker = EmbeddingInputWarningTracker(
+            f"sample_recall_{label}",
+            DEFAULT_DOCUMENT_EMBED_CHARS,
+            str(capability.get("provider_id") or ""),
         )
+        vectors = await IndexManager._embed_texts_aggregated(
+            provider,
+            [text for _, text in samples],
+            dimension=dimension,
+            capability=capability,
+            tracker=tracker,
+            request_embeddings=provider.get_embeddings,
+            request_batch_size=max(1, int(capability.get("sample_batch_size") or 8)),
+        )
+        tracker.flush()
         if vectors.ndim != 2:
-            raise RuntimeError(f"{label}抽样召回向量格式无效")
+            raise RuntimeError(f"{label} sample recall vector shape is invalid")
         faiss.normalize_L2(vectors)
         k = min(10, int(index.ntotal))
         _, result_ids = index.search(vectors, k)
         for (expected_id, _), row in zip(samples, result_ids, strict=True):
             if expected_id not in {int(item) for item in row if int(item) >= 0}:
                 raise RuntimeError(
-                    f"{label}抽样召回未命中自身 ID: {expected_id}"
+                    f"{label} sample recall did not return itself: {expected_id}"
                 )
 
     @staticmethod
@@ -409,12 +638,31 @@ class IndexManager:
                     f"Provider 测试失败: {provider_status.get('error') or '未知错误'}"
                 )
 
+            capability = await _provider_capability_snapshot(
+                provider,
+                provider_id=self.provider_id,
+                provider_revision=self.provider_revision,
+                provider_config_sha256=self.provider_config_sha256,
+                provider_status=provider_status,
+                force_probe=False,
+            )
+
             document_index = faiss.clone_index(snapshot.document_index)
             graph_index = faiss.clone_index(snapshot.graph_index)
             self._remove_ids(document_index, remove_document_ids | add_document_ids)
             self._remove_ids(graph_index, remove_graph_entry_ids | add_graph_ids)
 
             norm_values: list[float] = []
+            document_tracker = EmbeddingInputWarningTracker(
+                "incremental_index_update_documents",
+                DEFAULT_DOCUMENT_EMBED_CHARS,
+                self.provider_id,
+            )
+            graph_tracker = EmbeddingInputWarningTracker(
+                "incremental_index_update_graph",
+                DEFAULT_DOCUMENT_EMBED_CHARS,
+                self.provider_id,
+            )
 
             async def add_texts(
                 index: faiss.Index,
@@ -424,17 +672,18 @@ class IndexManager:
             ) -> None:
                 if not rows:
                     return
-                texts = [
-                    _clip_for_embedding(
-                        row.get(text_key) or "",
-                        provider,
-                        DEFAULT_DOCUMENT_EMBED_CHARS,
-                    )
-                    for row in rows
-                ]
+                texts = [str(row.get(text_key) or "") for row in rows]
                 ids = np.asarray([int(row["id"]) for row in rows], dtype=np.int64)
-                vectors = await provider.get_embeddings(texts)
-                matrix = np.asarray(vectors, dtype=np.float32)
+                tracker = document_tracker if text_key == "text" else graph_tracker
+                matrix = await self._embed_texts_aggregated(
+                    provider,
+                    texts,
+                    dimension=dimension,
+                    capability=capability,
+                    tracker=tracker,
+                    request_embeddings=provider.get_embeddings,
+                    request_batch_size=max(1, len(rows)),
+                )
                 minimum, maximum, total_norm = self._validate_matrix(
                     matrix,
                     expected_rows=len(rows),
@@ -446,8 +695,12 @@ class IndexManager:
                 faiss.normalize_L2(matrix)
                 index.add_with_ids(matrix, ids)
 
-            await add_texts(document_index, add_documents, text_key="text")
-            await add_texts(graph_index, add_graph_entries, text_key="content")
+            try:
+                await add_texts(document_index, add_documents, text_key="text")
+                await add_texts(graph_index, add_graph_entries, text_key="content")
+            finally:
+                document_tracker.flush()
+                graph_tracker.flush()
 
             final_document_ids = self._index_ids(document_index)
             final_graph_ids = self._index_ids(graph_index)
@@ -491,6 +744,22 @@ class IndexManager:
                 vector_norm_min=round(vector_norm_min, 8),
                 vector_norm_max=round(vector_norm_max, 8),
                 vector_norm_mean=round(vector_norm_mean, 8),
+                embedding_capability=capability,
+                chunked_document_count=int(previous.get("chunked_document_count") or 0)
+                + document_tracker.chunked_items,
+                chunked_graph_entry_count=int(
+                    previous.get("chunked_graph_entry_count") or 0
+                )
+                + graph_tracker.chunked_items,
+                total_embedding_chunks=int(previous.get("total_embedding_chunks") or 0)
+                + document_tracker.total_chunks
+                + graph_tracker.total_chunks,
+                max_chunks_per_item=max(
+                    int(previous.get("max_chunks_per_item") or 1),
+                    document_tracker.max_chunks_per_item,
+                    graph_tracker.max_chunks_per_item,
+                    1,
+                ),
             )
             final_manifest = self._write_generation(
                 document_index, graph_index, manifest
@@ -629,10 +898,35 @@ class IndexManager:
         norm_max = 0.0
         norm_sum = 0.0
         norm_count = 0
+        capability = await _provider_capability_snapshot(
+            candidate,
+            provider_id=provider_id if provider_id is not None else self.provider_id,
+            provider_revision=provider_revision
+            if provider_revision is not None
+            else self.provider_revision,
+            provider_config_sha256=provider_config_sha256
+            if provider_config_sha256 is not None
+            else self.provider_config_sha256,
+            provider_status=provider_status,
+                force_probe=False,
+        )
         semaphore = asyncio.Semaphore(worker_limit)
+        document_tracker = EmbeddingInputWarningTracker(
+            "index_rebuild_documents",
+            DEFAULT_DOCUMENT_EMBED_CHARS,
+            provider_id if provider_id is not None else self.provider_id,
+        )
+        graph_tracker = EmbeddingInputWarningTracker(
+            "index_rebuild_graph",
+            DEFAULT_DOCUMENT_EMBED_CHARS,
+            provider_id if provider_id is not None else self.provider_id,
+        )
 
         async def embed_chunks(
-            texts: list[str], ids: list[int], index: faiss.Index
+            texts: list[str],
+            ids: list[int],
+            index: faiss.Index,
+            tracker: EmbeddingInputWarningTracker,
         ) -> None:
             nonlocal done, norm_min, norm_max, norm_sum, norm_count
             chunks = [
@@ -657,8 +951,15 @@ class IndexManager:
 
             async def run(chunk_texts: list[str], chunk_ids: list[int]):
                 async with semaphore:
-                    vectors = await get_embeddings_with_retry(chunk_texts)
-                    matrix = np.asarray(vectors, dtype=np.float32)
+                    matrix = await self._embed_texts_aggregated(
+                        candidate,
+                        chunk_texts,
+                        dimension=dimension,
+                        capability=capability,
+                        tracker=tracker,
+                        request_embeddings=get_embeddings_with_retry,
+                        request_batch_size=embed_batch_size,
+                    )
                     minimum, maximum, total_norm = self._validate_matrix(
                         matrix,
                         expected_rows=len(chunk_ids),
@@ -700,16 +1001,10 @@ class IndexManager:
             async for batch in self.storage.iter_documents(batch_size=read_batch_size):
                 ids = [int(item["id"]) for item in batch]
                 await embed_chunks(
-                    [
-                        _clip_for_embedding(
-                            item["text"],
-                            candidate,
-                            DEFAULT_DOCUMENT_EMBED_CHARS,
-                        )
-                        for item in batch
-                    ],
+                    [str(item["text"] or "") for item in batch],
                     ids,
                     doc_index,
+                    document_tracker,
                 )
                 document_ids.extend(ids)
                 if batch_delay > 0 and len(batch) >= read_batch_size and done < total:
@@ -719,16 +1014,10 @@ class IndexManager:
             async for batch in self.storage.iter_graph_entries(batch_size=read_batch_size):
                 ids = [int(item["id"]) for item in batch]
                 await embed_chunks(
-                    [
-                        _clip_for_embedding(
-                            item["content"],
-                            candidate,
-                            DEFAULT_DOCUMENT_EMBED_CHARS,
-                        )
-                        for item in batch
-                    ],
+                    [str(item["content"] or "") for item in batch],
                     ids,
                     graph_index,
+                    graph_tracker,
                 )
                 graph_ids.extend(ids)
                 if batch_delay > 0 and len(batch) >= read_batch_size and done < total:
@@ -766,10 +1055,20 @@ class IndexManager:
                     ).fetchall()
                 ]
             await self._validate_sample_recall(
-                candidate, doc_index, document_samples, "文档索引"
+                candidate,
+                doc_index,
+                document_samples,
+                "文档索引",
+                dimension=dimension,
+                capability=capability,
             )
             await self._validate_sample_recall(
-                candidate, graph_index, graph_samples, "图谱索引"
+                candidate,
+                graph_index,
+                graph_samples,
+                "图谱索引",
+                dimension=dimension,
+                capability=capability,
             )
 
             manifest = GenerationManifest(
@@ -809,6 +1108,17 @@ class IndexManager:
                 vector_norm_mean=round(
                     0.0 if norm_count == 0 else norm_sum / norm_count, 8
                 ),
+                embedding_capability=capability,
+                chunked_document_count=document_tracker.chunked_items,
+                chunked_graph_entry_count=graph_tracker.chunked_items,
+                total_embedding_chunks=(
+                    document_tracker.total_chunks + graph_tracker.total_chunks
+                ),
+                max_chunks_per_item=max(
+                    document_tracker.max_chunks_per_item,
+                    graph_tracker.max_chunks_per_item,
+                    1,
+                ),
             )
             _write_faiss_index(doc_index, temp_dir / "documents.index")
             _write_faiss_index(graph_index, temp_dir / "graph.index")
@@ -838,6 +1148,9 @@ class IndexManager:
 
                 shutil.rmtree(temp_dir, ignore_errors=True)
             raise
+        finally:
+            document_tracker.flush()
+            graph_tracker.flush()
 
     async def _embedding_source_fingerprint(self) -> dict[str, Any]:
         document_hash = hashlib.sha256()
@@ -1064,6 +1377,33 @@ class IndexManager:
                 "Embedding 维度与断点不一致，拒绝不安全续跑",
             )
         state["dimension"] = dimension
+        capability = state.get("embedding_capability")
+        if not isinstance(capability, dict) or not capability:
+            try:
+                capability = await _provider_capability_snapshot(
+                    candidate,
+                    provider_id=effective_provider,
+                    provider_revision=effective_revision,
+                    provider_config_sha256=effective_config_hash,
+                    provider_status=provider_status,
+                    force_probe=False,
+                )
+            except Exception as exc:
+                raise JobInterrupted(
+                    "provider_context_probe_failed",
+                    "Embedding Provider context probe failed; task is paused at the last safe checkpoint.",
+                    error=str(exc),
+                ) from exc
+            state["embedding_capability"] = capability
+            await save_state(
+                state,
+                "Embedding Provider context has been probed and checkpointed.",
+            )
+        elif int(capability.get("detected_max_context_tokens") or 0) < 128:
+            raise JobInterrupted(
+                "provider_context_probe_failed",
+                "Embedding Provider context checkpoint is invalid; stop the task to roll back.",
+            )
 
         doc_index = self._empty_index(dimension)
         graph_index = self._empty_index(dimension)
@@ -1087,8 +1427,22 @@ class IndexManager:
                 graph_ids.extend(map(int, ids))
 
         semaphore = asyncio.Semaphore(worker_limit)
+        document_tracker = EmbeddingInputWarningTracker(
+            "resumable_index_rebuild_documents",
+            DEFAULT_DOCUMENT_EMBED_CHARS,
+            effective_provider,
+        )
+        graph_tracker = EmbeddingInputWarningTracker(
+            "resumable_index_rebuild_graph",
+            DEFAULT_DOCUMENT_EMBED_CHARS,
+            effective_provider,
+        )
 
-        async def embed_batch(texts: list[str], ids: list[int]) -> np.ndarray:
+        async def embed_batch(
+            texts: list[str],
+            ids: list[int],
+            tracker: EmbeddingInputWarningTracker,
+        ) -> np.ndarray:
             chunks = [
                 (texts[i : i + embed_batch_size], ids[i : i + embed_batch_size])
                 for i in range(0, len(texts), embed_batch_size)
@@ -1096,30 +1450,42 @@ class IndexManager:
 
             async def run(chunk_texts: list[str], chunk_ids: list[int]):
                 async with semaphore:
-                    last_exc: Exception | None = None
-                    for attempt in range(max_retries):
-                        try:
-                            vectors = await candidate.get_embeddings(chunk_texts)
-                            matrix = np.asarray(vectors, dtype=np.float32)
-                            minimum, maximum, total_norm = self._validate_matrix(
-                                matrix,
-                                expected_rows=len(chunk_ids),
-                                dimension=dimension,
-                            )
-                            faiss.normalize_L2(matrix)
-                            if request_delay > 0:
-                                await asyncio.sleep(request_delay)
-                            return matrix, minimum, maximum, total_norm
-                        except Exception as exc:
-                            last_exc = exc
-                            if attempt + 1 < max_retries:
-                                await asyncio.sleep(retry_base_delay * (2**attempt))
-                    assert last_exc is not None
-                    raise JobInterrupted(
-                        "provider_unavailable",
-                        "Embedding 服务请求失败，任务已回退到最近安全断点",
-                        error=str(last_exc),
-                    ) from last_exc
+                    async def request_embeddings(batch_texts: list[str]):
+                        last_exc: Exception | None = None
+                        for attempt in range(max_retries):
+                            try:
+                                result = await candidate.get_embeddings(batch_texts)
+                                if request_delay > 0:
+                                    await asyncio.sleep(request_delay)
+                                return result
+                            except Exception as exc:
+                                last_exc = exc
+                                if attempt + 1 < max_retries:
+                                    await asyncio.sleep(retry_base_delay * (2**attempt))
+                        assert last_exc is not None
+                        tracker.flush()
+                        raise JobInterrupted(
+                            "provider_unavailable",
+                            "Embedding request failed; task is paused at the last safe checkpoint.",
+                            error=str(last_exc),
+                        ) from last_exc
+
+                    matrix = await self._embed_texts_aggregated(
+                        candidate,
+                        chunk_texts,
+                        dimension=dimension,
+                        capability=capability,
+                        tracker=tracker,
+                        request_embeddings=request_embeddings,
+                        request_batch_size=embed_batch_size,
+                    )
+                    minimum, maximum, total_norm = self._validate_matrix(
+                        matrix,
+                        expected_rows=len(chunk_ids),
+                        dimension=dimension,
+                    )
+                    faiss.normalize_L2(matrix)
+                    return matrix, minimum, maximum, total_norm
 
             results: list[tuple[np.ndarray, float, float, float]] = []
             for start in range(0, len(chunks), worker_limit):
@@ -1177,11 +1543,8 @@ class IndexManager:
             batch_size=read_batch_size, after_id=int(state.get("last_document_id", 0))
         ):
             ids = [int(item["id"]) for item in batch]
-            texts = [
-                _clip_for_embedding(item["text"], candidate, DEFAULT_DOCUMENT_EMBED_CHARS)
-                for item in batch
-            ]
-            matrix = await embed_batch(texts, ids)
+            texts = [str(item["text"] or "") for item in batch]
+            matrix = await embed_batch(texts, ids, document_tracker)
             await persist_segment("documents", ids, matrix)
             doc_index.add_with_ids(matrix, np.asarray(ids, dtype=np.int64))
             document_ids.extend(ids)
@@ -1200,11 +1563,8 @@ class IndexManager:
             batch_size=read_batch_size, after_id=int(state.get("last_graph_id", 0))
         ):
             ids = [int(item["id"]) for item in batch]
-            texts = [
-                _clip_for_embedding(item["content"], candidate, DEFAULT_DOCUMENT_EMBED_CHARS)
-                for item in batch
-            ]
-            matrix = await embed_batch(texts, ids)
+            texts = [str(item["content"] or "") for item in batch]
+            matrix = await embed_batch(texts, ids, graph_tracker)
             await persist_segment("graph", ids, matrix)
             graph_index.add_with_ids(matrix, np.asarray(ids, dtype=np.int64))
             graph_ids.extend(ids)
@@ -1217,6 +1577,8 @@ class IndexManager:
             if batch_delay > 0:
                 await asyncio.sleep(batch_delay)
 
+        document_tracker.flush()
+        graph_tracker.flush()
         if doc_index.ntotal != int(state["total_documents"]) or graph_index.ntotal != int(state["total_graph_entries"]):
             raise RuntimeError("zero-loss resumable rebuild vector count mismatch")
         final_fingerprint = await self._embedding_source_fingerprint()
@@ -1244,8 +1606,22 @@ class IndexManager:
                 ).fetchall()
             ]
         try:
-            await self._validate_sample_recall(candidate, doc_index, document_samples, "文档索引")
-            await self._validate_sample_recall(candidate, graph_index, graph_samples, "图记忆索引")
+            await self._validate_sample_recall(
+                candidate,
+                doc_index,
+                document_samples,
+                "文档索引",
+                dimension=dimension,
+                capability=capability,
+            )
+            await self._validate_sample_recall(
+                candidate,
+                graph_index,
+                graph_samples,
+                "图记忆索引",
+                dimension=dimension,
+                capability=capability,
+            )
         except Exception as exc:
             raise JobInterrupted(
                 "provider_unavailable",
@@ -1282,6 +1658,17 @@ class IndexManager:
                 if not int(state["norm_count"])
                 else float(state["norm_sum"]) / int(state["norm_count"]),
                 8,
+            ),
+            embedding_capability=capability,
+            chunked_document_count=document_tracker.chunked_items,
+            chunked_graph_entry_count=graph_tracker.chunked_items,
+            total_embedding_chunks=(
+                document_tracker.total_chunks + graph_tracker.total_chunks
+            ),
+            max_chunks_per_item=max(
+                1,
+                document_tracker.max_chunks_per_item,
+                graph_tracker.max_chunks_per_item,
             ),
         )
         state["phase"] = "ready_to_commit"
@@ -1360,18 +1747,34 @@ class IndexManager:
         snapshot = self._snapshot
         if snapshot is None or snapshot.document_index.ntotal == 0:
             return []
-        vector = np.asarray(
-            [
-                await snapshot.provider.get_embedding(
-                    _clip_for_embedding(
-                        query,
-                        snapshot.provider,
-                        DEFAULT_QUERY_EMBED_CHARS,
-                    ),
-                )
-            ],
-            dtype=np.float32,
+        capability = (snapshot.manifest or {}).get("embedding_capability")
+        if not isinstance(capability, dict) or int(
+            capability.get("detected_max_context_tokens") or 0
+        ) < 128:
+            capability = await _provider_capability_snapshot(
+                snapshot.provider,
+                provider_id=self.provider_id,
+                provider_revision=self.provider_revision,
+                provider_config_sha256=self.provider_config_sha256,
+                force_probe=False,
+            )
+        tracker = EmbeddingInputWarningTracker(
+            "document_recall_query",
+            DEFAULT_QUERY_EMBED_CHARS,
+            self.provider_id,
         )
+        try:
+            vector = await self._embed_texts_aggregated(
+                snapshot.provider,
+                [query],
+                dimension=int(snapshot.document_index.d),
+                capability=capability,
+                tracker=tracker,
+                request_embeddings=snapshot.provider.get_embeddings,
+                request_batch_size=1,
+            )
+        finally:
+            tracker.flush()
         faiss.normalize_L2(vector)
         distances, ids = snapshot.document_index.search(vector, fetch_k or k)
         return [
@@ -1386,18 +1789,34 @@ class IndexManager:
         snapshot = self._snapshot
         if snapshot is None or snapshot.graph_index.ntotal == 0:
             return []
-        vector = np.asarray(
-            [
-                await snapshot.provider.get_embedding(
-                    _clip_for_embedding(
-                        query,
-                        snapshot.provider,
-                        DEFAULT_QUERY_EMBED_CHARS,
-                    ),
-                )
-            ],
-            dtype=np.float32,
+        capability = (snapshot.manifest or {}).get("embedding_capability")
+        if not isinstance(capability, dict) or int(
+            capability.get("detected_max_context_tokens") or 0
+        ) < 128:
+            capability = await _provider_capability_snapshot(
+                snapshot.provider,
+                provider_id=self.provider_id,
+                provider_revision=self.provider_revision,
+                provider_config_sha256=self.provider_config_sha256,
+                force_probe=False,
+            )
+        tracker = EmbeddingInputWarningTracker(
+            "graph_recall_query",
+            DEFAULT_QUERY_EMBED_CHARS,
+            self.provider_id,
         )
+        try:
+            vector = await self._embed_texts_aggregated(
+                snapshot.provider,
+                [query],
+                dimension=int(snapshot.graph_index.d),
+                capability=capability,
+                tracker=tracker,
+                request_embeddings=snapshot.provider.get_embeddings,
+                request_batch_size=1,
+            )
+        finally:
+            tracker.flush()
         faiss.normalize_L2(vector)
         distances, ids = snapshot.graph_index.search(vector, fetch_k or k)
         return [
