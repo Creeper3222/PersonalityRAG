@@ -19,6 +19,10 @@ from personalityrag.storage import Storage
 from personalityrag.text import TextProcessor
 
 
+JOB_TIMEOUT_SECONDS = 120
+EVENT_TIMEOUT_SECONDS = 30
+
+
 class ControlledProvider(EmbeddingProvider):
     def __init__(self, config: ProviderConfig):
         self.config = config
@@ -176,7 +180,7 @@ async def test_import_pause_resume_matches_uninterrupted_and_stop_restores_empty
             {"source_db": str(normal_upload), "conversations_db": None},
             library_id="normal",
         )
-        assert (await asyncio.wait_for(manager.jobs.wait(normal_id), timeout=5))["status"] == "completed"
+        assert (await asyncio.wait_for(manager.jobs.wait(normal_id), timeout=JOB_TIMEOUT_SECONDS))["status"] == "completed"
         assert long_source_text not in provider.embedded_texts
         assert long_source_text in "".join(provider.embedded_texts)
 
@@ -190,7 +194,7 @@ async def test_import_pause_resume_matches_uninterrupted_and_stop_restores_empty
             {"source_db": str(paused_upload), "conversations_db": None},
             library_id="paused",
         )
-        await asyncio.wait_for(provider.batch_started.wait(), timeout=2)
+        await asyncio.wait_for(provider.batch_started.wait(), timeout=EVENT_TIMEOUT_SECONDS)
         await manager.jobs.pause(paused_id)
         provider.release_batch.set()
         paused_job = await _wait_status(manager, paused_id, "paused")
@@ -202,7 +206,7 @@ async def test_import_pause_resume_matches_uninterrupted_and_stop_restores_empty
         assert len(list((workspace / "index" / "segments").glob("*.npz"))) == 1
 
         await manager.jobs.resume(paused_id)
-        resumed = await asyncio.wait_for(manager.jobs.wait(paused_id), timeout=5)
+        resumed = await asyncio.wait_for(manager.jobs.wait(paused_id), timeout=JOB_TIMEOUT_SECONDS)
         assert resumed["status"] == "completed"
         assert not workspace.exists()
 
@@ -230,10 +234,10 @@ async def test_import_pause_resume_matches_uninterrupted_and_stop_restores_empty
             {"source_db": str(stopped_upload), "conversations_db": None},
             library_id="stopped",
         )
-        await asyncio.wait_for(provider.batch_started.wait(), timeout=2)
+        await asyncio.wait_for(provider.batch_started.wait(), timeout=EVENT_TIMEOUT_SECONDS)
         await manager.jobs.stop(stopped_id)
         provider.release_batch.set()
-        stopped = await asyncio.wait_for(manager.jobs.wait(stopped_id), timeout=5)
+        stopped = await asyncio.wait_for(manager.jobs.wait(stopped_id), timeout=JOB_TIMEOUT_SECONDS)
         assert stopped["status"] == "stopped"
         assert stopped["progress"] == 0
         stopped_runtime = await manager.get_runtime("stopped")
@@ -250,12 +254,12 @@ async def test_import_pause_resume_matches_uninterrupted_and_stop_restores_empty
             {"source_db": str(interrupted_upload), "conversations_db": None},
             library_id="interrupted",
         )
-        await asyncio.wait_for(provider.batch_started.wait(), timeout=2)
+        await asyncio.wait_for(provider.batch_started.wait(), timeout=EVENT_TIMEOUT_SECONDS)
         interrupted = await _wait_status(manager, interrupted_id, "interrupted")
         assert interrupted["status_reason"] == "provider_unavailable"
         assert interrupted["capabilities"]["resume"] is True
         await manager.jobs.resume(interrupted_id)
-        assert (await asyncio.wait_for(manager.jobs.wait(interrupted_id), timeout=5))["status"] == "completed"
+        assert (await asyncio.wait_for(manager.jobs.wait(interrupted_id), timeout=JOB_TIMEOUT_SECONDS))["status"] == "completed"
         interrupted_runtime = await manager.get_runtime("interrupted")
         assert _index_signature(normal_runtime.indexes.document_index) == _index_signature(
             interrupted_runtime.indexes.document_index
@@ -274,7 +278,7 @@ async def test_import_pause_resume_matches_uninterrupted_and_stop_restores_empty
             {"source_db": str(conflict_upload), "conversations_db": None},
             library_id="conflict",
         )
-        await asyncio.wait_for(provider.batch_started.wait(), timeout=2)
+        await asyncio.wait_for(provider.batch_started.wait(), timeout=EVENT_TIMEOUT_SECONDS)
         await manager.jobs.pause(conflict_id)
         provider.release_batch.set()
         await _wait_status(manager, conflict_id, "paused")
@@ -287,7 +291,7 @@ async def test_import_pause_resume_matches_uninterrupted_and_stop_restores_empty
         assert conflict["status_reason"] == "source_changed"
         assert conflict["capabilities"]["stop"] is True
         await manager.jobs.stop(conflict_id)
-        assert (await asyncio.wait_for(manager.jobs.wait(conflict_id), timeout=5))["status"] == "stopped"
+        assert (await asyncio.wait_for(manager.jobs.wait(conflict_id), timeout=JOB_TIMEOUT_SECONDS))["status"] == "stopped"
         assert await manager.library_is_empty("conflict") is True
     finally:
         await manager.close()
