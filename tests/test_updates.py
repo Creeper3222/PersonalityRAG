@@ -227,6 +227,7 @@ class _FakeEngine:
     def __init__(self) -> None:
         self.old = _container_fixture()
         self.calls: list[tuple] = []
+        self.created_bodies: list[dict] = []
         self.fail_target = False
         self.__class__.instances.append(self)
 
@@ -234,6 +235,17 @@ class _FakeEngine:
         if container == "target":
             return {"Image": "sha256:" + "2" * 64}
         return self.old
+
+    def inspect_image(self, image: str) -> dict:
+        return {
+            "Config": {
+                "Labels": {
+                    "org.opencontainers.image.version": "v0.1.1",
+                    "org.opencontainers.image.revision": SOURCE_COMMIT,
+                    "io.personalityrag.platform": "linux-docker",
+                }
+            }
+        }
 
     def stop(self, container: str, timeout: int = 120) -> None:
         self.calls.append(("stop", container))
@@ -243,6 +255,7 @@ class _FakeEngine:
 
     def create_container(self, name: str, body: dict) -> str:
         self.calls.append(("create", name))
+        self.created_bodies.append(body)
         return "target"
 
     def start(self, container: str) -> None:
@@ -263,7 +276,12 @@ def test_docker_helper_completes_and_records_transaction(tmp_path: Path, monkeyp
     transaction = tmp_path / "transaction.json"
     transaction.write_text(json.dumps({
         "transaction_id": "abcdef012345", "source_container_id": "old", "source_container_name": "PersonalityRAG",
-        "target_image_ref": "repo@" + DIGEST_B, "target_tag": "v0.1.0", "current_tag": "v0.1.0",
+        "target_image_ref": "repo@" + DIGEST_B, "target_tag": "v0.1.1", "current_tag": "v0.1.0",
     }), encoding="utf-8")
     assert docker_update_helper.apply(transaction) == 0
+    created = _FakeEngine.instances[-1].created_bodies[0]
+    assert created["Labels"]["com.docker.compose.service"] == "personalityrag"
+    assert created["Labels"]["org.opencontainers.image.version"] == "v0.1.1"
+    assert created["Labels"]["org.opencontainers.image.revision"] == SOURCE_COMMIT
+    assert created["Labels"]["io.personalityrag.platform"] == "linux-docker"
     assert json.loads(transaction.read_text(encoding="utf-8"))["status"] == "completed"

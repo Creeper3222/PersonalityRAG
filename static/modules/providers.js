@@ -129,10 +129,10 @@ async function loadProviders(render = true) {
             : usedBy.length === 1
               ? usedLibButton(usedBy[0], "used-lib-plain")
               : `<div class="used-lib-row">${usedLibButton(usedBy[0], "used-lib-first-btn")}<details class="used-lib-dd"><summary><span class="used-lib-count">＋${usedBy.length - 1}</span><span class="used-lib-caret" aria-hidden="true">▾</span></summary><ul class="${["used-lib-list", kind === "rerank" ? "used-lib-list-rerank" : "used-lib-list-embedding"].join(" ")}">${usedBy.slice(1).map((item) => `<li>${usedLibButton(item)}</li>`).join("")}</ul></details></div>`;
-          const maxContextText = provider.max_context_tokens_source?.startsWith("auto:")
-            && provider.max_context_tokens
-            ? `${t("autoDetect")} (${provider.max_context_tokens})`
-            : (provider.max_context_tokens || t("autoDetect"));
+          const contextMode = inferContextLengthMode(provider);
+          const maxContextText = provider.max_context_tokens
+            ? `${provider.max_context_tokens} · ${contextMode === "auto" ? t("contextLengthModeAuto") : t("contextLengthModeManual")}`
+            : t("maxContextAutoPending");
           const providerMetaRows = [
             `<dt>${escapeHtml(t("typeLabel"))}</dt><dd>${escapeHtml(providerTypeName(provider.type))}</dd>`,
             `<dt>${escapeHtml(t("modelLabel"))}</dt><dd>${escapeHtml(provider.model)}</dd>`,
@@ -349,51 +349,68 @@ function applyProviderFormKind(provider) {
   setProviderRowVisible("provider-launch-model-row", type === "xinference_rerank");
 }
 
-function applyProviderContextLock(provider, options = {}) {
+function inferContextLengthMode(provider = {}) {
   const source = String(provider.max_context_tokens_source || "");
-  const autoDetected = source.startsWith("auto:");
+  const tokens = Number(provider.max_context_tokens || 0);
+  const mode = String(provider.context_length_mode || "").toLowerCase();
+  if (mode === "auto" || mode === "manual") return mode;
+  if (source.startsWith("auto:")) return "auto";
+  return tokens >= 128 ? "manual" : "auto";
+}
+
+function applyProviderContextState(provider, options = {}) {
+  const source = String(provider.max_context_tokens_source || "");
+  const mode = inferContextLengthMode(provider);
+  const autoMode = mode === "auto";
   const input = $("provider-max-context");
   const help = $("provider-context-help");
-  input.value = provider.max_context_tokens ?? 0;
+  const sourceLabel = $("provider-context-source-label");
+  const modeSelect = $("provider-context-mode");
+  input.value = provider.max_context_tokens ?? (autoMode ? 0 : 512);
   input.dataset.originalValue = String(provider.max_context_tokens ?? 0);
   input.dataset.originalSource = source;
-  input.dataset.manualUnlocked = "false";
+  input.dataset.originalMode = mode;
   if (options.syncDraftOrigin) {
     $("provider-api-base").dataset.originalValue = $("provider-api-base").value;
     $("provider-model").dataset.originalValue = $("provider-model").value;
   }
   $("provider-max-context-source").value = source;
-  input.readOnly = autoDetected;
-  input.classList.toggle("readonly-lock", autoDetected);
-  input.setAttribute("aria-readonly", autoDetected ? "true" : "false");
+  if (modeSelect) modeSelect.value = mode;
+  input.readOnly = autoMode;
+  input.classList.toggle("readonly-lock", autoMode);
+  input.setAttribute("aria-readonly", autoMode ? "true" : "false");
   if (help) {
-    help.textContent = autoDetected
-      ? `${t("maxContextAutoHelp")} ${source}`
-      : t("maxContextManualHelp");
+    help.textContent = autoMode ? t("maxContextAutoHelp") : t("maxContextManualHelp");
   }
+  if (sourceLabel) {
+    const sourceText = source || (autoMode ? t("maxContextAutoPending") : "manual:user");
+    sourceLabel.textContent = `${t("maxContextSource")}: ${sourceText}`;
+  }
+}
+
+function applyProviderContextLock(provider, options = {}) {
+  applyProviderContextState(provider, options);
 }
 
 function refreshProviderContextDraftLock() {
   const input = $("provider-max-context");
-  const originalSource = String(input?.dataset.originalSource || "");
-  if (!originalSource.startsWith("auto:")) return;
+  const modeSelect = $("provider-context-mode");
+  if (!input || modeSelect?.value !== "auto") return;
   const changed = $("provider-api-base").value !== ($("provider-api-base").dataset.originalValue || "")
     || $("provider-model").value !== ($("provider-model").dataset.originalValue || "");
-  input.readOnly = !changed;
-  input.classList.toggle("readonly-lock", !changed);
-  input.setAttribute("aria-readonly", changed ? "false" : "true");
+  input.readOnly = true;
+  input.classList.add("readonly-lock");
+  input.setAttribute("aria-readonly", "true");
   if (changed) {
-    if (input.dataset.manualUnlocked !== "true") {
-      input.value = "0";
-      input.dataset.manualUnlocked = "true";
-    }
+    input.value = "0";
     $("provider-max-context-source").value = "";
-    $("provider-context-help").textContent = t("maxContextManualHelp");
+    $("provider-context-help").textContent = t("maxContextAutoPending");
+    $("provider-context-source-label").textContent = `${t("maxContextSource")}: ${t("maxContextAutoPending")}`;
   } else {
-    input.dataset.manualUnlocked = "false";
     input.value = input.dataset.originalValue || "0";
-    $("provider-max-context-source").value = originalSource;
-    $("provider-context-help").textContent = `${t("maxContextAutoHelp")} ${originalSource}`;
+    $("provider-max-context-source").value = input.dataset.originalSource || "";
+    $("provider-context-help").textContent = t("maxContextAutoHelp");
+    $("provider-context-source-label").textContent = `${t("maxContextSource")}: ${input.dataset.originalSource || t("maxContextAutoPending")}`;
   }
 }
 
@@ -478,6 +495,7 @@ function providerFormPayload() {
     clear_api_key: $("provider-clear-key").checked,
     model: $("provider-model").value.trim(),
     dimensions: rerank ? 0 : (Number($("provider-dimensions").value) || 0),
+    context_length_mode: rerank ? "auto" : ($("provider-context-mode")?.value || "auto"),
     max_context_tokens: rerank ? 0 : (Number($("provider-max-context").value) || 0),
     max_context_tokens_source: rerank ? "" : $("provider-max-context-source").value,
     return_documents: $("provider-return-documents").checked,
@@ -509,6 +527,12 @@ $("provider-form").onsubmit = async (event) => {
   const originalId = $("provider-original-id").value;
   if (validateIdentifierInput($("provider-id")) === null) return;
   const payload = providerFormPayload();
+  if (!isRerankProvider(payload.type)
+    && payload.context_length_mode === "manual"
+    && Number(payload.max_context_tokens || 0) < 128) {
+    toast(t("maxContextManualInvalid"), true);
+    return;
+  }
   try {
     if (originalId) {
       const originalProvider = state.providers.find((item) => item.id === originalId)
@@ -585,6 +609,7 @@ $("provider-detect-context").onclick = async () => {
       return;
     }
     const { clear_api_key, ...draft } = payload;
+    draft.context_length_mode = "auto";
     draft.max_context_tokens = 0;
     draft.max_context_tokens_source = "";
     const originalId = $("provider-original-id").value.trim();
@@ -596,8 +621,9 @@ $("provider-detect-context").onclick = async () => {
       body: JSON.stringify(draft),
     });
     if (result.max_context_tokens) {
-      applyProviderContextLock(
+      applyProviderContextState(
         {
+          context_length_mode: "auto",
           max_context_tokens: result.max_context_tokens,
           max_context_tokens_source: result.max_context_tokens_source || "",
         },
@@ -606,9 +632,10 @@ $("provider-detect-context").onclick = async () => {
       toast(`${t("autoDetect")} ${result.max_context_tokens}`);
       return;
     }
-    applyProviderContextLock({
-      max_context_tokens: Number($("provider-max-context").value) || 0,
-      max_context_tokens_source: "",
+    applyProviderContextState({
+      context_length_mode: "manual",
+      max_context_tokens: Math.max(512, Number($("provider-max-context").value) || 0),
+      max_context_tokens_source: "manual:fallback-undetected",
     });
     toast(t("maxContextManualHelp"), true);
   } catch (error) {
@@ -620,6 +647,18 @@ $("provider-detect-context").onclick = async () => {
 
 $("provider-api-base")?.addEventListener("input", refreshProviderContextDraftLock);
 $("provider-model")?.addEventListener("input", refreshProviderContextDraftLock);
+$("provider-context-mode")?.addEventListener("change", () => {
+  const mode = $("provider-context-mode").value;
+  if (mode === "manual") {
+    applyProviderContextState({
+      context_length_mode: "manual",
+      max_context_tokens: Math.max(512, Number($("provider-max-context").value) || 0),
+      max_context_tokens_source: $("provider-max-context-source").value || "manual:user",
+    });
+    return;
+  }
+  $("provider-detect-context")?.click();
+});
 
 function fillProviderSelect(select, selectedId = "", kind = "embedding", options = {}) {
   const candidates = state.providers.filter(

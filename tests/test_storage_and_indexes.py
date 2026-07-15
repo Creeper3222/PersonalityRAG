@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -7,7 +8,10 @@ import pytest
 
 from personalityrag.config import AppConfig, ProviderConfig, RecallConfig
 from personalityrag.graph import GraphBuilder
-from personalityrag.indexes import IndexManager
+from personalityrag.indexes import (
+    DEFAULT_DOCUMENT_EMBED_CHARS,
+    IndexManager,
+)
 from personalityrag.providers import EmbeddingProvider
 from personalityrag.retrieval import RetrievalEngine
 from personalityrag.service import PersonalityRAGService
@@ -59,6 +63,34 @@ class CountingProvider(FakeProvider):
         return await super().get_embeddings(texts)
 
 
+class FullInputCountingProvider(CountingProvider):
+    def __init__(self, config: ProviderConfig) -> None:
+        super().__init__()
+        self.config = config
+
+
+class StrictContextProvider(FakeProvider):
+    def __init__(self, config: ProviderConfig, *, detected_tokens: int = 128) -> None:
+        self.config = config
+        self.detected_tokens = detected_tokens
+        self.detect_calls = 0
+        self.embedded_texts: list[str] = []
+
+    async def detect_context_length(self):
+        self.detect_calls += 1
+        return {
+            "max_context_tokens": self.detected_tokens,
+            "max_context_tokens_source": "auto:strict-fixture",
+        }
+
+    async def get_embeddings(self, texts: list[str]) -> list[list[float]]:
+        hard_char_limit = max(64, int(self.detected_tokens * 0.75))
+        if any(len(text) > hard_char_limit for text in texts):
+            raise ValueError("fixture rejected over-context embedding input")
+        self.embedded_texts.extend(texts)
+        return [await FakeProvider.get_embedding(self, text) for text in texts]
+
+
 @pytest.mark.asyncio
 async def test_write_rebuild_recall_and_delete(tmp_path: Path):
     storage = Storage(tmp_path)
@@ -99,6 +131,141 @@ async def test_write_rebuild_recall_and_delete(tmp_path: Path):
     assert {item.doc_id for item in results} <= {first, second}
     assert await storage.delete_memories([first]) == 1
     assert await storage.get_document(first) is None
+
+
+@pytest.mark.asyncio
+async def test_embedding_inputs_are_stably_chunked_after_context_probe(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    storage = Storage(tmp_path)
+    await storage.initialize()
+    long_document = "document-prefix-" + ("A" * (DEFAULT_DOCUMENT_EMBED_CHARS + 256))
+    long_graph_fact = "graph-prefix-" + ("B" * (DEFAULT_DOCUMENT_EMBED_CHARS + 128))
+    long_query = "query-prefix-" + ("C" * (DEFAULT_DOCUMENT_EMBED_CHARS + 64))
+    await storage.create_memory(
+        {
+            "content": long_document,
+            "persona_id": "Default",
+            "topics": ["long-input"],
+            "key_facts": [long_graph_fact],
+        },
+        TextProcessor().tokenize,
+        GraphBuilder().build,
+    )
+    config = ProviderConfig(
+        id="display_context_only",
+        dimensions=FakeProvider.dimension,
+        max_context_tokens=1,
+        max_context_tokens_source="manual",
+    )
+    provider = FullInputCountingProvider(config)
+    indexes = IndexManager(
+        tmp_path,
+        storage,
+        provider,
+        "fake",
+        provider_id=config.id,
+    )
+    await indexes.initialize()
+
+    caplog.set_level(logging.WARNING, logger="personalityrag")
+    await indexes.rebuild(batch_size=1, concurrency=1)
+
+    assert provider.config.max_context_tokens == 4096
+    assert long_document not in provider.embedded_texts
+    assert long_document in "".join(provider.embedded_texts)
+    assert long_graph_fact in "".join(provider.embedded_texts)
+    assert all(len(text) <= 3072 for text in provider.embedded_texts)
+    rebuild_warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "Embedding 输入较长" in record.getMessage()
+    ]
+    assert rebuild_warnings
+    assert any("label=index_rebuild_documents" in item for item in rebuild_warnings)
+    assert any("policy=stable_char_chunk_mean_pool_v1" in item for item in rebuild_warnings)
+
+    caplog.clear()
+    provider.embedded_texts.clear()
+    await indexes.search_documents(long_query, 5)
+    await indexes.search_graph(long_query, 5)
+
+    assert long_query not in provider.embedded_texts
+    assert "".join(provider.embedded_texts) == long_query + long_query
+    assert all(len(text) <= 3072 for text in provider.embedded_texts)
+    query_warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "Embedding 输入较长" in record.getMessage()
+    ]
+    assert len(query_warnings) == 2
+    assert any("label=document_recall_query" in item for item in query_warnings)
+    assert any("label=graph_recall_query" in item for item in query_warnings)
+
+
+@pytest.mark.asyncio
+async def test_strict_provider_is_probed_once_and_never_receives_oversized_input(
+    tmp_path: Path,
+):
+    storage = Storage(tmp_path)
+    await storage.initialize()
+    source_text = "strict-provider-" + ("长" * 420)
+    await storage.create_memory(
+        {"content": source_text, "topics": ["strict"]},
+        TextProcessor().tokenize,
+        GraphBuilder().build,
+    )
+    config = ProviderConfig(
+        id="strict",
+        dimensions=FakeProvider.dimension,
+        max_context_tokens=0,
+    )
+    provider = StrictContextProvider(config)
+    indexes = IndexManager(tmp_path, storage, provider, "fake", provider_id=config.id)
+    await indexes.initialize()
+
+    manifest = await indexes.rebuild(batch_size=1, concurrency=1)
+
+    assert provider.detect_calls == 1
+    assert manifest["embedding_capability"]["detected_max_context_tokens"] == 128
+    assert manifest["chunked_document_count"] >= 1
+    assert all(len(text) <= 96 for text in provider.embedded_texts)
+    assert source_text in "".join(provider.embedded_texts)
+
+    provider.embedded_texts.clear()
+    await indexes.search_documents("查询" * 180, 5)
+    assert provider.detect_calls == 1
+    assert all(len(text) <= 96 for text in provider.embedded_texts)
+
+
+@pytest.mark.asyncio
+async def test_incremental_index_trusts_persisted_context_at_or_above_128(
+    tmp_path: Path,
+):
+    storage = Storage(tmp_path)
+    await storage.initialize()
+    config = ProviderConfig(
+        id="trusted-short-task",
+        dimensions=FakeProvider.dimension,
+        max_context_tokens=128,
+        max_context_tokens_source="auto:persisted",
+    )
+    provider = StrictContextProvider(config)
+    indexes = IndexManager(tmp_path, storage, provider, "fake", provider_id=config.id)
+    await indexes.initialize()
+    memory_id = await storage.create_memory(
+        {"content": "增量记忆" * 80, "topics": ["incremental"]},
+        TextProcessor().tokenize,
+        GraphBuilder().build,
+    )
+
+    result = await indexes.upsert_memories([memory_id], reason="trusted_context")
+
+    assert result["document_vectors"] == 1
+    assert provider.detect_calls == 0
+    assert provider.embedded_texts
+    assert all(len(text) <= 96 for text in provider.embedded_texts)
 
 
 @pytest.mark.asyncio

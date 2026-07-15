@@ -20,6 +20,10 @@ from .config import (
     RecallConfig,
 )
 from .compat import LIVINGMEMORY_DATABASE_VERSION
+from .context_lengths import (
+    MANUAL_CONTEXT_FALLBACK_TOKENS,
+    MIN_VALID_CONTEXT_TOKENS,
+)
 from .control import ControlStore, LibraryRecord, ProviderRevision
 from .identifiers import validate_identifier
 from .io_utils import run_blocking
@@ -1688,7 +1692,6 @@ class LibraryManager:
         task_context=None,
         checkpoint_dir: Path | None = None,
     ) -> dict[str, Any]:
-        runtime = await self.get_runtime(library_id)
         record = await self.control.get_library(library_id)
         if not record:
             raise KeyError(library_id)
@@ -1701,6 +1704,18 @@ class LibraryManager:
             raise ValueError("Provider 不存在")
         if not provider.config.enabled:
             raise ValueError("Provider 未启用")
+        provider, provider_metadata_changed = (
+            await self._refresh_context_length_for_long_task(
+                provider,
+                checkpoint_dir=checkpoint_dir,
+            )
+        )
+        if provider_metadata_changed:
+            await self.unload_runtime(
+                library_id,
+                reason="embedding_context_capability_refreshed",
+            )
+        runtime = await self.get_runtime(library_id)
         logger.warning(
             "开始重建记忆库索引：library_id=%s provider=%s revision=%s",
             library_id,
@@ -1733,7 +1748,6 @@ class LibraryManager:
         task_context=None,
         checkpoint_dir: Path | None = None,
     ) -> dict[str, Any]:
-        runtime = await self.get_runtime(library_id)
         record = await self.control.get_library(library_id)
         if not record:
             raise KeyError(library_id)
@@ -1744,6 +1758,18 @@ class LibraryManager:
             raise ValueError("Provider 不存在")
         if not provider.config.enabled:
             raise ValueError("Provider 未启用")
+        provider, provider_metadata_changed = (
+            await self._refresh_context_length_for_long_task(
+                provider,
+                checkpoint_dir=checkpoint_dir,
+            )
+        )
+        if provider_metadata_changed:
+            await self.unload_runtime(
+                library_id,
+                reason="embedding_context_capability_refreshed",
+            )
+        runtime = await self.get_runtime(library_id)
         logger.warning(
             "开始重建记忆库图数据与索引：library_id=%s provider=%s revision=%s",
             library_id,
@@ -1809,8 +1835,26 @@ class LibraryManager:
             keep_secret=bool(base) and not clear_api_key,
         )
         if provider_kind(config.type) != "embedding":
+            draft["context_length_mode"] = "auto"
             draft["max_context_tokens"] = 0
             draft["max_context_tokens_source"] = ""
+            return draft
+        mode = (
+            config.context_length_mode
+            if config.context_length_mode in {"auto", "manual"}
+            else "auto"
+        )
+        draft["context_length_mode"] = mode
+        if mode == "manual":
+            if int(config.max_context_tokens or 0) < MIN_VALID_CONTEXT_TOKENS:
+                raise ValueError(
+                    f"manual max_context_tokens must be >= {MIN_VALID_CONTEXT_TOKENS}"
+                )
+            draft["max_context_tokens"] = int(config.max_context_tokens)
+            draft["max_context_tokens_source"] = (
+                str(config.max_context_tokens_source or "").strip()
+                or "manual:user"
+            )
             return draft
         changed = (
             force
@@ -1818,43 +1862,45 @@ class LibraryManager:
             or config.type != base.type
             or config.api_base != base.api_base
             or config.model != base.model
+            or getattr(base, "context_length_mode", "auto") != "auto"
+            or int(config.max_context_tokens or 0) < MIN_VALID_CONTEXT_TOKENS
         )
         if changed:
             detected = await self._detect_context_length(config)
-            if detected.get("max_context_tokens"):
+            if int(detected.get("max_context_tokens") or 0) >= MIN_VALID_CONTEXT_TOKENS:
                 draft["max_context_tokens"] = int(detected["max_context_tokens"])
                 draft["max_context_tokens_source"] = str(
                     detected.get("max_context_tokens_source") or ""
                 )
+                draft["context_length_mode"] = "auto"
                 return draft
-            source = str(
-                draft.get("max_context_tokens_source")
-                or config.max_context_tokens_source
-                or ""
+            fallback_tokens = int(
+                draft.get("max_context_tokens") or config.max_context_tokens or 0
             )
-            if source.startswith("auto:"):
-                draft["max_context_tokens"] = 0
-                draft["max_context_tokens_source"] = ""
-            elif int(draft.get("max_context_tokens") or config.max_context_tokens or 0) > 0:
-                draft["max_context_tokens"] = int(
-                    draft.get("max_context_tokens") or config.max_context_tokens
-                )
-                draft["max_context_tokens_source"] = "manual"
-            else:
-                draft["max_context_tokens"] = 0
-                draft["max_context_tokens_source"] = ""
+            if fallback_tokens < MIN_VALID_CONTEXT_TOKENS:
+                fallback_tokens = MANUAL_CONTEXT_FALLBACK_TOKENS
+            draft["context_length_mode"] = "manual"
+            draft["max_context_tokens"] = fallback_tokens
+            draft["max_context_tokens_source"] = "manual:fallback-undetected"
             return draft
-        if int(config.max_context_tokens or 0) > 0 and not str(
-            config.max_context_tokens_source or ""
-        ).startswith("auto:"):
-            draft["max_context_tokens_source"] = "manual"
-        elif int(config.max_context_tokens or 0) <= 0:
+        if int(config.max_context_tokens or 0) < MIN_VALID_CONTEXT_TOKENS:
+            draft["max_context_tokens"] = 0
             draft["max_context_tokens_source"] = ""
+        else:
+            draft["max_context_tokens"] = int(config.max_context_tokens)
+            draft["max_context_tokens_source"] = str(
+                config.max_context_tokens_source or ""
+            )
         return draft
 
     async def _detect_context_length(self, config: ProviderConfig) -> dict[str, Any]:
         provider = build_provider(
-            replace(config, max_context_tokens=0, max_context_tokens_source="")
+            replace(
+                config,
+                context_length_mode="auto",
+                max_context_tokens=0,
+                max_context_tokens_source="",
+            )
         )
         try:
             result = await provider.detect_context_length()
@@ -1878,12 +1924,96 @@ class LibraryManager:
         finally:
             await provider.close()
 
+    async def _refresh_context_length_for_long_task(
+        self,
+        provider: ProviderRevision,
+        *,
+        checkpoint_dir: Path | None,
+    ) -> tuple[ProviderRevision, bool]:
+        """Probe once at long-task start and persist display capability metadata.
+
+        A resumed job owns a verified capability snapshot in its checkpoint.  It
+        must reuse that snapshot so a single logical task never changes its
+        chunking boundary halfway through a rebuild.
+        """
+        checkpoint_path = (
+            checkpoint_dir / "checkpoint.json" if checkpoint_dir is not None else None
+        )
+        if checkpoint_path is not None and checkpoint_path.exists():
+            try:
+                checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+                capability = checkpoint.get("embedding_capability")
+                if isinstance(capability, dict) and int(
+                    capability.get("detected_max_context_tokens") or 0
+                ) >= 128:
+                    return provider, False
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                # The index task owns checkpoint-corruption handling and can
+                # recover from checkpoint.prev.json deterministically.
+                pass
+
+        context_length_mode = "auto"
+        if provider.config.context_length_mode == "manual":
+            context_length_mode = "manual"
+            max_context_tokens = int(provider.config.max_context_tokens or 0)
+            max_context_tokens_source = str(
+                provider.config.max_context_tokens_source or "manual:user"
+            )
+        else:
+            detected = await self._detect_context_length(provider.config)
+            max_context_tokens = int(detected.get("max_context_tokens") or 0)
+            max_context_tokens_source = str(
+                detected.get("max_context_tokens_source") or ""
+            )
+        if max_context_tokens < MIN_VALID_CONTEXT_TOKENS:
+            existing_tokens = int(provider.config.max_context_tokens or 0)
+            max_context_tokens = (
+                existing_tokens
+                if existing_tokens >= MIN_VALID_CONTEXT_TOKENS
+                else MANUAL_CONTEXT_FALLBACK_TOKENS
+            )
+            max_context_tokens_source = "manual:fallback-undetected"
+            context_length_mode = "manual"
+        if max_context_tokens < 128:
+            raise JobInterrupted(
+                "provider_context_probe_failed",
+                "无法确认 Embedding Provider 的上下文长度，任务已中断并保留在安全状态",
+                error=(
+                    f"provider={provider.provider_id}, "
+                    f"detected_tokens={max_context_tokens}, minimum=128"
+                ),
+            )
+        if (
+            int(provider.config.max_context_tokens or 0) == max_context_tokens
+            and str(provider.config.max_context_tokens_source or "")
+            == max_context_tokens_source
+            and provider.config.context_length_mode == context_length_mode
+        ):
+            return provider, False
+        refreshed = await self.control.update_provider(
+            provider.provider_id,
+            {
+                "context_length_mode": context_length_mode,
+                "max_context_tokens": max_context_tokens,
+                "max_context_tokens_source": max_context_tokens_source,
+            },
+        )
+        logger.info(
+            "长任务已刷新 Embedding 上下文能力：provider=%s revision=%s tokens=%s source=%s",
+            refreshed.provider_id,
+            refreshed.revision,
+            max_context_tokens,
+            max_context_tokens_source,
+        )
+        return refreshed, True
+
     async def detect_context_length(
         self,
         payload: dict[str, Any],
         provider_id: str | None = None,
     ) -> dict[str, Any]:
         draft = dict(payload)
+        draft["context_length_mode"] = "auto"
         draft["max_context_tokens"] = 0
         draft["max_context_tokens_source"] = ""
         current = await self.control.get_provider(provider_id) if provider_id else None

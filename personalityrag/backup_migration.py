@@ -22,6 +22,11 @@ from .config import (
     app_config_from_dict,
     save_config,
 )
+from .context_lengths import (
+    MANUAL_CONTEXT_FALLBACK_TOKENS,
+    MIN_VALID_CONTEXT_TOKENS,
+    static_context_table_metadata,
+)
 from .identifiers import validate_identifier
 from .io_utils import run_blocking
 from .libraries import LibraryManager
@@ -47,6 +52,67 @@ SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 class PragPackageError(RuntimeError):
     pass
+
+
+def _normalize_provider_context_config(config: dict[str, Any]) -> dict[str, int]:
+    summary = {
+        "auto_pending": 0,
+        "manual_fallback": 0,
+        "legacy_manual": 0,
+    }
+    provider_type = str(config.get("type") or "")
+    if "embedding" not in provider_type:
+        config["context_length_mode"] = "auto"
+        config["max_context_tokens"] = 0
+        config["max_context_tokens_source"] = ""
+        return summary
+    try:
+        tokens = int(config.get("max_context_tokens") or 0)
+    except (TypeError, ValueError):
+        tokens = 0
+    source = str(config.get("max_context_tokens_source") or "")
+    mode = str(config.get("context_length_mode") or "").strip().lower()
+    if mode not in {"auto", "manual"}:
+        if source.startswith("auto:"):
+            mode = "auto"
+        elif tokens >= MIN_VALID_CONTEXT_TOKENS:
+            mode = "manual"
+            summary["legacy_manual"] += 1
+        else:
+            mode = "auto"
+            tokens = 0
+            source = ""
+    if mode == "manual":
+        if tokens < MIN_VALID_CONTEXT_TOKENS:
+            tokens = MANUAL_CONTEXT_FALLBACK_TOKENS
+            source = "manual:fallback-undetected"
+            summary["manual_fallback"] += 1
+        elif not source:
+            source = "manual:user"
+    elif tokens < MIN_VALID_CONTEXT_TOKENS:
+        tokens = 0
+        source = ""
+        summary["auto_pending"] += 1
+    config["context_length_mode"] = mode
+    config["max_context_tokens"] = tokens
+    config["max_context_tokens_source"] = source
+    return summary
+
+
+def _normalize_provider_snapshot_context(snapshot: dict[str, Any]) -> dict[str, int]:
+    summary = {
+        "auto_pending": 0,
+        "manual_fallback": 0,
+        "legacy_manual": 0,
+    }
+    for revision in snapshot.get("provider_revisions") or []:
+        config = revision.get("config")
+        if not isinstance(config, dict):
+            continue
+        item_summary = _normalize_provider_context_config(config)
+        for key, value in item_summary.items():
+            summary[key] = summary.get(key, 0) + int(value or 0)
+    return summary
 
 
 @asynccontextmanager
@@ -198,6 +264,7 @@ async def export_prag_package(
         provider_snapshot: dict[str, Any] | None = None
         if include_providers:
             provider_snapshot = await manager.control.export_provider_snapshot()
+            provider_snapshot["context_length_table"] = static_context_table_metadata()
             _add_json_file(files, "providers/providers.json", provider_snapshot)
 
         library_entries = []
@@ -756,6 +823,15 @@ async def import_prag_package(
                 _load_json,
                 extract_dir / "providers" / "providers.json",
             )
+            context_length_migration = _normalize_provider_snapshot_context(
+                provider_snapshot
+            )
+        else:
+            context_length_migration = {
+                "auto_pending": 0,
+                "manual_fallback": 0,
+                "legacy_manual": 0,
+            }
         prepared_libraries = None
         if scope.get("include_libraries"):
             current_providers = await manager.control.export_provider_snapshot()
@@ -814,6 +890,7 @@ async def import_prag_package(
         "default_library_id": manifest.get("default_library_id") or "",
         "libraries_imported": len((prepared_libraries or {}).get("libraries") or []),
         "providers_imported": len((provider_snapshot or {}).get("providers") or []),
+        "context_length_migration": context_length_migration,
         "missing_provider_ids": (prepared_libraries or {}).get(
             "missing_providers", []
         ),

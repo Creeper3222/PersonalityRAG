@@ -76,6 +76,7 @@ class ProviderConfig:
     api_base: str = "http://127.0.0.1:8001/v1"
     api_key: str = "vllm"
     model: str = "BAAI/bge-m3"
+    context_length_mode: str = "auto"
     dimensions: int = 1024
     max_context_tokens: int = 0
     max_context_tokens_source: str = ""
@@ -221,6 +222,21 @@ def _merge_dataclass(cls, raw: dict[str, Any] | None):
     raw = raw or {}
     allowed = {item.name for item in cls.__dataclass_fields__.values()}
     payload = {key: value for key, value in raw.items() if key in allowed}
+    if cls is ProviderConfig:
+        if payload.get("type") == "openai_compatible":
+            payload["type"] = "vllm_embedding"
+        if "context_length_mode" not in payload:
+            source = str(payload.get("max_context_tokens_source") or "")
+            tokens = int(payload.get("max_context_tokens") or 0)
+            if source.startswith("auto:"):
+                payload["context_length_mode"] = "auto"
+            elif tokens >= 128:
+                payload["context_length_mode"] = "manual"
+                payload.setdefault("max_context_tokens_source", "manual")
+            else:
+                payload["context_length_mode"] = "auto"
+                payload["max_context_tokens"] = 0
+                payload["max_context_tokens_source"] = ""
     if cls is ProviderConfig and isinstance(
         payload.get("index_rebuild_settings"), dict
     ):

@@ -10,6 +10,15 @@ from typing import Any
 from .docker_engine import DockerEngineClient, clone_container_body
 
 
+IMAGE_IDENTITY_LABELS = (
+    "org.opencontainers.image.title",
+    "org.opencontainers.image.version",
+    "org.opencontainers.image.revision",
+    "org.opencontainers.image.source",
+    "io.personalityrag.platform",
+)
+
+
 def _read(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -19,6 +28,21 @@ def _write(path: Path, payload: dict[str, Any], **changes: Any) -> None:
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(temporary, path)
+
+
+def _target_container_body(
+    engine: DockerEngineClient, old: dict[str, Any], target_ref: str
+) -> dict[str, Any]:
+    body = clone_container_body(old, target_ref)
+    image_labels = (
+        (engine.inspect_image(target_ref).get("Config") or {}).get("Labels") or {}
+    )
+    labels = dict(body.get("Labels") or {})
+    for key in IMAGE_IDENTITY_LABELS:
+        if key in image_labels:
+            labels[key] = image_labels[key]
+    body["Labels"] = labels
+    return body
 
 
 def apply(transaction_file: Path) -> int:
@@ -40,7 +64,10 @@ def apply(transaction_file: Path) -> int:
         engine.rename(old_id, rollback_name)
         old_renamed = True
         _write(transaction_file, payload, stage="creating_target")
-        target_id = engine.create_container(original_name, clone_container_body(old, target_ref))
+        target_id = engine.create_container(
+            original_name,
+            _target_container_body(engine, old, target_ref),
+        )
         engine.start(target_id)
         _write(transaction_file, payload, stage="checking_target", target_container_id=target_id)
         if not engine.wait_healthy(target_id, expected_version=str(payload["target_tag"]), timeout=180):

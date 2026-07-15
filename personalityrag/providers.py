@@ -13,6 +13,10 @@ from urllib.parse import urlparse
 import httpx
 
 from .config import IndexRebuildSettings, ProviderConfig
+from .context_lengths import (
+    MIN_VALID_CONTEXT_TOKENS,
+    lookup_static_context_length,
+)
 from .identifiers import validate_identifier
 from .logger import logger, safe_summary
 
@@ -25,6 +29,7 @@ PROVIDER_TEMPLATES: dict[str, dict[str, Any]] = {
         "api_key": "",
         "model": "text-embedding-3-small",
         "dimensions": 1536,
+        "context_length_mode": "auto",
         "max_context_tokens": 0,
         "max_context_tokens_source": "",
         "timeout_seconds": 30,
@@ -40,6 +45,7 @@ PROVIDER_TEMPLATES: dict[str, dict[str, Any]] = {
         "api_key": "",
         "model": "gemini-embedding-exp-03-07",
         "dimensions": 768,
+        "context_length_mode": "auto",
         "max_context_tokens": 0,
         "max_context_tokens_source": "",
         "timeout_seconds": 20,
@@ -55,6 +61,7 @@ PROVIDER_TEMPLATES: dict[str, dict[str, Any]] = {
         "api_key": "",
         "model": "nvidia/llama-nemotron-embed-1b-v2",
         "dimensions": 1024,
+        "context_length_mode": "auto",
         "max_context_tokens": 0,
         "max_context_tokens_source": "",
         "timeout_seconds": 20,
@@ -71,6 +78,7 @@ PROVIDER_TEMPLATES: dict[str, dict[str, Any]] = {
         "api_key": "",
         "model": "nomic-embed-text",
         "dimensions": 768,
+        "context_length_mode": "auto",
         "max_context_tokens": 0,
         "max_context_tokens_source": "",
         "timeout_seconds": 60,
@@ -86,6 +94,7 @@ PROVIDER_TEMPLATES: dict[str, dict[str, Any]] = {
         "api_key": "",
         "model": "BAAI/bge-m3",
         "dimensions": 1024,
+        "context_length_mode": "auto",
         "max_context_tokens": 0,
         "max_context_tokens_source": "",
         "timeout_seconds": 30,
@@ -199,7 +208,7 @@ def provider_config_hash(config: ProviderConfig) -> str:
     payload.pop("concurrency", None)
     payload.pop("max_retries", None)
     payload.pop("display_name", None)
-    payload.pop("max_context_tokens", None)
+    payload.pop("context_length_mode", None)
     payload.pop("max_context_tokens_source", None)
     payload = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -227,6 +236,16 @@ def validate_provider_config(config: ProviderConfig) -> None:
         raise ValueError("嵌入维度不能小于 0")
     if config.max_context_tokens < 0:
         raise ValueError("max_context_tokens must not be negative")
+    if config.context_length_mode not in {"auto", "manual"}:
+        raise ValueError("context_length_mode must be auto or manual")
+    if (
+        provider_kind(config.type) == "embedding"
+        and config.context_length_mode == "manual"
+        and config.max_context_tokens < MIN_VALID_CONTEXT_TOKENS
+    ):
+        raise ValueError(
+            f"manual max_context_tokens must be >= {MIN_VALID_CONTEXT_TOKENS}"
+        )
     if config.timeout_seconds <= 0:
         raise ValueError("超时时间必须大于 0")
     if config.batch_size <= 0 or config.concurrency <= 0:
@@ -257,6 +276,7 @@ def config_from_dict(
     keep_secret: bool = False,
 ) -> ProviderConfig:
     source = asdict(base) if base else {}
+    context_mode_supplied = "context_length_mode" in payload
     allowed = set(ProviderConfig.__dataclass_fields__)
     had_nested_rebuild_settings = isinstance(
         source.get("index_rebuild_settings"), dict
@@ -290,6 +310,24 @@ def config_from_dict(
             if "max_retries" in source:
                 defaults["max_retries"] = source["max_retries"]
         source["index_rebuild_settings"] = IndexRebuildSettings(**defaults)
+    if not context_mode_supplied and base is None:
+        max_context_tokens = int(source.get("max_context_tokens") or 0)
+        max_context_source = str(source.get("max_context_tokens_source") or "")
+        if max_context_source.startswith("auto:"):
+            source["context_length_mode"] = "auto"
+        elif max_context_tokens >= MIN_VALID_CONTEXT_TOKENS:
+            source["context_length_mode"] = "manual"
+            source.setdefault("max_context_tokens_source", "manual")
+        else:
+            source["context_length_mode"] = "auto"
+            source["max_context_tokens"] = 0
+            source["max_context_tokens_source"] = ""
+    if str(source.get("context_length_mode") or "auto") == "manual":
+        source["max_context_tokens_source"] = str(
+            source.get("max_context_tokens_source") or "manual"
+        )
+    elif int(source.get("max_context_tokens") or 0) <= 0:
+        source["max_context_tokens_source"] = ""
     config = ProviderConfig(**source)
     validate_provider_config(config)
     return config
@@ -404,7 +442,7 @@ class HTTPEmbeddingProvider(EmbeddingProvider):
                     return nested
         return None
 
-    async def detect_context_length(self) -> dict[str, Any]:
+    async def _detect_context_length_from_models(self) -> dict[str, Any]:
         try:
             for item in await self.list_models():
                 if not isinstance(item, dict) or not self._model_matches(item):
@@ -424,6 +462,19 @@ class HTTPEmbeddingProvider(EmbeddingProvider):
                 safe_summary(exc, max_chars=160),
             )
         return {"max_context_tokens": 0, "max_context_tokens_source": ""}
+
+    def _detect_static_context_length(self) -> dict[str, Any]:
+        candidates = [self.config.model]
+        if self._resolved_model and self._resolved_model != self.config.model:
+            candidates.insert(0, self._resolved_model)
+        for model_name in candidates:
+            detected = lookup_static_context_length(model_name)
+            if detected.get("max_context_tokens"):
+                return detected
+        return {"max_context_tokens": 0, "max_context_tokens_source": ""}
+
+    async def detect_context_length(self) -> dict[str, Any]:
+        return self._detect_static_context_length()
 
     async def _retry(self, operation):
         last_error: Exception | None = None
@@ -537,13 +588,6 @@ class OpenAIEmbeddingProvider(HTTPEmbeddingProvider):
         return list(response.json().get("data") or [])
 
     async def detect_context_length(self) -> dict[str, Any]:
-        model = self.config.model.strip()
-        value = OPENAI_EMBEDDING_CONTEXT_LENGTHS.get(model)
-        if value:
-            return {
-                "max_context_tokens": value,
-                "max_context_tokens_source": f"auto:{self.config.type}:known-model-table",
-            }
         return await super().detect_context_length()
 
     async def get_embeddings(self, texts: list[str]) -> list[list[float]]:
@@ -686,7 +730,7 @@ class VLLMEmbeddingProvider(HTTPEmbeddingProvider):
         return list(response.json().get("data") or [])
 
     async def detect_context_length(self) -> dict[str, Any]:
-        detected = await super().detect_context_length()
+        detected = await self._detect_context_length_from_models()
         if detected.get("max_context_tokens"):
             return detected
         try:
@@ -710,7 +754,7 @@ class VLLMEmbeddingProvider(HTTPEmbeddingProvider):
                 self.config.id,
                 safe_summary(exc, max_chars=160),
             )
-        return {"max_context_tokens": 0, "max_context_tokens_source": ""}
+        return self._detect_static_context_length()
 
     async def _resolve_model(self) -> str:
         if self._resolved_model:
@@ -799,7 +843,7 @@ class OllamaEmbeddingProvider(HTTPEmbeddingProvider):
                 self.config.id,
                 safe_summary(exc, max_chars=160),
             )
-        return await super().detect_context_length()
+        return self._detect_static_context_length()
 
     async def get_embeddings(self, texts: list[str]) -> list[list[float]]:
         if not texts:
