@@ -160,6 +160,7 @@ function requestBackupExportScope({ suggestedName = "" } = {}) {
 function settingsDraft() {
   return {
     access_base_url: $("settings-access-base-url")?.value.trim() || "",
+    public_adapter_url: $("settings-public-adapter-url")?.value.trim() || "",
     port: Number($("settings-port")?.value || 0),
     access_port: Number($("settings-access-port")?.value || 0),
     new_password: $("settings-password")?.value || "",
@@ -174,6 +175,7 @@ function hasUnsavedSettingsChanges() {
   const draft = settingsDraft();
   return (
     draft.access_base_url !== (state.settings.access_base_url || "http://127.0.0.1") ||
+    draft.public_adapter_url !== (state.settings.public_adapter_url || "") ||
     draft.port !== Number(state.settings.configured_port || 8765) ||
     draft.access_port !== Number(state.settings.configured_access_port || 8766) ||
     draft.runtime_idle_minutes !== Number(state.settings.runtime_residency?.idle_minutes || 30) ||
@@ -352,7 +354,7 @@ function showRestartScreen(payload) {
 
 async function loadSettings() {
   try {
-    if (!$("settings-access-base-url") || !$("settings-access-port")) {
+    if (!$("settings-access-base-url") || !$("settings-access-port") || !$("settings-public-adapter-url")) {
       window.location.reload();
       return;
     }
@@ -364,6 +366,9 @@ async function loadSettings() {
       data.configured_webui_url || data.webui_url || data.access_url || "—",
     );
     $("settings-access-base-url").value = data.access_base_url || "http://127.0.0.1";
+    $("settings-public-adapter-url").value = data.public_adapter_url || "";
+    $("settings-public-adapter-url-current").textContent =
+      data.public_adapter_url || t("publicAdapterUrlNotConfigured");
     $("settings-port").value = data.configured_port || 8765;
     $("settings-actual-port").textContent = formatRuntimePendingValue(
       data.actual_port,
@@ -387,6 +392,7 @@ async function loadSettings() {
     $("settings-note").textContent = t("settingsPortRestartHint");
     await loadUpdateStatus();
   } catch (error) {
+    if (error?.name === "AbortError") return;
     toast(error.message, true);
   }
 }
@@ -432,7 +438,9 @@ function renderUpdateStatus(payload) {
 }
 
 async function loadUpdateStatus({ refresh = false } = {}) {
-  const payload = await api(`/updates/status${refresh ? "?refresh=true" : ""}`);
+  const payload = await api(`/updates/status${refresh ? "?refresh=true" : ""}`, {
+    pageScoped: false,
+  });
   renderUpdateStatus(payload);
   return payload;
 }
@@ -516,7 +524,9 @@ async function checkLastUpdateTransaction() {
   const transactionId = localStorage.getItem("personalityrag_update_transaction") || "";
   if (!transactionId) return null;
   try {
-    const payload = await api(`/updates/transactions/${encodeURIComponent(transactionId)}`);
+    const payload = await api(`/updates/transactions/${encodeURIComponent(transactionId)}`, {
+      pageScoped: false,
+    });
     if (payload.status === "completed") {
       localStorage.removeItem("personalityrag_update_transaction");
       toast(t("versionSwitchCompleted", { tag: payload.target_tag || payload.target_version }));

@@ -47,6 +47,7 @@ def _tracked_text_files() -> list[Path]:
         REPO_ROOT / item
         for item in paths
         if item
+        and (REPO_ROOT / item).is_file()
         and (
             Path(item).suffix.lower() in TEXT_SUFFIXES
             or Path(item).name == ".editorconfig"
@@ -102,7 +103,14 @@ def test_russian_locale_has_no_cjk_mojibake_or_copied_ui_sentences() -> None:
 
 
 def test_html_i18n_references_exist_in_every_locale() -> None:
-    html = (REPO_ROOT / "static" / "index.html").read_text(encoding="utf-8")
+    html = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (
+            REPO_ROOT / "static" / "index.html",
+            REPO_ROOT / "static" / "database-types" / "livingmemory-v8.html",
+            REPO_ROOT / "static" / "database-types" / "text-media-v1.html",
+        )
+    )
     referenced = set(
         re.findall(r'data-i18n(?:-placeholder)?="([^"]+)"', html)
     )

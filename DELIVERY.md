@@ -39,6 +39,11 @@ WebUI 验收截图位于 `data/libraries/beileite/reports`。
 - 每个库的 Recall 与衰减、清理、备份设置已独立写入全局控制库
 - 多库隔离、懒加载、Provider revision、密钥掩码、占用保护及重启恢复均已实测
 
+> Current runtime layout note: v0.1.1 migrates the historical
+> `data/libraries/beileite` root to
+> `data/databases/memory_stores/livingmemory_v8/beileite`; the historical
+> paths above describe the original v0.1.0 delivery artifacts.
+
 ## 校验结论
 
 - `livingmemory.db` 与源快照的非派生表数量、主键、UUID、metadata 和行哈希一致。

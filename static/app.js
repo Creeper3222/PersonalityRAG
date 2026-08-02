@@ -1,18 +1,21 @@
 import enUS from "./locales/en.js";
 import ruRU from "./locales/ru.js";
 import zhCN from "./locales/zh.js";
-import { createGraphController } from "./modules/graph.js";
 import { createTaskLogController } from "./modules/tasks-logs.js";
 import { createApiClient, parseDownloadFilename, responseError } from "./modules/api.js";
 import { createSettingsController } from "./modules/settings.js";
 import { createLibrariesController } from "./modules/libraries.js";
 import { createProvidersController } from "./modules/providers.js";
-import { createMemoriesController } from "./modules/memories.js";
-import { createRecallController } from "./modules/recall.js";
-import { createSystemController } from "./modules/system.js";
 import { createFileManagerController } from "./modules/files.js";
+import { createGlobalSystemController } from "./modules/global-system.js";
+import { createRevisionDebugController } from "./modules/revision-debug.js";
+import { createAsyncActionGuard } from "./modules/ui-guard.js";
+import {
+  createDatabaseUiRegistry,
+  databasePageRoute, databaseTypePageRoute, globalPageRoute, parsePageRoute,
+} from "./modules/database-ui-registry.js";
+const DEFAULT_DATABASE_TYPE = "livingmemory_v8";
 const $ = (id) => document.getElementById(id);
-
 document.querySelector('.nav[data-page="system"]')?.after(
   document.querySelector('.nav[data-page="files"]'),
 );
@@ -20,15 +23,23 @@ document.querySelector('.nav[data-page="system"]')?.after(
 const APP_PAGES = new Set([
   "libraries",
   "providers",
+  "database",
   "graph",
   "memory",
   "recall",
   "system",
   "files",
   "settings",
+  "revision-debug",
   "logs",
 ]);
-const RESTART_RETURN_PAGE = "settings";
+const GLOBAL_PAGES = new Set(["libraries", "providers", "system", "files", "settings", "revision-debug", "logs"]);
+const LEGACY_DATABASE_PAGES = Object.freeze({
+  graph: "graph",
+  memory: "memories",
+  recall: "recall",
+});
+const RESTART_RETURN_PAGE = "libraries";
 
 function isValidPage(page) {
   return APP_PAGES.has(page);
@@ -37,7 +48,7 @@ function isValidPage(page) {
 function consumeInitialRouteState() {
   const url = new URL(window.location.href);
   const requestedPage = url.searchParams.get("page");
-  const page = isValidPage(requestedPage) ? requestedPage : "libraries";
+  const page = url.searchParams.has("restart") ? "libraries" : requestedPage || "libraries";
   const shouldCleanup =
     url.searchParams.has("page") || url.searchParams.has("restart");
   if (shouldCleanup) {
@@ -52,6 +63,10 @@ const initialRouteState = consumeInitialRouteState();
 
 const state = {
   page: initialRouteState.page,
+  pageRequests: {
+    generation: 0,
+    controller: new AbortController(),
+  },
   memoryPage: 1,
   memoryPageSize: 20,
   memoryHasMore: false,
@@ -59,7 +74,9 @@ const state = {
   selectedMemoryId: null,
   selectedMemoryDetail: null,
   stats: null,
-  libraries: [],
+  databases: [],
+  databaseTypes: [],
+  databaseCategory: "memory",
   providers: [],
   providerTypes: [],
   providerStatuses: {},
@@ -91,8 +108,10 @@ const state = {
     probeCursor: 0,
     lastPhase: "",
   },
-  selectedLibraryId: localStorage.getItem("prag_library_id") || "",
-  expandedLibraryIds: new Set(),
+  selectedDatabaseId: "",
+  selectedDatabaseType: DEFAULT_DATABASE_TYPE,
+  selectedDatabaseRefByCategory: { memory: null, knowledge: null },
+  expandedDatabaseRefs: new Set(),
   optimisticIndexConflicts: new Set(),
   logs: {
     items: [],
@@ -128,6 +147,11 @@ const DEFAULT_LIBRARY_CONVERSATION_SETTINGS = {
 const DEFAULT_LIBRARY_RECALL_SETTINGS = {
   rrf_k: 60,
   decay_rate: 0,
+  min_importance_for_retrieval: 0,
+  min_similarity_for_retrieval: 0,
+  recent_memory_count: 2,
+  recent_memory_max_age_hours: 72,
+  memory_type_filter: "all",
   access_decay_window_days: 30,
   access_decay_max_count: 10,
   access_count_decay_multiplier: 0.5,
@@ -158,14 +182,17 @@ const DEFAULT_LIBRARY_MAINTENANCE_SETTINGS = {
   backup_enabled: true,
   backup_keep_days: 7,
   auto_cleanup_enabled: false,
+  auto_archived_enabled: false,
   cleanup_days_threshold: 7,
   cleanup_importance_threshold: 0.3,
+  protected_importance_threshold: 1,
 };
 
 const DEFAULT_RECALL_K = 5;
 const DEFAULT_RERANK_K = 5;
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9_-]+$/;
 const LIBRARY_EXPAND_ICON = `<svg viewBox="0 0 240 24" aria-hidden="true"><circle cx="24" cy="12" r="4.5"/><circle cx="120" cy="12" r="4.5"/><circle cx="216" cy="12" r="4.5"/></svg>`;
+const asyncGuard = createAsyncActionGuard();
 
 function validateIdentifierInput(input) {
   const value = input?.value ?? "";
@@ -243,12 +270,12 @@ function applyLanguage() {
       element.placeholder = t(key);
     }
   });
-  $("page-title").textContent = t(state.page);
+  $("page-title").textContent = t(state.pageTitleKey || state.page);
   applyLoginMode({ login_mode: state.loginMode });
-  $("memory-sort").querySelector('[value="created_desc"]').textContent = t("sortNewest");
-  $("memory-sort").querySelector('[value="created_asc"]').textContent = t("sortOldest");
-  $("memory-sort").querySelector('[value="importance_desc"]').textContent = t("sortImportanceDesc");
-  $("memory-sort").querySelector('[value="importance_asc"]').textContent = t("sortImportanceAsc");
+  $("memory-sort")?.querySelector('[value="created_desc"]')?.replaceChildren(t("sortNewest"));
+  $("memory-sort")?.querySelector('[value="created_asc"]')?.replaceChildren(t("sortOldest"));
+  $("memory-sort")?.querySelector('[value="importance_desc"]')?.replaceChildren(t("sortImportanceDesc"));
+  $("memory-sort")?.querySelector('[value="importance_asc"]')?.replaceChildren(t("sortImportanceAsc"));
   $("language").value = lang;
 }
 
@@ -313,11 +340,39 @@ function confirmDialog({ title = t("confirmTitle"), message = "", confirmText = 
   });
 }
 
-const api = createApiClient({
+const rawApi = createApiClient({
   onUnauthorized: () => showLogin(),
   unauthorizedMessage: () => t("unauthorized"),
   onOperationalError: (error) => logUiFeedback(error.message, "ERROR"),
 });
+
+function pageRequestAbortError() {
+  const error = new Error("Page request superseded");
+  error.name = "AbortError";
+  return error;
+}
+
+function beginPageRequestGeneration() {
+  state.pageRequests.controller.abort();
+  state.pageRequests = {
+    generation: state.pageRequests.generation + 1,
+    controller: new AbortController(),
+  };
+  return state.pageRequests.generation;
+}
+
+async function api(path, options = {}) {
+  const { pageScoped = true, ...requestOptions } = options;
+  const method = String(requestOptions.method || "GET").toUpperCase();
+  const scoped = pageScoped && method === "GET" && !requestOptions.signal;
+  const generation = state.pageRequests.generation;
+  if (scoped) requestOptions.signal = state.pageRequests.controller.signal;
+  const payload = await rawApi(path, requestOptions);
+  if (scoped && generation !== state.pageRequests.generation) {
+    throw pageRequestAbortError();
+  }
+  return payload;
+}
 
 const {
   requestBackupPassword, requestBackupExportScope,
@@ -334,24 +389,61 @@ const {
   escapeHtml,
   confirmDialog,
 });
-function libraryApi(path, options = {}) {
-  if (!state.selectedLibraryId) {
+function databaseRefKey(databaseType, databaseId) {
+  return `${databaseType || DEFAULT_DATABASE_TYPE}:${databaseId || ""}`;
+}
+
+const DATABASE_TYPE_API_CLIENTS = Object.freeze({
+  livingmemory_v8: Object.freeze({
+    collection: "/memory-libraries/livingmemory_v8",
+  }),
+  text_media_v1: Object.freeze({
+    collection: "/knowledge-libraries/text_media_v1",
+  }),
+});
+
+function databaseTypeApiClient(databaseType) {
+  const normalizedType = databaseType || DEFAULT_DATABASE_TYPE;
+  const client = DATABASE_TYPE_API_CLIENTS[normalizedType];
+  if (!client) {
+    throw new Error(`Unsupported database type: ${normalizedType}`);
+  }
+  return client;
+}
+
+function databaseCollectionApiPath(databaseType) {
+  return databaseTypeApiClient(databaseType).collection;
+}
+
+function databaseApiPath(databaseType, databaseId, path = "") {
+  return `${databaseCollectionApiPath(databaseType)}/${encodeURIComponent(databaseId)}${path}`;
+}
+
+function selectedDatabaseApi(path, options = {}) {
+  if (!state.selectedDatabaseId) {
     throw new Error("请先选择记忆库");
   }
-  return api(`/libraries/${encodeURIComponent(state.selectedLibraryId)}${path}`, options);
+  return api(databaseApiPath(
+    state.selectedDatabaseType,
+    state.selectedDatabaseId,
+    path,
+  ), options);
 }
 
-function selectedLibrary() {
-  return state.libraries.find((item) => item.id === state.selectedLibraryId) || null;
+function selectedDatabase() {
+  return state.databases.find((item) => (
+    item.id === state.selectedDatabaseId
+    && (item.database_type || DEFAULT_DATABASE_TYPE) === state.selectedDatabaseType
+  )) || null;
 }
 
-function selectedLibraryHasRerank() {
-  const library = selectedLibrary();
+function selectedDatabaseHasRerank() {
+  const library = selectedDatabase();
   return Boolean(library?.rerank_provider_id || library?.rerank_provider?.id);
 }
 
 function updateRecallRerankControls() {
-  const hasRerank = selectedLibraryHasRerank();
+  const hasRerank = selectedDatabaseHasRerank();
   $("recall-k-control")?.classList.remove("hidden");
   $("recall-rerank-k-control")?.classList.toggle("hidden", !hasRerank);
   $("recall-view-rerank")?.classList.toggle("hidden", !hasRerank);
@@ -370,15 +462,23 @@ function updateRecallRerankControls() {
   });
 }
 
-function refreshSidebarLibrary() {
+function refreshSidebarDatabase() {
   const box = $("sidebar-current-library");
   if (!box) return;
-  const library = selectedLibrary();
-  if (!library) {
+  const library = selectedDatabase();
+  if (!library || parsePageRoute(state.route)?.scope === "database_type") {
     box.classList.add("hidden");
     return;
   }
   const provider = library.provider || {};
+  const categoryLabel = box.querySelector("span");
+  if (categoryLabel) {
+    const key = library.database_category === "knowledge"
+      ? "currentKnowledgeLibrary"
+      : "currentLibrary";
+    categoryLabel.dataset.i18n = key;
+    categoryLabel.textContent = t(key);
+  }
   $("sidebar-library-name").textContent = library.name || library.id;
   $("sidebar-library-id").textContent = library.id;
   $("sidebar-library-provider").textContent = `${provider.display_name || provider.id || "未绑定"}`;
@@ -386,13 +486,43 @@ function refreshSidebarLibrary() {
   box.classList.remove("hidden");
 }
 
-function refreshLibraryContext() {
-  refreshSidebarLibrary();
+const DATABASE_NAV_ICONS = Object.freeze({
+  overview: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 4h18v13H3V4Zm2 2v9h14V6H5Zm3 13h8v2H8v-2Z"/></svg>',
+  graph: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3a3 3 0 1 1-1 5.83v6.34A3 3 0 1 1 7.83 18h6.34A3 3 0 1 1 17 20.83V17a3 3 0 0 1-2.83-2H7.83A3 3 0 0 1 7 16.83V8.83A3 3 0 0 1 6 9V3Zm11 3a3 3 0 1 1 0 6 3 3 0 0 1 0-6ZM8 8.83v4.34A3 3 0 0 1 7.83 13h6.34A3 3 0 0 1 16 11.83 3 3 0 0 1 14.17 8H7.83L8 8.83Z"/></svg>',
+  memories: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 2 9 4.5-9 4.5-9-4.5L12 2Zm-7.2 8.4L12 14l7.2-3.6L21 12l-9 4.5L3 12l1.8-1.6Zm0 5.5 7.2 3.6 7.2-3.6L21 17.5 12 22l-9-4.5 1.8-1.6Z"/></svg>',
+  recall: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10.5 3a7.5 7.5 0 1 1-4.71 13.34L2.6 19.53l-1.42-1.42 3.2-3.2A7.5 7.5 0 0 1 10.5 3Zm0 2a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11Z"/></svg>',
+  content: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 2h10l4 4v16H5V2Zm2 2v16h10V7h-3V4H7Zm2 7h6v2H9v-2Zm0 4h6v2H9v-2Z"/></svg>',
+  media: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 4h18v16H3V4Zm2 2v10.17L9.17 12 12 14.83 14.83 12 19 16.17V6H5Zm10 1.5A2.5 2.5 0 1 1 15 12a2.5 2.5 0 0 1 0-5Z"/></svg>',
+  search: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10.5 3a7.5 7.5 0 1 1-4.71 13.34L2.6 19.53l-1.42-1.42 3.2-3.2A7.5 7.5 0 0 1 10.5 3Zm0 2a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11Z"/></svg>',
+  settings: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m10.8 2 2.4.01.55 2.05c.55.2 1.07.5 1.54.89l2.05-.57 1.21 2.08-1.5 1.5c.1.57.1 1.15 0 1.72l1.5 1.5-1.2 2.09-2.06-.57c-.47.39-.99.69-1.54.89l-.55 2.05h-2.4l-.55-2.05a6.5 6.5 0 0 1-1.54-.89l-2.05.57-1.21-2.08 1.5-1.51a5.2 5.2 0 0 1 0-1.72l-1.5-1.5 1.2-2.08 2.06.57c.47-.39.99-.69 1.54-.89L10.8 2ZM12 7a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z"/></svg>',
+});
+
+function renderDatabaseNavigation() {
+  const container = $("database-type-nav");
+  if (!container) return;
+  const database = selectedDatabase();
+  const databaseType = database?.database_type || state.selectedDatabaseType;
+  const pages = [...(database ? databaseUiRegistry.availablePages(database) : []),
+    ...databaseUiRegistry.availableTypePages(databaseType)];
+  container.innerHTML = pages.map((page) => {
+    const route = page.scope === "database_type" ? databaseTypePageRoute(databaseType, page.id)
+      : databasePageRoute(database.database_type, page.id);
+    const icon = page.iconMarkup || `<span class="nav-ico">${DATABASE_NAV_ICONS[page.id] || DATABASE_NAV_ICONS.content}</span>`;
+    return `<button class="nav" type="button" data-route="${escapeHtml(route)}">${icon}<b data-i18n="${escapeHtml(page.labelKey)}">${escapeHtml(t(page.labelKey))}</b></button>`;
+  }).join("");
+  container.querySelectorAll(".nav[data-route]").forEach((button) => {
+    button.onclick = () => activatePage(button.dataset.route);
+  });
+  container.querySelector(`[data-route="${CSS.escape(state.route || "")}"]`)?.classList.add("active");
+}
+
+function refreshDatabaseContext() {
+  refreshSidebarDatabase();
   updateRecallRerankControls();
+  renderDatabaseNavigation();
   const button = $("library-context");
-  const library = selectedLibrary();
-  const libraryPages = ["graph", "memory", "recall", "system"];
-  if (!library || !libraryPages.includes(state.page)) {
+  const library = selectedDatabase();
+  if (!library || parsePageRoute(state.route)?.scope !== "database") {
     button.classList.add("hidden");
     return;
   }
@@ -402,24 +532,38 @@ function refreshLibraryContext() {
   button.classList.remove("hidden");
 }
 
-function updateLibraryCardSelection() {
+function updateDatabaseCardSelection() {
   document.querySelectorAll(".library-card").forEach((card) => {
-    const selected = card.dataset.id === state.selectedLibraryId;
+    const selected = card.dataset.id === state.selectedDatabaseId
+      && card.dataset.databaseType === state.selectedDatabaseType;
     card.classList.toggle("active-card", selected);
     card.setAttribute("aria-pressed", selected ? "true" : "false");
     card.querySelector(".selected-library-badge")?.classList.toggle("hidden", !selected);
   });
 }
 
-function selectLibrary(libraryId, options = {}) {
-  if (!libraryId) return;
-  const changed = state.selectedLibraryId !== libraryId;
-  state.selectedLibraryId = libraryId;
-  localStorage.setItem("prag_library_id", state.selectedLibraryId);
+function selectDatabase(databaseId, options = {}) {
+  if (!databaseId) return;
+  const databaseType = options.databaseType || DEFAULT_DATABASE_TYPE;
+  const database = state.databases.find((item) => (
+    item.id === databaseId
+    && (item.database_type || DEFAULT_DATABASE_TYPE) === databaseType
+  ));
+  const databaseCategory = options.databaseCategory || database?.database_category || "";
+  const previousDatabaseType = state.selectedDatabaseType;
+  const changed = state.selectedDatabaseId !== databaseId
+    || state.selectedDatabaseType !== databaseType;
+  state.selectedDatabaseId = databaseId;
+  state.selectedDatabaseType = databaseType;
+  if (databaseCategory && state.selectedDatabaseRefByCategory) {
+    state.selectedDatabaseRefByCategory[databaseCategory] = { id: databaseId, databaseType };
+  }
+  window.dispatchEvent(new CustomEvent("prag-database-selection-changed"));
   if (options.resetMemoryPage !== false) {
     state.memoryPage = 1;
   }
   if (changed) {
+    beginPageRequestGeneration();
     state.recallCache = {
       embedding: [],
       rerank: [],
@@ -430,14 +574,29 @@ function selectLibrary(libraryId, options = {}) {
       renderRecallResults();
     }
   }
-  refreshLibraryContext();
-  updateLibraryCardSelection();
+  refreshDatabaseContext();
+  updateDatabaseCardSelection();
+  const activeRoute = parsePageRoute(state.route);
+  if (changed && ["database", "database_type"].includes(activeRoute?.scope)) {
+    const driver = databaseUiRegistry.get(databaseType);
+    const keepTypePage = activeRoute.scope === "database_type" && previousDatabaseType === databaseType
+      && databaseUiRegistry.resolveTypePage(databaseType, activeRoute.pageId);
+    const pageId = previousDatabaseType === databaseType && activeRoute.scope === "database"
+      ? activeRoute.pageId : driver?.defaultPage;
+    if (!keepTypePage && pageId) {
+      queueMicrotask(() => activatePage(
+        databasePageRoute(databaseType, pageId),
+      ).catch((error) => toast(error.message, true)));
+    }
+  }
 }
 
 function showLogin() {
+  state.pageRequests.controller.abort();
   stopLogPolling();
   if (state.updates.timer) clearInterval(state.updates.timer);
   state.updates.timer = null;
+  revisionDebugController?.clear();
   $("login").classList.remove("hidden");
   $("app").classList.add("hidden");
 }
@@ -450,6 +609,7 @@ function showApp() {
   if (!state.updates.timer) {
     state.updates.timer = setInterval(() => loadUpdateStatus().catch(() => {}), 15 * 60 * 1000);
   }
+  revisionDebugController?.refreshSessionStatus().catch(() => {});
 }
 
 function displayStatus(status) {
@@ -506,6 +666,12 @@ $("language").addEventListener("change", (event) => {
   lang = event.target.value;
   localStorage.setItem("prag_lang", lang);
   applyLanguage();
+  const activeRoute = parsePageRoute(state.route);
+  if (["database", "database_type"].includes(activeRoute?.scope)) {
+    databaseUiRegistry.get(activeRoute.databaseType)
+      ?.onLanguageChange(activeRoute.pageId, activeRoute.scope)
+      .catch((error) => toast(error.message, true));
+  }
   if (state.page === "graph" && state.stats) {
     loadGraph();
   }
@@ -516,28 +682,100 @@ $("language").addEventListener("change", (event) => {
     loadSystem();
   }
   if (state.page === "files") fileController.renderFiles();
-  if (state.page === "libraries") loadLibraries();
+  if (state.page === "libraries") loadDatabases();
   if (state.page === "providers") loadProviders();
+  if (state.page === "revision-debug") revisionDebugController.onLanguageChange();
 });
 
 document.documentElement.dataset.theme = localStorage.getItem("prag_theme") || "light";
 
+function normalizePageRoute(value) {
+  const parsed = parsePageRoute(value);
+  if (parsed) return value;
+  if (GLOBAL_PAGES.has(value)) return globalPageRoute(value);
+  if (LEGACY_DATABASE_PAGES[value]) {
+    const typeId = state.selectedDatabaseType || DEFAULT_DATABASE_TYPE;
+    const driver = databaseUiRegistry.get(typeId);
+    const pageId = typeId === DEFAULT_DATABASE_TYPE
+      ? LEGACY_DATABASE_PAGES[value]
+      : driver?.defaultPage;
+    return pageId ? databasePageRoute(typeId, pageId) : globalPageRoute("libraries");
+  }
+  return globalPageRoute("libraries");
+}
+
+function resolvePageRoute(value) {
+  const route = normalizePageRoute(value);
+  const parsed = parsePageRoute(route);
+  if (parsed?.scope === "database_type") {
+    if (parsed.databaseType !== state.selectedDatabaseType) return globalPageRoute("libraries");
+    const page = databaseUiRegistry.resolveTypePage(parsed.databaseType, parsed.pageId);
+    return page ? databaseTypePageRoute(parsed.databaseType, page.id) : globalPageRoute("libraries");
+  }
+  if (parsed?.scope !== "database") return route;
+  const database = selectedDatabase();
+  if (!database) return globalPageRoute("libraries");
+  const requestedPage = parsed.databaseType === database.database_type
+    ? parsed.pageId
+    : "";
+  const page = databaseUiRegistry.resolvePage(database, requestedPage);
+  return page
+    ? databasePageRoute(database.database_type, page.id)
+    : globalPageRoute("libraries");
+}
+
 function setActivePage(page) {
-  const nextPage = isValidPage(page) ? page : "libraries";
+  const route = resolvePageRoute(page);
+  const parsed = parsePageRoute(route);
+  const database = parsed?.scope === "database" ? selectedDatabase() : null;
+  const descriptor = parsed?.scope === "database_type" ? databaseUiRegistry.resolveTypePage(parsed.databaseType, parsed.pageId)
+    : database ? databaseUiRegistry.resolvePage(database, parsed.pageId) : null;
+  const nextPage = parsed?.scope === "global"
+    ? parsed.pageId
+    : descriptor?.viewId || "database";
+  const nextType = ["database", "database_type"].includes(parsed?.scope) ? parsed.databaseType : null;
+  if (state.activeDatabaseUiType && state.activeDatabaseUiType !== nextType) {
+    databaseUiRegistry.get(state.activeDatabaseUiType)?.unmount();
+  }
+  if (nextType && state.activeDatabaseUiType !== nextType) {
+    databaseUiRegistry.get(nextType)?.mount({ host: $("database-page-host") });
+  }
+  state.activeDatabaseUiType = nextType;
   document.querySelectorAll(".nav[data-page]").forEach((item) => {
-    item.classList.toggle("active", item.dataset.page === nextPage);
+    item.classList.toggle(
+      "active",
+      parsed?.scope === "global" && item.dataset.page === nextPage,
+    );
+  });
+  document.querySelectorAll(".nav[data-route]").forEach((item) => {
+    item.classList.toggle("active", item.dataset.route === route);
   });
   document.querySelectorAll(".page").forEach((section) => {
     section.classList.toggle("active", section.id === `page-${nextPage}`);
   });
   state.page = nextPage;
+  state.route = route;
+  state.pageTitleKey = descriptor?.titleKey || nextPage;
   applyLanguage();
-  refreshLibraryContext();
+  refreshDatabaseContext();
 }
 
 async function activatePage(page) {
+  beginPageRequestGeneration();
+  const requested = normalizePageRoute(page);
+  const requestedRoute = parsePageRoute(requested);
+  if (
+    requestedRoute?.scope === "database"
+    || (requestedRoute?.scope === "global" && requestedRoute.pageId === "libraries")
+  ) {
+    await ensureDatabaseSelection();
+  }
   setActivePage(page);
-  await loadPage(state.page);
+  try {
+    await loadPage(state.route);
+  } catch (error) {
+    if (error?.name !== "AbortError") throw error;
+  }
 }
 
 document.querySelectorAll(".nav[data-page]").forEach((button) =>
@@ -547,28 +785,34 @@ document.querySelectorAll(".nav[data-page]").forEach((button) =>
 );
 
 async function loadPage(page) {
-  if (page !== "logs") {
+  const parsed = parsePageRoute(page) || parsePageRoute(normalizePageRoute(page));
+  if (!(parsed?.scope === "global" && parsed.pageId === "logs")) {
     stopLogPolling();
     stopTaskPolling();
   }
-  if (page === "libraries") await loadLibraries();
-  if (page === "providers") await loadProviders();
-  if (["graph", "memory", "recall", "system"].includes(page)) {
-    await ensureLibrarySelection();
+  if (["database", "database_type"].includes(parsed?.scope)) {
+    const database = selectedDatabase();
+    const driver = databaseUiRegistry.get(parsed.databaseType);
+    if (driver) await driver.load({ scope: parsed.scope, pageId: parsed.pageId,
+      database: parsed.scope === "database" ? database : null, databaseType: parsed.databaseType });
   }
-  if (page === "graph") await loadGraph();
-  if (page === "memory") await loadMemories();
-  if (page === "system") await loadSystem();
-  if (page === "files") await fileController.loadFiles();
-  if (page === "settings") await loadSettings();
-  if (page === "logs") {
+  if (parsed?.scope === "global" && parsed.pageId === "libraries") await loadDatabases();
+  if (parsed?.scope === "global" && parsed.pageId === "providers") await loadProviders();
+  if (parsed?.scope === "global" && parsed.pageId === "system") await globalSystemController.loadGlobalSystem();
+  if (parsed?.scope === "global" && parsed.pageId === "files") await fileController.loadFiles();
+  if (parsed?.scope === "global" && parsed.pageId === "settings") {
+    await loadSettings();
+    await revisionDebugController.refreshSessionStatus();
+  }
+  if (parsed?.scope === "global" && parsed.pageId === "revision-debug") await revisionDebugController.load();
+  if (parsed?.scope === "global" && parsed.pageId === "logs") {
     state.tasks.scope = state.tasks.scope || "active";
     renderTasks();
     renderLogs();
     startLogPolling();
     startTaskPolling();
   }
-  refreshLibraryContext();
+  refreshDatabaseContext();
 }
 
 function statCards(target, items) {
@@ -621,32 +865,9 @@ function memoryImportanceClass(value) {
   return score >= 7 ? "high" : score >= 4 ? "medium" : "low";
 }
 
-function displayMemoryType(type) {
-  const normalized = String(type || "GENERAL").toUpperCase();
-  const mapping = {
-    GENERAL: t("typeGeneral"),
-    FACT: t("typeFact"),
-    EVENT: t("typeEvent"),
-    PREFERENCE: t("typePreference"),
-    OPINION: t("typeOpinion"),
-    FACTUAL: t("typeFactual"),
-    EPISODIC: t("typeEpisodic"),
-    RELATIONAL: t("typeRelational"),
-    PLANNED: t("typePlanned"),
-    GROUP_CHAT: t("typeGroupChat"),
-    PRIVATE_CHAT: t("typePrivateChat"),
-    MANUAL: t("typeManual"),
-  };
-  return mapping[normalized] || normalized;
-}
-
 function memoryStatusPill(status) {
   const value = String(status || "active").toLowerCase();
   return `<span class="memory-status-pill ${escapeHtml(value)}">${escapeHtml(displayStatus(value))}</span>`;
-}
-
-function memoryTypeTag(type) {
-  return `<span class="memory-type-tag">${escapeHtml(displayMemoryType(type))}</span>`;
 }
 
 function memoryImportanceBar(value) {
@@ -659,11 +880,12 @@ function memoryImportanceBar(value) {
 
 function normalizeMemoryDetail(raw = {}) {
   const metadata = raw.metadata || {};
+  const canonicalSummary = String(metadata.canonical_summary || raw.text || raw.content || raw.summary || "");
+  const personaSummary = String(metadata.persona_summary || "");
   return {
     id: Number(raw.id ?? raw.memory_id),
     text: raw.text || raw.content || raw.summary || "",
     metadata,
-    type: metadata.memory_type || raw.memory_type || "GENERAL",
     importance: normalizeMemoryImportance(metadata.importance ?? raw.importance),
     status: metadata.status || raw.status || "active",
     sessionId: metadata.session_id ?? raw.session_id ?? "—",
@@ -676,6 +898,13 @@ function normalizeMemoryDetail(raw = {}) {
     keyFacts: Array.isArray(metadata.key_facts) ? metadata.key_facts : [],
     updateHistory: Array.isArray(metadata.update_history) ? metadata.update_history : [],
     graph: raw.graph_context || null,
+    canonicalSummary,
+    personaSummary,
+    hasSource: Boolean(raw.has_source ?? metadata.has_source),
+    sourceTimeStrategy: String(metadata.source_time_strategy || "preserve"),
+    sourceTimeTags: metadata.source_time_tags && typeof metadata.source_time_tags === "object"
+      ? metadata.source_time_tags
+      : {},
     raw,
   };
 }
@@ -747,28 +976,50 @@ function renderMemoryMiniGraph(graph) {
   </svg>`;
 }
 
-const graphController = createGraphController({ $, state, t, libraryApi, statCards, toast, escapeHtml });
-async function loadGraph(payload = null) {
-  return graphController.loadGraph(payload);
-}
-
-const { loadMemories } = createMemoriesController({
-  $, state, t, toast, api, libraryApi, escapeHtml, formatMemoryTime,
-  displayMemoryType, memoryStatusPill, memoryTypeTag, memoryImportanceBar,
+const databaseUiRegistry = createDatabaseUiRegistry({
+  $, state, t, toast, api, responseError, selectedDatabaseApi, escapeHtml, formatMemoryTime,
+  statCards, formatVersionTag,
+  memoryStatusPill, memoryImportanceBar,
   displayStatus,
   normalizeMemoryDetail, memoryMetaItem, memoryListSection, memoryTagsSection,
-  renderMemoryMiniGraph, loadLibraries: (...args) => loadLibraries(...args),
-  debounce, confirmDialog,
-});
-const { setRecallView, renderRecallResults } = createRecallController({
-  $, state, t, toast, libraryApi, escapeHtml, selectedLibrary, selectedLibraryHasRerank,
+  renderMemoryMiniGraph, loadDatabases: (...args) => loadDatabases(...args),
+  debounce, confirmDialog, asyncGuard,
+  selectedDatabase, selectedDatabaseHasRerank, selectDatabase,
   setRecallK, setRecallRerankK, updateRecallRerankControls,
+  closeOverlay,
+  navigate: (...args) => activatePage(...args),
+  loadProviders: (...args) => loadProviders(...args),
+  fillProviderSelect: (...args) => fillProviderSelect(...args),
+  addOptimisticTask: (...args) => addOptimisticTask(...args),
+  removeOptimisticTask: (...args) => removeOptimisticTask(...args),
+  trackQueuedJob: (...args) => trackQueuedJob(...args),
 });
-const { loadSystem, scheduleSystemPanelsRefresh, formatBytes } = createSystemController({
-  $, state, t, toast, libraryApi, statCards, formatVersionTag, escapeHtml,
-});
+await databaseUiRegistry.preload();
+const livingMemoryUi = databaseUiRegistry.get(DEFAULT_DATABASE_TYPE);
+await livingMemoryUi.mount({ root: document.querySelector("main") });
+const textMediaUi = databaseUiRegistry.get("text_media_v1");
+await textMediaUi.mount({ host: $("database-page-host") });
+const typeNav = $("database-type-nav");
+document.querySelector('.nav[data-page="providers"]')?.after(typeNav);
+for (const page of ["graph", "memory", "recall"]) {
+  document.querySelector(`.nav[data-page="${page}"]`)?.remove();
+}
+const {
+  loadGraph,
+  loadMemories,
+  setRecallView,
+  renderRecallResults,
+  resetRecallTest,
+  loadOverview: loadSystem,
+  scheduleOverviewRefresh: scheduleSystemPanelsRefresh,
+  formatBytes,
+} = livingMemoryUi.actions;
+const graphController = { render: livingMemoryUi.actions.renderGraph };
 const fileController = createFileManagerController({
-  $, state, t, api, toast, responseError, parseDownloadFilename, confirmDialog, escapeHtml,
+  $, state, t, api, toast, responseError, parseDownloadFilename, confirmDialog, escapeHtml, asyncGuard,
+});
+const globalSystemController = createGlobalSystemController({
+  $, api, t, escapeHtml, statCards,
 });
 const {
   loadTasks, startTaskPolling, stopTaskPolling, renderTasks,
@@ -777,33 +1028,63 @@ const {
   trackQueuedJob, addOptimisticTask, updateOptimisticTask, removeOptimisticTask,
   renderLogs, renderLogAutoScrollState,
 } = createTaskLogController({
-  $, state, t, api, toast, escapeHtml, formatBytes, selectedLibrary,
-  loadLibraries: (...args) => loadLibraries(...args),
-  loadGraph, loadMemories, loadSystem,
+  $, state, t, api, toast, escapeHtml, formatBytes, selectedDatabase,
+  onTaskFinished: async (job) => {
+    await loadDatabases(state.page === "libraries");
+    const route = parsePageRoute(state.route);
+    if (route?.scope === "global" && route.pageId === "system") {
+      await globalSystemController.loadGlobalSystem();
+      return;
+    }
+    if (route?.scope === "database_type") {
+      if ((job.database_type || DEFAULT_DATABASE_TYPE) !== route.databaseType) return;
+      await databaseUiRegistry.get(route.databaseType)?.load({ scope: route.scope,
+        pageId: route.pageId, databaseType: route.databaseType });
+      return;
+    }
+    if (route?.scope !== "database") return;
+    const database = selectedDatabase();
+    const jobType = job.database_type || DEFAULT_DATABASE_TYPE;
+    const jobDatabaseId = job.memory_store_id || job.knowledge_base_id
+      || job.database_id
+      || job.library_id;
+    if (!database || database.id !== jobDatabaseId || database.database_type !== jobType) return;
+    await databaseUiRegistry.get(database.database_type)?.load({
+      pageId: route.pageId,
+      database,
+    });
+  },
   confirmDialog,
-  markLibraryIndexConflict: (...args) => markLibraryIndexConflict(...args),
-  clearLibraryIndexConflict: (...args) => clearLibraryIndexConflict(...args),
-  refreshLibraryContext,
+  markDatabaseIndexConflict: (...args) => markDatabaseIndexConflict(...args),
+  clearDatabaseIndexConflict: (...args) => clearDatabaseIndexConflict(...args),
+  refreshDatabaseContext,
 });
-const { loadLibraries, ensureLibrarySelection, navigate, bindUsedListDetails, confirmSensitiveProviderEdit, markLibraryIndexConflict, clearLibraryIndexConflict } = createLibrariesController({
-  $, state, t, toast, api, libraryApi, selectedLibrary, selectLibrary, refreshLibraryContext,
+const { loadDatabases, ensureDatabaseSelection, navigate, bindUsedListDetails, confirmSensitiveProviderEdit, markDatabaseIndexConflict, clearDatabaseIndexConflict } = createLibrariesController({
+  $, state, t, toast, api, selectedDatabaseApi, selectedDatabase, selectDatabase, refreshDatabaseContext,
+  databaseApiPath, databaseCollectionApiPath, databaseRefKey, DEFAULT_DATABASE_TYPE,
   escapeHtml, confirmDialog, addOptimisticTask, removeOptimisticTask, trackQueuedJob,
   validateIdentifierInput, LIBRARY_EXPAND_ICON,
   activatePage, closeOverlay, joinLocalizedList,
   DEFAULT_LIBRARY_CONVERSATION_SETTINGS, DEFAULT_LIBRARY_RECALL_SETTINGS,
-  DEFAULT_LIBRARY_MAINTENANCE_SETTINGS,
+  DEFAULT_LIBRARY_MAINTENANCE_SETTINGS, asyncGuard,
   loadProviders: (...args) => loadProviders(...args),
   fillProviderSelect: (...args) => fillProviderSelect(...args),
+  databaseUiRegistry, databasePageRoute, databaseTypePageRoute,
 });
 const { loadProviders, fillProviderSelect } = createProvidersController({
   $, state, t, toast, api, escapeHtml, validateIdentifierInput,
-  confirmSensitiveProviderEdit, navigate, loadLibraries, confirmDialog, closeOverlay, selectLibrary,
+  confirmSensitiveProviderEdit, navigate, loadDatabases, confirmDialog, closeOverlay, selectDatabase, asyncGuard,
+});
+const revisionDebugController = createRevisionDebugController({
+  $, state, t, api, toast, escapeHtml, navigate: (...args) => activatePage(...args),
+  confirmDialog, asyncGuard,
 });
 $("settings-form")?.addEventListener("submit", async (event) => {
   event.preventDefault();
+  await asyncGuard.run("settings:save", async () => {
   const draft = settingsDraft();
   const payload = {
-    access_base_url: draft.access_base_url,
+    access_base_url: draft.access_base_url, public_adapter_url: draft.public_adapter_url,
     port: draft.port,
     access_port: draft.access_port,
     new_password: draft.new_password || null,
@@ -820,13 +1101,20 @@ $("settings-form")?.addEventListener("submit", async (event) => {
     state.loginMode = data.login_mode || state.loginMode;
     applyLoginMode(data);
     await loadSettings();
+    await revisionDebugController.refreshSessionStatus();
     toast(t("settingsSaved"));
   } catch (error) {
     toast(error.message, true);
   }
+  }, {
+    form: event.currentTarget,
+    button: event.submitter,
+    busyText: t("loading"),
+  });
 });
 
-$("backup-migration-export")?.addEventListener("click", async () => {
+$("backup-migration-export")?.addEventListener("click", async (event) => {
+  await asyncGuard.run("settings:backup-export", async () => {
   const password = await requestBackupPassword();
   if (!password) return;
   const suggestedName = `personalityrag-${new Date().toISOString().slice(0, 10)}.prag`;
@@ -874,6 +1162,10 @@ $("backup-migration-export")?.addEventListener("click", async () => {
   } finally {
     exportSession.close?.();
   }
+  }, {
+    button: event.currentTarget,
+    busyText: t("loading"),
+  });
 });
 
 $("backup-migration-import")?.addEventListener("click", () => {
@@ -882,6 +1174,7 @@ $("backup-migration-import")?.addEventListener("click", () => {
 });
 
 $("backup-migration-import-file")?.addEventListener("change", async (event) => {
+  await asyncGuard.run("settings:backup-import", async () => {
   const file = event.target.files?.[0] || null;
   if (!file) return;
   if (!file.name.toLowerCase().endsWith(".prag")) {
@@ -909,15 +1202,20 @@ $("backup-migration-import-file")?.addEventListener("change", async (event) => {
     );
     await loadSettings();
     await loadProviders();
-    await loadLibraries();
+    await loadDatabases();
   } catch (error) {
     toast(error.message, true);
   } finally {
     event.target.value = "";
   }
+  }, {
+    button: $("backup-migration-import"),
+    busyText: t("loading"),
+  });
 });
 
-$("settings-restart")?.addEventListener("click", async () => {
+$("settings-restart")?.addEventListener("click", async (event) => {
+  await asyncGuard.run("settings:restart", async () => {
   if (hasUnsavedSettingsChanges()) {
     const confirmed = await confirmDialog({
       message: t("restartUnsavedConfirm"),
@@ -931,23 +1229,37 @@ $("settings-restart")?.addEventListener("click", async () => {
   } catch (error) {
     toast(error.message, true);
   }
+  }, {
+    button: event.currentTarget,
+    busyText: t("loading"),
+  });
 });
 
-$("updates-refresh")?.addEventListener("click", async () => {
+$("updates-refresh")?.addEventListener("click", async (event) => {
+  await asyncGuard.run("updates:refresh", async () => {
   try {
     await refreshUpdateReleases();
     toast(t("updateCheckComplete"));
   } catch (error) {
     toast(error.message, true);
   }
+  }, {
+    button: event.currentTarget,
+    busyText: t("loading"),
+  });
 });
 
-$("updates-select")?.addEventListener("click", async () => {
+$("updates-select")?.addEventListener("click", async (event) => {
+  await asyncGuard.run("updates:select", async () => {
   try {
     await openVersionSelector();
   } catch (error) {
     toast(error.message, true);
   }
+  }, {
+    button: event.currentTarget,
+    busyText: t("loading"),
+  });
 });
 
 $("update-available-badge")?.addEventListener("click", async () => {
@@ -1012,20 +1324,15 @@ $("logs-clear")?.addEventListener("click", async () => {
   }
 });
 
-$("libraries-refresh")?.addEventListener("click", async () => { await loadLibraries(); toast(t("pageRefreshed")); });
+$("libraries-refresh")?.addEventListener("click", async () => { await loadDatabases(true, { force: true }); toast(t("pageRefreshed")); });
 $("providers-refresh")?.addEventListener("click", async () => { await loadProviders(); toast(t("pageRefreshed")); });
 $("graph-refresh")?.addEventListener("click", async () => { await loadGraph(); toast(t("pageRefreshed")); });
 $("recall-refresh")?.addEventListener("click", () => {
-  setRecallK(DEFAULT_RECALL_K);
-  setRecallRerankK(DEFAULT_RERANK_K);
-  if (!$("recall-query").value.trim()) {
-    toast(t("recallRefreshEmpty"), true);
-    return;
-  }
-  $("run-recall").click();
+  resetRecallTest();
+  toast(t("pageRefreshed"));
 });
 $("system-refresh")?.addEventListener("click", async () => { await loadSystem(); toast(t("pageRefreshed")); });
-$("settings-refresh")?.addEventListener("click", async () => { await loadSettings(); toast(t("pageRefreshed")); });
+$("settings-refresh")?.addEventListener("click", async () => { await loadSettings(); await revisionDebugController.refreshSessionStatus(); toast(t("pageRefreshed")); });
 $("logs-refresh")?.addEventListener("click", async () => {
   try {
     await loadTasks(state.tasks.scope);
@@ -1058,6 +1365,7 @@ fetch("/api/v1/auth/status", { credentials: "same-origin" })
   .then((response) => response.json())
   .then((status) => {
     applyLoginMode(status);
+    if ($("sidebar-version")) $("sidebar-version").textContent = status.version ? `v${status.version}` : "v-";
     if (status.authenticated) {
       showApp();
       activatePage(state.page);

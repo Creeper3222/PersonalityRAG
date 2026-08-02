@@ -44,13 +44,16 @@ async def test_create_app_keeps_contexts_and_authentication_isolated(
     first_app = create_app(first_context)
     second_app = create_app(second_context)
 
-    async with AsyncClient(
-        transport=ASGITransport(app=first_app),
-        base_url="http://first:8765",
-    ) as first_client, AsyncClient(
-        transport=ASGITransport(app=second_app),
-        base_url="http://second:8765",
-    ) as second_client:
+    async with (
+        AsyncClient(
+            transport=ASGITransport(app=first_app),
+            base_url="http://first:8765",
+        ) as first_client,
+        AsyncClient(
+            transport=ASGITransport(app=second_app),
+            base_url="http://second:8765",
+        ) as second_client,
+    ):
         first_ok = await first_client.get(
             "/api/v1/settings",
             headers={"Authorization": "Bearer first-api-key"},
@@ -99,7 +102,11 @@ async def test_update_status_is_authenticated_and_context_scoped(
     application = create_app(context)
 
     async def status(*, refresh: bool = False):
-        return {"current_version": "0.1.0", "update_available": False, "refresh": refresh}
+        return {
+            "current_version": "0.1.0",
+            "update_available": False,
+            "refresh": refresh,
+        }
 
     monkeypatch.setattr(context.updates, "status", status)
     async with AsyncClient(
@@ -129,7 +136,7 @@ async def test_log_poll_is_silent_and_heartbeat_does_not_raise_slow_warning(
     context = _context(tmp_path, "long-poll-logs", AppConfig(api_key="fixture-key"))
     debug_paths: list[str] = []
     warning_paths: list[str] = []
-    clock = iter([0.0, 2.0, 0.0, 2.0, 0.0, 2.0, 0.0, 2.0])
+    clock = iter([0.0, 2.0, 0.0, 2.0, 0.0, 2.0, 0.0, 2.0, 0.0, 2.0])
 
     async def app(scope, receive, send):
         await send({"type": "http.response.start", "status": 200, "headers": []})
@@ -157,7 +164,8 @@ async def test_log_poll_is_silent_and_heartbeat_does_not_raise_slow_warning(
     for method, path in (
         ("GET", "/api/v1/logs"),
         ("GET", "/api/v1/jobs"),
-        ("POST", "/api/v1/libraries/demo/adapters/heartbeat"),
+        ("POST", "/api/v1/memory-libraries/livingmemory_v8/demo/adapters/heartbeat"),
+        ("POST", "/api/v1/knowledge-libraries/text_media_v1/demo/adapters/heartbeat"),
         ("GET", "/api/v1/health"),
     ):
         await middleware(
@@ -171,7 +179,10 @@ async def test_log_poll_is_silent_and_heartbeat_does_not_raise_slow_warning(
             send,
         )
 
-    assert debug_paths == ["/api/v1/libraries/demo/adapters/heartbeat"]
+    assert debug_paths == [
+        "/api/v1/memory-libraries/livingmemory_v8/demo/adapters/heartbeat",
+        "/api/v1/knowledge-libraries/text_media_v1/demo/adapters/heartbeat",
+    ]
     assert warning_paths == ["/api/v1/health"]
 
 
@@ -273,7 +284,7 @@ async def test_adapter_status_reads_do_not_load_or_touch_library_runtime(
         )
         await context.manager.unload_runtime("offline", reason="fixture")
         default_last_used = context.manager.runtime_residency_status()["runtimes"][
-            "Default"
+            "livingmemory_v8:Default"
         ]["last_used_at"]
         application = create_app(context)
         headers = {
@@ -285,23 +296,26 @@ async def test_adapter_status_reads_do_not_load_or_touch_library_runtime(
             base_url="http://test:8765",
         ) as client:
             detail = await client.get(
-                "/api/v1/libraries/offline",
+                "/api/v1/memory-libraries/livingmemory_v8/offline",
                 headers=headers,
             )
             stats = await client.get(
-                "/api/v1/libraries/offline/stats",
+                "/api/v1/memory-libraries/livingmemory_v8/offline/stats",
                 headers=headers,
             )
             indexes = await client.get(
-                "/api/v1/libraries/offline/indexes",
+                "/api/v1/memory-libraries/livingmemory_v8/offline/indexes",
                 headers=headers,
             )
 
         assert detail.status_code == stats.status_code == indexes.status_code == 200
         assert "offline" not in context.manager.runtimes
-        assert context.manager.runtime_residency_status()["runtimes"]["Default"][
-            "last_used_at"
-        ] == default_last_used
+        assert (
+            context.manager.runtime_residency_status()["runtimes"][
+                "livingmemory_v8:Default"
+            ]["last_used_at"]
+            == default_last_used
+        )
         assert stats.json()["provider_status"]["cached"] is True
     finally:
         await context.manager.close()

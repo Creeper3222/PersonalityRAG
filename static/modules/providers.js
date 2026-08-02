@@ -1,7 +1,11 @@
-export function createProvidersController({ $, state, t, toast, api, escapeHtml, validateIdentifierInput, confirmSensitiveProviderEdit, navigate, loadLibraries, confirmDialog, closeOverlay, selectLibrary }) {
+export function createProvidersController({ $, state, t, toast, api, escapeHtml, validateIdentifierInput, confirmSensitiveProviderEdit, navigate, loadDatabases, confirmDialog, closeOverlay, selectDatabase, asyncGuard }) {
+function themedMaskIcon(iconPath) {
+  return `<span class="themed-icon-mask" aria-hidden="true" style="--themed-icon-mask:url('${iconPath}')"></span>`;
+}
+
 const PROVIDER_ICON_SVG = {
-  gemini_embedding: `<img src="/static/icons/google_gemini.svg" alt="" aria-hidden="true">`,
-  nvidia_embedding: `<img src="/static/icons/nvidia.svg" alt="" aria-hidden="true">`,
+  gemini_embedding: themedMaskIcon("/static/icons/google_gemini.svg"),
+  nvidia_embedding: themedMaskIcon("/static/icons/nvidia.svg"),
   openai_embedding: `<svg viewBox="0 0 1024 1024" aria-hidden="true"><path d="M565.265 954.52c-22.29 0-48.4-8.153-67.952-14.84a103.425 103.425 0 0 1-26.876-11.272c-12.737-7.77-15.411-8.343-19.806-24.774 21.972-5.158 81.581-41.905 103.871-55.342 148.897-89.16 119.029-10.445 119.029-364.982 15.03 3.566 82.79 32.416 82.79 57.317 0 133.103 20.571 273.848-52.603 354.92-22.8 25.474-91.835 58.972-138.39 58.972zM132.204 655.196c258.627 136.86 184.37 157.049 357.721 52.095 44.58-27.194 90.434-49.293 132.593-77.57V731.62C526.99 753.846 350.2 958.659 203.468 832.307L177.61 807.15c-37.32-43.943-45.344-72.41-45.344-151.89z m375.744-19.106c-19.933-13.31-79.48-51.33-101.897-57.317v-133.74a1158.312 1158.312 0 0 0 101.897-57.316c43.943 10.19 70.691 47.064 114.634 57.317v127.37c-17.832 12.101-95.847 58.719-114.634 63.75zM81.255 457.772c0-63.686-4.267-90.306 38.848-145.776 23.946-30.888 47.51-39.613 82.091-57.954v261.11c44.134 23.373 83.874 49.039 129.345 74.449l131.766 78.397c-59.546 15.921-63.686 61.33-109.603 33.753-104.7-62.73-272.383-129.345-272.383-243.915z m866.123 127.371c0 79.543-47.573 161.188-121.002 178.32V597.88c0-82.791 9.744-84.574-48.91-116.608l-212.2-118.9c15.793-23.628 22.608-19.107 48.145-34.837 41.714-25.474 39.04-16.112 117.054 28.786 94.191 54.196 216.85 100.56 216.85 228.886zM406.051 387.718V292.19c43.752-23.182 90.689-50.949 133.358-76.805 82.154-49.547 95.528-63.304 185.006-63.304 48.465 0 102.534 36.747 125.652 65.406 42.223 52.222 39.93 92.662 39.93 151.125C858.92 352.118 697.605 247.61 667.099 247.61s-229.65 123.422-261.11 140.108z m-50.948 159.214c-16.367-10.954-63.112-39.995-82.791-44.58 0-168.321-33.88-314.607 67.952-390.52 56.043-41.714 113.17-53.814 181.377-30.696 25.474 8.661 35.536 20.889 56.361 26.43-11.782 16.048-80.69 50.31-102.279 63.303-154.564 93.235-120.62 7.45-120.62 376.063zM62.15 667.934c0 169.149 115.143 280.853 274.293 273.848 59.8-2.675 26.812-7.706 69.417 25.474 97.821 76.741 228.822 73.748 319.638 1.02a251.94 251.94 0 0 0 52.604-55.662c58.209-85.275-10.954-45.599 81.963-83.62 130.237-53.24 199.4-217.358 128.645-355.428-27.448-53.56-40.249-28.85-28.276-104.699 18.723-118.582-63.176-230.032-157.622-269.772-98.903-41.587-129.09 12.737-178.892-37.574a161.889 161.889 0 0 0-43.816-32.607c-106.1-56.68-248.82-27.385-321.676 64.768-81.326 102.98 9.49 54.706-92.407 98.649C15.15 257.354-33.251 439.176 41.579 561.07c56.808 92.599 20.57 4.967 20.57 106.8z"/></svg>`,
   ollama_embedding: `<svg viewBox="0 0 1024 1024" aria-hidden="true"><path d="M287.922 79.6c-42.4 25.6-68.8 118-59.2 205.6l3.6 34.8-20 20c-64.8 64-81.2 163.2-40.4 243.2l10.8 21.2-10 24.8c-26 65.2-24 144 4.4 200.8l11.6 22.8-7.2 14.8c-16.4 33.6-24.4 107.6-14.8 141.2l4 15.2h60.4l-3.2-13.2c-2-6.8-3.6-30.8-3.6-52.8 0-38 0.8-41.6 15.2-71.6 8-17.2 14.8-34.4 14.8-38 0-3.6-5.6-15.6-12.8-26.8-35.6-55.6-36.4-123.6-2.8-190.4 14.8-29.6 14.4-38.8-2-58.8-22.4-26.4-33.2-69.2-26.4-104.4 9.6-50.4 40.4-92.8 82-112.4 20-9.6 29.2-11.6 54.8-11.6h31.2l8-16c18.4-36.4 50.4-61.6 93.6-74 55.6-16.4 124.4 14.8 154.8 70.4l9.6 17.6 34 2c58 4 93.2 27.2 118.4 78 25.6 52 22.4 107.2-8.4 147.6-17.2 22.4-17.2 32-2.4 61.6 33.6 66.8 32.8 134.8-2.8 190.4-7.2 11.2-12.8 23.2-12.8 26.8 0 3.6 6.8 20.8 14.8 38 14.4 30 15.2 33.6 15.2 71.6 0 22-1.6 46-3.6 52.8l-3.2 13.2h60.4l4-14.8c9.6-34 1.6-108-14.8-141.6l-7.2-14.8 11.6-22.8c28.4-56.8 30.4-135.6 4-201.6l-10-25.2 10.8-22c24-49.6 27.2-108.8 8-164.8-10.8-32-25.2-54.8-50.8-79.2l-17.2-17.2 3.6-34.8c7.2-66-8.8-148.4-35.6-183.6-21.2-28-49.6-36.4-79.2-24-27.2 11.2-50.8 51.6-62 106.4-5.2 26-8 31.6-12.8 29.6-34-15.6-60.4-21.6-94.8-21.6-35.2 0-53.2 4.4-93.2 21.6-4.8 2-7.6-3.6-12.8-29.6-11.2-54.8-34.8-95.2-62-106.4-18.4-8-41.2-6.8-55.6 2z m45.6 73.6c16 32.8 27.2 110.8 17.6 125.2-1.6 2.4-13.6 5.6-26.8 7.2-13.2 1.6-27.2 3.6-30.8 4.8-6.4 2-7.2-1.6-7.2-37.2 0-21.6 2.8-50.4 6-64.4 7.2-30 20.8-58 27.2-55.6 2.4 0.8 8.8 10 14 20z m384.8-5.2c12.8 24.8 20 62.8 20 105.6 0 30.8-1.2 38.8-5.2 37.2-3.2-1.2-17.6-3.2-32-4.8-32-3.6-33.2-5.6-29.6-54 3.6-43.2 23.2-100 35.2-100 2 0 7.2 7.2 11.6 16z"/><path d="M453.522 479.6c-44.8 18-75.2 47.6-85.6 83.6-15.6 54 8.4 101.2 64.4 127.6 22.8 10.4 27.2 11.2 80 11.2s57.2-0.8 80-11.2c41.2-19.2 64-48 68.8-86.4 5.2-46.4-24-92.4-74-117.2-24.4-12.4-30-13.2-70.8-14-35.2-0.8-47.6 0.4-62.8 6.4z m102 38.8c10 3.2 26.4 13.2 36.4 22 35.2 31.2 38 68.4 6.8 96.8-21.6 19.6-40 24.8-86.4 24.8-46.4 0-64.8-5.2-86.4-24.8-31.2-28.4-28.4-65.6 6.8-96.8 10-8.8 25.6-18.4 34.8-22 22.4-7.6 65.2-8 88 0z"/><path d="M480.722 558.8c-5.6 5.6-2 25.2 5.2 30 4.8 3.6 8.4 11.2 9.2 21.2 1.2 15.6 1.6 16 17.2 16s16-0.4 16.4-15.2c0-10 3.2-17.6 8.8-22.8 9.6-9.2 11.6-20.8 4-26.8-5.6-4.4-56.8-6-60.8-2.4z m-168.8-78.4c-18.4 9.2-28 44.8-16.4 60 7.2 9.2 20.8 15.6 34 15.6 17.2 0 36.8-23.2 36.8-43.2 0-8-2.4-17.6-5.2-21.2-11.2-14.4-32-19.2-49.2-11.2z m364.4 0.4c-12.8 7.2-17.6 16-18 32 0 20 19.6 43.2 36.8 43.2 23.2 0 38.8-14 39.2-35.2 0-32.8-32-54.8-58-40z"/></svg>`,
   vllm_embedding: `<svg viewBox="0 0 1024 1024" aria-hidden="true"><path d="M412.16 922.688L64 249.664h348.16v673.024z"/><path d="M667.392 922.688H412.096L586.24 226.432 899.392 64 667.328 922.688z"/></svg>`,
@@ -55,6 +59,127 @@ function providerTypeDescription(type) {
   }[type] || "自定义模型提供商。";
 }
 
+function providerDatabaseTypeMeta(databaseType) {
+  return state.databaseTypes.find((item) => item.id === databaseType) || null;
+}
+
+function providerDatabaseCategory(databaseType, fallback = "") {
+  return fallback || providerDatabaseTypeMeta(databaseType)?.category || "";
+}
+
+function providerDatabaseTypeName(databaseType, fallback = "") {
+  return fallback || providerDatabaseTypeMeta(databaseType)?.display_name || databaseType || "";
+}
+
+function providerDatabaseCategoryRank(category) {
+  return category === "memory" ? 0 : category === "knowledge" ? 1 : 9;
+}
+
+function providerUsedLibraries(provider, kind) {
+  const usageByRef = new Map();
+  const addUsage = (usage) => {
+    const databaseType = usage.database_type || "livingmemory_v8";
+    const databaseId = usage.memory_store_id
+      || usage.knowledge_base_id
+      || usage.database_id
+      || usage.library_id
+      || "";
+    if (!databaseId) return;
+    const usageKind = usage.usage_kind || "embedding";
+    if (usageKind !== kind) return;
+    const library = state.databases.find(
+      (item) => item.id === databaseId
+        && (item.database_type || "livingmemory_v8") === databaseType,
+    );
+    const category = providerDatabaseCategory(
+      databaseType,
+      usage.database_category || library?.database_category || "",
+    );
+    const typeName = providerDatabaseTypeName(
+      databaseType,
+      usage.type_display_name || library?.type_metadata?.display_name || "",
+    );
+    const key = `${databaseType}:${databaseId}:${usageKind}`;
+    const current = usageByRef.get(key) || {};
+    usageByRef.set(key, {
+      ...current,
+      ...usage,
+      database_id: databaseId,
+      database_type: databaseType,
+      database_category: category,
+      type_display_name: typeName,
+      database_name: usage.database_name || usage.library_name || library?.name || databaseId,
+      provider_revision: usage.provider_revision ?? library?.provider_revision ?? null,
+      usage_kind: usageKind,
+      needs_rebuild: usage.needs_rebuild ?? (
+        usageKind === "embedding"
+          ? Number(library?.provider_revision || 0) !== Number(provider.revision || 0)
+          : false
+      ),
+    });
+  };
+  (provider.used_by || []).forEach(addUsage);
+  state.databases.forEach((library) => {
+    const databaseType = library.database_type || "livingmemory_v8";
+    if (kind === "embedding" && library.provider_id === provider.id) {
+      addUsage({
+        database_id: library.id,
+        database_type: databaseType,
+        database_category: library.database_category,
+        type_display_name: library.type_metadata?.display_name,
+        database_name: library.name,
+        provider_revision: library.provider_revision,
+        usage_kind: "embedding",
+      });
+    }
+    if (kind === "rerank" && library.rerank_provider_id === provider.id) {
+      addUsage({
+        database_id: library.id,
+        database_type: databaseType,
+        database_category: library.database_category,
+        type_display_name: library.type_metadata?.display_name,
+        database_name: library.name,
+        provider_revision: null,
+        usage_kind: "rerank",
+        needs_rebuild: false,
+      });
+    }
+  });
+  const rows = Array.from(usageByRef.values()).sort((left, right) => {
+    const categoryDelta = providerDatabaseCategoryRank(left.database_category)
+      - providerDatabaseCategoryRank(right.database_category);
+    if (categoryDelta) return categoryDelta;
+    const nameDelta = String(left.database_name || left.database_id || "").localeCompare(
+      String(right.database_name || right.database_id || ""),
+      "zh-Hans-CN",
+    );
+    if (nameDelta) return nameDelta;
+    const typeDelta = String(left.type_display_name || "").localeCompare(
+      String(right.type_display_name || ""),
+      "zh-Hans-CN",
+    );
+    if (typeDelta) return typeDelta;
+    return `${left.database_type}:${left.database_id}`.localeCompare(
+      `${right.database_type}:${right.database_id}`,
+      "zh-Hans-CN",
+    );
+  });
+  const nameCounts = rows.reduce((counts, item) => {
+    const name = String(item.database_name || item.database_id || "");
+    counts.set(name, (counts.get(name) || 0) + 1);
+    return counts;
+  }, new Map());
+  return rows.map((item) => {
+    const name = String(item.database_name || item.database_id || "");
+    return {
+      ...item,
+      display_label: (nameCounts.get(name) || 0) > 1
+        ? `${name} \u00b7 ${item.type_display_name || item.database_type}`
+        : name,
+    };
+  });
+}
+
 async function loadProviders(render = true) {
   try {
     const [providers, types] = await Promise.all([
@@ -64,6 +189,7 @@ async function loadProviders(render = true) {
     state.providers = providers.items || [];
     state.providerTypes = types.items || [];
     if (!render) return;
+    await loadDatabases(false);
     const activeKind = state.providerKind === "rerank" ? "rerank" : "embedding";
     document.querySelectorAll("[data-provider-kind]").forEach((button) => {
       const isActive = button.dataset.providerKind === activeKind;
@@ -78,7 +204,8 @@ async function loadProviders(render = true) {
         .map((provider) => {
           const kind = providerKindOf(provider);
           const status = state.providerStatuses[provider.id];
-          const pendingLibraries = (provider.used_by || []).filter(
+          const usedBy = providerUsedLibraries(provider, kind);
+          const pendingLibraries = usedBy.filter(
             (item) => item.usage_kind !== "rerank"
               && (
                 item.needs_rebuild ?? (
@@ -96,7 +223,7 @@ async function loadProviders(render = true) {
           const statusText = pendingLibraries.length
             ? t("pendingRebuild", {
                 libraries: pendingLibraries.map((item) => t("stillUsesRevision", {
-                  library: item.library_name,
+                  library: item.database_name,
                   revision: item.provider_revision,
                 })).join("、"),
               })
@@ -105,30 +232,24 @@ async function loadProviders(render = true) {
               : status
                 ? t("unavailableStatus", { error: status.error || "" })
                 : t("notTested");
-          const libraryOrder = new Map(
-            state.libraries.map((item, index) => [item.id, index]),
-          );
-          const usedBy = [...(provider.used_by || [])].sort((left, right) => {
-            const leftIndex = libraryOrder.get(left.library_id);
-            const rightIndex = libraryOrder.get(right.library_id);
-            if (leftIndex != null || rightIndex != null) {
-              return (leftIndex ?? Number.MAX_SAFE_INTEGER) - (rightIndex ?? Number.MAX_SAFE_INTEGER);
-            }
-            return String(left.library_name || left.library_id || "").localeCompare(
-              String(right.library_name || right.library_id || ""),
-              "zh-Hans-CN",
-            );
-          });
           const usedLibButton = (item, extraClass = "") => {
             const usageLabel = item.usage_kind === "rerank" ? " · Rerank" : "";
             const usageClass = item.usage_kind === "rerank" ? "used-lib-rerank" : "used-lib-embedding";
-            return `<button type="button" class="${["used-lib-jump", usageClass, extraClass].filter(Boolean).join(" ")}" data-library-id="${escapeHtml(item.library_id)}">${escapeHtml(item.library_name)}${escapeHtml(usageLabel)}</button>`;
+            const label = item.display_label || item.database_name;
+            const disambiguatedClass = label !== item.database_name ? "used-lib-disambiguated" : "";
+            return `<button type="button" class="${["used-lib-jump", usageClass, disambiguatedClass, extraClass].filter(Boolean).join(" ")}" title="${escapeHtml(label + usageLabel)}" data-database-id="${escapeHtml(item.database_id)}" data-database-type="${escapeHtml(item.database_type || "livingmemory_v8")}" data-database-category="${escapeHtml(item.database_category || "")}">${escapeHtml(label)}${escapeHtml(usageLabel)}</button>`;
           };
+          const usedLibRowClass = [
+            "used-lib-row",
+            (usedBy[0]?.display_label || usedBy[0]?.database_name) !== usedBy[0]?.database_name
+              ? "used-lib-row-disambiguated"
+              : "",
+          ].filter(Boolean).join(" ");
           const usedLibrariesHtml = usedBy.length === 0
             ? escapeHtml(t("none"))
             : usedBy.length === 1
               ? usedLibButton(usedBy[0], "used-lib-plain")
-              : `<div class="used-lib-row">${usedLibButton(usedBy[0], "used-lib-first-btn")}<details class="used-lib-dd"><summary><span class="used-lib-count">＋${usedBy.length - 1}</span><span class="used-lib-caret" aria-hidden="true">▾</span></summary><ul class="${["used-lib-list", kind === "rerank" ? "used-lib-list-rerank" : "used-lib-list-embedding"].join(" ")}">${usedBy.slice(1).map((item) => `<li>${usedLibButton(item)}</li>`).join("")}</ul></details></div>`;
+              : `<div class="${usedLibRowClass}">${usedLibButton(usedBy[0], "used-lib-first-btn")}<details class="used-lib-dd"><summary><span class="used-lib-count">＋${usedBy.length - 1}</span><span class="used-lib-caret" aria-hidden="true">▾</span></summary><ul class="${["used-lib-list", kind === "rerank" ? "used-lib-list-rerank" : "used-lib-list-embedding"].join(" ")}">${usedBy.slice(1).map((item) => `<li>${usedLibButton(item)}</li>`).join("")}</ul></details></div>`;
           const contextMode = inferContextLengthMode(provider);
           const maxContextText = provider.max_context_tokens
             ? `${provider.max_context_tokens} · ${contextMode === "auto" ? t("contextLengthModeAuto") : t("contextLengthModeManual")}`
@@ -174,6 +295,7 @@ async function loadProviders(render = true) {
         .join("") || `<div class="panel">${escapeHtml(t("noProviders"))}</div>`;
     bindProviderCardActions();
   } catch (error) {
+    if (error?.name === "AbortError") return;
     toast(error.message, true);
   }
 }
@@ -240,9 +362,20 @@ function bindProviderCardActions() {
     button.onclick = (event) => {
       event.preventDefault();
       event.stopPropagation();
-      const libraryId = button.dataset.libraryId || "";
-      if (!libraryId) return;
-      selectLibrary(libraryId);
+      const databaseId = button.dataset.databaseId || "";
+      if (!databaseId) return;
+      const databaseCategory = button.dataset.databaseCategory || "";
+      if (databaseCategory) {
+        state.databaseCategory = databaseCategory;
+        document.querySelectorAll(".database-category-tab").forEach((item) => {
+          const active = item.dataset.databaseCategory === databaseCategory;
+          item.classList.toggle("active", active);
+          item.setAttribute("aria-selected", active ? "true" : "false");
+        });
+      }
+      selectDatabase(databaseId, {
+        databaseType: button.dataset.databaseType || "livingmemory_v8",
+      });
       navigate("libraries");
     };
   });
@@ -253,6 +386,7 @@ function bindProviderCardActions() {
   });
   document.querySelectorAll(".copy-provider").forEach((button) => {
     button.onclick = async () => {
+      await asyncGuard.run(`provider:${button.dataset.id}:copy`, async () => {
       try {
         await api(`/providers/${encodeURIComponent(button.dataset.id)}/copy`, {
           method: "POST",
@@ -263,10 +397,15 @@ function bindProviderCardActions() {
       } catch (error) {
         toast(error.message, true);
       }
+      }, {
+        button,
+        busyText: t("loading"),
+      });
     };
   });
   document.querySelectorAll(".delete-provider").forEach((button) => {
     button.onclick = async () => {
+      await asyncGuard.run(`provider:${button.dataset.id}:delete`, async () => {
       if (!(await confirmDialog({
         title: t("confirmTitle"),
         message: t("confirmDeleteProvider", { id: button.dataset.id }),
@@ -279,10 +418,15 @@ function bindProviderCardActions() {
       } catch (error) {
         toast(error.message, true);
       }
+      }, {
+        button,
+        busyText: t("loading"),
+      });
     };
   });
   document.querySelectorAll(".test-provider-card").forEach((button) => {
     button.onclick = async () => {
+      await asyncGuard.run(`provider:${button.dataset.id}:test`, async () => {
       button.disabled = true;
       button.textContent = "测试中…";
       try {
@@ -293,6 +437,10 @@ function bindProviderCardActions() {
         toast(error.message, true);
       }
       await loadProviders();
+      }, {
+        button,
+        busyText: t("loading"),
+      });
     };
   });
 }
@@ -533,6 +681,7 @@ $("provider-form").onsubmit = async (event) => {
     toast(t("maxContextManualInvalid"), true);
     return;
   }
+  await asyncGuard.run(`provider-form:${originalId || payload.id || "new"}`, async () => {
   try {
     if (originalId) {
       const originalProvider = state.providers.find((item) => item.id === originalId)
@@ -552,10 +701,15 @@ $("provider-form").onsubmit = async (event) => {
     closeOverlay("provider-modal");
     toast("Provider 已保存");
     await loadProviders();
-    await loadLibraries(false);
+    await loadDatabases(false);
   } catch (error) {
     toast(error.message, true);
   }
+  }, {
+    form: event.currentTarget,
+    button: event.submitter,
+    busyText: t("loading"),
+  });
 };
 
 async function testDraftProvider() {
@@ -571,37 +725,47 @@ async function testDraftProvider() {
 }
 
 $("provider-draft-test").onclick = async () => {
-  try {
-    const result = await testDraftProvider();
-    toast(result.available ? "Provider 测试成功" : result.error, !result.available);
-  } catch (error) {
-    toast(error.message, true);
-  }
+  await asyncGuard.run("provider:draft-test", async () => {
+    try {
+      const result = await testDraftProvider();
+      toast(result.available ? "Provider 测试成功" : result.error, !result.available);
+    } catch (error) {
+      toast(error.message, true);
+    }
+  }, {
+    button: $("provider-draft-test"),
+    busyText: t("loading"),
+  });
 };
 
 $("provider-detect-dimension").onclick = async () => {
-  try {
-    const payload = providerFormPayload();
-    if (isRerankProvider(payload.type)) {
-      toast("Rerank Provider 不需要检测嵌入维度", true);
-      return;
+  await asyncGuard.run("provider:detect-dimension", async () => {
+    try {
+      const payload = providerFormPayload();
+      if (isRerankProvider(payload.type)) {
+        toast("Rerank Provider 不需要检测嵌入维度", true);
+        return;
+      }
+      const { clear_api_key, ...draft } = payload;
+      draft.dimensions = 0;
+      const result = await api("/providers/detect-dimension", {
+        method: "POST",
+        body: JSON.stringify(draft),
+      });
+      $("provider-dimensions").value = result.dimensions;
+      toast(`检测到 ${result.dimensions} 维`);
+    } catch (error) {
+      toast(error.message, true);
     }
-    const { clear_api_key, ...draft } = payload;
-    draft.dimensions = 0;
-    const result = await api("/providers/detect-dimension", {
-      method: "POST",
-      body: JSON.stringify(draft),
-    });
-    $("provider-dimensions").value = result.dimensions;
-    toast(`检测到 ${result.dimensions} 维`);
-  } catch (error) {
-    toast(error.message, true);
-  }
+  }, {
+    button: $("provider-detect-dimension"),
+    busyText: t("loading"),
+  });
 };
 
 $("provider-detect-context").onclick = async () => {
   const button = $("provider-detect-context");
-  button.disabled = true;
+  await asyncGuard.run("provider:detect-context", async () => {
   try {
     const payload = providerFormPayload();
     if (isRerankProvider(payload.type)) {
@@ -640,9 +804,11 @@ $("provider-detect-context").onclick = async () => {
     toast(t("maxContextManualHelp"), true);
   } catch (error) {
     toast(error.message, true);
-  } finally {
-    button.disabled = false;
   }
+  }, {
+    button,
+    busyText: t("loading"),
+  });
 };
 
 $("provider-api-base")?.addEventListener("input", refreshProviderContextDraftLock);

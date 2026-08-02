@@ -9,6 +9,11 @@ import pytest
 
 from personalityrag.config import AppConfig, ProviderConfig
 from personalityrag.control import ControlStore, ProviderRevision
+from personalityrag.database_types import (
+    DatabaseRef,
+    LIVINGMEMORY_V8_TYPE,
+    database_type_registry,
+)
 from personalityrag.libraries import LibraryManager
 from personalityrag.providers import provider_config_hash
 from personalityrag.storage import Storage
@@ -78,7 +83,9 @@ async def test_summary_library_list_uses_scalar_stats_without_full_metadata_scan
         provider,
     )
     storage = Storage(
-        root / "data" / "libraries" / "summary_library",
+        database_type_registry.data_dir(
+            manager.data_dir, DatabaseRef(LIVINGMEMORY_V8_TYPE, "summary_library")
+        ),
         system_path=manager.system_path,
     )
     await storage.initialize()
@@ -166,6 +173,61 @@ async def test_summary_for_config_only_empty_library_does_not_create_databases(
     assert not storage.conversations_path.exists()
 
 
+@pytest.mark.asyncio
+async def test_statistics_cache_is_single_flight_and_invalidates_after_write(
+    tmp_path: Path,
+) -> None:
+    storage = Storage(tmp_path / "cached-library", pooled=True)
+    await storage.initialize()
+    calls = 0
+    release = asyncio.Event()
+    original = storage._summary_statistics_uncached
+
+    async def counted():
+        nonlocal calls
+        calls += 1
+        await release.wait()
+        return await original()
+
+    storage._summary_statistics_uncached = counted
+    requests = [asyncio.create_task(storage.summary_statistics()) for _ in range(5)]
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if calls:
+            break
+    assert calls == 1
+    release.set()
+    results = await asyncio.gather(*requests)
+    assert all(item["total_memories"] == 0 for item in results)
+    assert calls == 1
+
+    async with storage.connect() as db:
+        await db.execute(
+            "INSERT INTO documents(doc_id,text,metadata) VALUES('doc-1','fixture','{}')"
+        )
+        await db.commit()
+    refreshed = await storage.summary_statistics()
+    assert refreshed["total_memories"] == 1
+    assert calls == 2
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_conversation_compatibility_indexes_are_additive(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "conversation-indexes")
+    await storage.initialize()
+    async with storage.conversation_connect() as db:
+        rows = await (
+            await db.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='messages'"
+            )
+        ).fetchall()
+    names = {str(row["name"]) for row in rows}
+    assert "idx_messages_session_time" in names
+    assert "idx_messages_session_timestamp_id" in names
+    assert "idx_messages_dedup_key" in names
+
+
 class CountingProvider:
     def __init__(self) -> None:
         self.calls = 0
@@ -249,4 +311,4 @@ def test_webui_library_list_requests_summary_mode() -> None:
         / "modules"
         / "libraries.js"
     ).read_text(encoding="utf-8")
-    assert 'api("/libraries?stats_mode=summary")' in source
+    assert 'api("/databases?stats_mode=summary")' in source

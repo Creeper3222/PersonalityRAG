@@ -16,6 +16,7 @@ from fastapi import (
     Form,
     Header,
     HTTPException,
+    Request,
     Response,
     UploadFile,
 )
@@ -24,14 +25,14 @@ from fastapi.responses import FileResponse, HTMLResponse
 from .. import __version__
 from ..application_context import auth, config, current_context, manager
 from ..auth import COOKIE_NAME, hash_password
+from ..revision_debug import DEBUG_COOKIE_NAME
 from ..backup_migration import (
     MAX_PACKAGE_BYTES,
     PragPackageError,
     export_prag_package,
     import_prag_package,
 )
-from ..compat import LIVINGMEMORY_DATABASE_VERSION
-from ..config import build_access_url, save_config
+from ..config import build_access_url, build_adapter_connection_url, save_config
 from ..http_shared import (
     _launch_restart_helper,
     _restart_probe_urls,
@@ -65,7 +66,6 @@ async def health():
         "status": "ok",
         "product": "PersonalityRAG",
         "version": __version__,
-        "livingmemory_database_version": LIVINGMEMORY_DATABASE_VERSION,
         "time": time.time(),
     }
 
@@ -83,14 +83,20 @@ async def auth_status(
         ),
         "login_password_enabled": auth.password_enabled,
         "login_mode": "password" if auth.password_enabled else "api_key",
+        "version": __version__,
     }
 
 @router.post("/api/v1/auth/login")
-async def login(payload: LoginRequest, response: Response):
+async def login(payload: LoginRequest, response: Response, request: Request):
     credential = payload.credential or payload.api_key
     if not await asyncio.to_thread(auth.verify_login_secret, credential):
         detail = "invalid password" if auth.password_enabled else "invalid API key"
         raise HTTPException(status_code=401, detail=detail)
+    current_context().revision_debug.revoke(
+        request.cookies.get(DEBUG_COOKIE_NAME),
+        auth,
+    )
+    response.delete_cookie(DEBUG_COOKIE_NAME, path="/")
     response.set_cookie(
         COOKIE_NAME,
         auth.issue_session(),
@@ -103,8 +109,13 @@ async def login(payload: LoginRequest, response: Response):
     return {"status": "ok", "fingerprint": config.api_key_fingerprint}
 
 @router.post("/api/v1/auth/logout")
-async def logout(response: Response):
+async def logout(response: Response, request: Request):
+    current_context().revision_debug.revoke(
+        request.cookies.get(DEBUG_COOKIE_NAME),
+        auth,
+    )
     response.delete_cookie(COOKIE_NAME, path="/")
+    response.delete_cookie(DEBUG_COOKIE_NAME, path="/")
     return {"status": "ok"}
 
 @router.post("/api/v1/auth/rotate", dependencies=[Depends(require_auth)])
@@ -115,7 +126,9 @@ async def rotate_key(response: Response):
     save_config(context.config_path, context.config)
     auth.api_key = config.api_key
     auth.session_secret = config.session_secret
+    current_context().revision_debug.revoke_all()
     response.delete_cookie(COOKIE_NAME, path="/")
+    response.delete_cookie(DEBUG_COOKIE_NAME, path="/")
     logger.warning("API Key 已轮换：new_fingerprint=%s", config.api_key_fingerprint)
     return {"api_key": config.api_key}
 
@@ -131,9 +144,15 @@ def _settings_payload() -> dict[str, Any]:
     )
     webui_url = build_access_url(config.access_base_url, actual_port)
     api_access_url = build_access_url(config.access_base_url, actual_access_port)
+    recommended_adapter_url = build_adapter_connection_url(
+        config,
+        access_port=actual_access_port,
+    )
     return {
         "host": config.host,
         "access_base_url": config.access_base_url,
+        "public_adapter_url": config.public_adapter_url,
+        "recommended_adapter_url": recommended_adapter_url,
         "configured_port": config.port,
         "configured_webui_url": configured_webui_url,
         "actual_port": actual_port,
@@ -164,7 +183,7 @@ async def get_settings():
     return _settings_payload()
 
 @router.patch("/api/v1/settings", dependencies=[Depends(require_auth)])
-async def update_settings(payload: SettingsUpdate):
+async def update_settings(payload: SettingsUpdate, response: Response):
     changed: list[str] = []
     next_webui_port = payload.port if payload.port is not None else config.port
     next_access_port = (
@@ -180,6 +199,12 @@ async def update_settings(payload: SettingsUpdate):
     ):
         config.access_base_url = payload.access_base_url
         changed.append("access_base_url")
+    if (
+        payload.public_adapter_url is not None
+        and payload.public_adapter_url != config.public_adapter_url
+    ):
+        config.public_adapter_url = payload.public_adapter_url
+        changed.append("public_adapter_url")
     if payload.port is not None and payload.port != config.port:
         config.port = payload.port
         changed.append("port")
@@ -230,6 +255,9 @@ async def update_settings(payload: SettingsUpdate):
             changed,
             bool({"port", "access_port"} & set(changed)),
         )
+    if {"password_cleared", "password_set"} & set(changed):
+        current_context().revision_debug.revoke_all()
+        response.delete_cookie(DEBUG_COOKIE_NAME, path="/")
     return {**_settings_payload(), "changed": changed}
 
 @router.post("/api/v1/settings/restart", dependencies=[Depends(require_auth)])
@@ -333,6 +361,7 @@ async def import_backup_migration(
         auth.api_key = config.api_key
         auth.session_secret = config.session_secret
         auth.password_hash = config.webui_password_hash
+        context.revision_debug.revoke_all()
         context.manager.config = context.config
         response.set_cookie(
             COOKIE_NAME,
@@ -343,6 +372,7 @@ async def import_backup_migration(
             max_age=auth.session_ttl_seconds,
             path="/",
         )
+        response.delete_cookie(DEBUG_COOKIE_NAME, path="/")
         return result
     except PragPackageError as exc:
         raise HTTPException(400, str(exc)) from exc

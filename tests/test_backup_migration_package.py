@@ -24,6 +24,10 @@ from personalityrag.config import (
     RuntimeResidencyConfig,
     save_config,
 )
+from personalityrag.database_types import (
+    LIVINGMEMORY_V8_TYPE,
+    database_type_registry,
+)
 from personalityrag.libraries import LibraryManager
 from personalityrag.providers import EmbeddingProvider
 from personalityrag.io_utils import (
@@ -79,7 +83,7 @@ def _patch_fake_provider(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda config: FakeProvider(config),
     )
     monkeypatch.setattr(
-        "personalityrag.libraries.build_provider",
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider",
         lambda config: FakeProvider(config),
     )
 
@@ -253,6 +257,11 @@ async def test_prag_export_requires_password_and_encrypts_scope(
             item for item in manifest["libraries"] if item["id"] == "empty_library"
         ][0]
         assert non_empty["files"]["livingmemory_db"] in names
+        assert non_empty["database_type"] == "livingmemory_v8"
+        assert manifest["default_database"] == {
+            "database_type": "livingmemory_v8",
+            "id": "Default",
+        }
         assert non_empty["files"]["conversations_db"] in names
         assert empty["empty"] is True
         assert "livingmemory_db" not in empty["files"]
@@ -514,7 +523,9 @@ async def test_prag_import_rolls_back_after_disk_full_during_library_install(
         original_sqlite_backup = backup_module.sqlite_backup
 
         def disk_full_during_install(source: Path, target: Path) -> None:
-            libraries_root = target_manager.data_dir / "libraries"
+            libraries_root = database_type_registry.type_root(
+                target_manager.data_dir, LIVINGMEMORY_V8_TYPE
+            )
             if (
                 target.name == "livingmemory.db"
                 and libraries_root in target.parents

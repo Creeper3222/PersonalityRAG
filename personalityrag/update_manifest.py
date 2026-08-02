@@ -5,12 +5,13 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
-from .compat import LIVINGMEMORY_DATABASE_VERSION
+from .storage_layout import DATABASE_LAYOUT_VERSION
 from .version import PLATFORM_NAME, PRODUCT_NAME, TAG_NAME, VERSION
 
 
@@ -18,6 +19,10 @@ MANIFEST_NAME = "update-manifest.json"
 MANIFEST_FORMAT_VERSION = 1
 CONFIG_SCHEMA_VERSION = 1
 CONTROL_SCHEMA_VERSION = 1
+# v0.1.0 requires this target-manifest key before it will install an update.
+# New runtimes do not read it; keep it only until v0.1.0 is no longer an
+# accepted update origin.
+V010_LIVINGMEMORY_MANIFEST_BRIDGE = 8
 MAX_WINDOWS_RELEASE_BYTES = 512 * 1024 * 1024
 MAX_RELEASE_FILES = 10_000
 MANAGED_DIRECTORIES = ("personalityrag", "static")
@@ -28,6 +33,42 @@ MANAGED_FILES = (
     "requirements-runtime.lock",
     "tools/runtime_bootstrap.py",
     "tools/update_helper.py",
+)
+SOURCE_ONLY_DIRECTORIES = frozenset({"assets", "config", "docs", "tests"})
+SOURCE_ONLY_TOP_LEVEL_FILES = frozenset(
+    {
+        ".editorconfig",
+        ".gitignore",
+        "DELIVERY.md",
+        "IMPLEMENTATION_AUDIT.md",
+        "LICENSE",
+        "README.md",
+        "THIRD_PARTY_NOTICES.md",
+        "pyproject.toml",
+        "requirements-dev.txt",
+    }
+)
+SOURCE_ONLY_TOOL_FILES = frozenset(
+    {
+        "tools/acceptance_livingmemory_253_webui.py",
+        "tools/acceptance_text_media_fusion_webui.py",
+        "tools/acceptance_text_media_modes_webui.py",
+        "tools/acceptance_text_media_webui.py",
+        "tools/acceptance_webui.py",
+        "tools/audit_migration.py",
+        "tools/benchmark_operations.py",
+        "tools/benchmark_text_media_modes.py",
+        "tools/benchmark_text_media_relevance_pivot.py",
+        "tools/benchmark_text_media_v1.py",
+        "tools/benchmark_text_media_v1_rerank.py",
+        "tools/benchmark_text_media_v1_semantic_rerank.py",
+        "tools/benchmark_text_media_v1_text_relevance.py",
+        "tools/build_windows_release.py",
+        "tools/compare_indexes.py",
+        "tools/export_embedding_context_lengths.py",
+        "tools/migrate_livingmemory.py",
+        "tools/rebuild_text_media_benchmark.py",
+    }
 )
 PROTECTED_TOP_LEVEL = frozenset(
     {".git", ".venv", "config", "data", "docs", "tests", "assets"}
@@ -40,6 +81,65 @@ TAG_PATTERN = re.compile(
 
 class UpdatePackageError(ValueError):
     pass
+
+
+def audit_release_source_contract(root: Path) -> tuple[str, ...]:
+    """Reject tracked source files that have no explicit release classification.
+
+    The v0.1.0 updater requires the manifest-v1 managed path contract to remain
+    byte-for-byte stable.  New runtime code therefore belongs below an existing
+    managed directory (``personalityrag`` or ``static``), while every tracked
+    source-only file must be classified here deliberately.  This prevents a
+    future release builder from silently omitting a newly added runtime entry.
+    """
+
+    root = root.resolve()
+    tracked_result = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "-z"],
+        check=False,
+        capture_output=True,
+    )
+    if tracked_result.returncode != 0:
+        raise UpdatePackageError("release source must be a readable Git repository")
+
+    dirty_result = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if dirty_result.returncode != 0:
+        raise UpdatePackageError("release source Git status is unavailable")
+    if dirty_result.stdout.strip():
+        raise UpdatePackageError("release source contains uncommitted tracked changes")
+
+    tracked = tuple(
+        item.decode("utf-8", "strict").replace("\\", "/")
+        for item in tracked_result.stdout.split(b"\0")
+        if item
+    )
+    unclassified: list[str] = []
+    for relative in tracked:
+        pure = PurePosixPath(relative)
+        if not pure.parts or pure.is_absolute() or ".." in pure.parts:
+            unclassified.append(relative)
+            continue
+        if pure.parts[0] in MANAGED_DIRECTORIES or relative in MANAGED_FILES:
+            continue
+        if pure.parts[0] in SOURCE_ONLY_DIRECTORIES:
+            continue
+        if relative in SOURCE_ONLY_TOP_LEVEL_FILES or relative in SOURCE_ONLY_TOOL_FILES:
+            continue
+        unclassified.append(relative)
+
+    if unclassified:
+        sample = ", ".join(sorted(unclassified)[:5])
+        raise UpdatePackageError(
+            "tracked files are not classified by the frozen update contract: " + sample
+        )
+    return tracked
 
 
 def parse_tag(tag: str) -> tuple[int, int, int, tuple[tuple[int, object], ...]]:
@@ -130,8 +230,12 @@ def build_manifest(
             "config_schema": {"minimum": CONFIG_SCHEMA_VERSION, "maximum": CONFIG_SCHEMA_VERSION},
             "control_schema": {"minimum": CONTROL_SCHEMA_VERSION, "maximum": CONTROL_SCHEMA_VERSION},
             "livingmemory_database": {
-                "minimum": LIVINGMEMORY_DATABASE_VERSION,
-                "maximum": LIVINGMEMORY_DATABASE_VERSION,
+                "minimum": V010_LIVINGMEMORY_MANIFEST_BRIDGE,
+                "maximum": V010_LIVINGMEMORY_MANIFEST_BRIDGE,
+            },
+            "database_layout": {
+                "minimum": DATABASE_LAYOUT_VERSION,
+                "maximum": DATABASE_LAYOUT_VERSION,
             },
         },
         "files": files,
@@ -213,7 +317,7 @@ def _validate_persistent_compatibility(contract: dict[str, Any]) -> None:
     current = {
         "config_schema": CONFIG_SCHEMA_VERSION,
         "control_schema": CONTROL_SCHEMA_VERSION,
-        "livingmemory_database": LIVINGMEMORY_DATABASE_VERSION,
+        "database_layout": DATABASE_LAYOUT_VERSION,
     }
     for key, value in current.items():
         bounds = contract.get(key) or {}
@@ -223,6 +327,11 @@ def _validate_persistent_compatibility(contract: dict[str, Any]) -> None:
         except (KeyError, TypeError, ValueError) as exc:
             raise UpdatePackageError(f"missing persistent compatibility range: {key}") from exc
         if not minimum <= value <= maximum:
+            if key == "database_layout":
+                raise UpdatePackageError(
+                    f"target release does not support database layout {value}; "
+                    "install a layout-aware release instead"
+                )
             raise UpdatePackageError(f"target release is incompatible with {key}={value}")
 
 
@@ -297,6 +406,6 @@ def current_release_contract() -> dict[str, Any]:
         "persistent_compatibility": {
             "config_schema": CONFIG_SCHEMA_VERSION,
             "control_schema": CONTROL_SCHEMA_VERSION,
-            "livingmemory_database": LIVINGMEMORY_DATABASE_VERSION,
+            "database_layout": DATABASE_LAYOUT_VERSION,
         },
     }

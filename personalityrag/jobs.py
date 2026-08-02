@@ -6,10 +6,17 @@ import json
 import time
 import uuid
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from typing import Any, AsyncContextManager, AsyncIterator, Awaitable, Callable
 
 from .logger import logger, safe_summary
-from .storage import Storage
+from .database_types import (
+    LIVINGMEMORY_V8_TYPE,
+    DatabaseRef,
+    database_identity_fields,
+    database_type_registry,
+)
+from . import library_types as _registered_database_types  # noqa: F401
 from .task_control import (
     JobExecutionContext,
     JobInterrupted,
@@ -19,8 +26,13 @@ from .task_control import (
 )
 from .task_types import (
     ACTIVE_JOB_STATUSES,
-    ADAPTER_BUSY_JOB_KINDS,
     TERMINAL_JOB_STATUSES,
+    task_type_registry,
+)
+from .task_details import (
+    build_database_state_comparison,
+    sanitize_task_value,
+    task_request_summary,
 )
 
 
@@ -29,7 +41,7 @@ TERMINAL_STATUSES = frozenset(TERMINAL_JOB_STATUSES)
 PAUSED_STATUSES = frozenset({"paused", "interrupted"})
 JOB_HISTORY_DAYS = 30
 JOB_HISTORY_LIMIT = 1000
-PROGRESS_PERSIST_INTERVAL_SECONDS = 0.25
+PROGRESS_PERSIST_INTERVAL_SECONDS = 1.0
 SUBSCRIBER_QUEUE_SIZE = 1
 
 ProgressCallback = Callable[[float, str], Awaitable[None]]
@@ -37,6 +49,10 @@ JobOperation = Callable[[ProgressCallback], Awaitable[Any]]
 OperationResolver = Callable[
     [dict[str, Any]],
     ResolvedJobOperation | Awaitable[ResolvedJobOperation],
+]
+DatabaseStateProvider = Callable[
+    [str, str],
+    dict[str, Any] | Awaitable[dict[str, Any]],
 ]
 
 
@@ -47,12 +63,13 @@ class JobStateConflict(RuntimeError):
 class JobManager:
     def __init__(
         self,
-        storage: Storage,
+        storage: Any,
         runtime_lease_factory: Callable[[str], AsyncContextManager[Any]] | None = None,
     ):
         self.storage = storage
         self._runtime_lease_factory = runtime_lease_factory
-        self._resolver: OperationResolver | None = None
+        self._resolvers: dict[str, OperationResolver] = {}
+        self._database_state_providers: dict[str, DatabaseStateProvider] = {}
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._operations: dict[str, JobOperation] = {}
         self._runtime_lease_jobs: set[str] = set()
@@ -65,14 +82,43 @@ class JobManager:
         self._control_requests: dict[str, str] = {}
         self._last_persisted_at: dict[str, float] = {}
         self._worker_task: asyncio.Task[None] | None = None
+        self._simple_tasks: dict[str, asyncio.Task[None]] = {}
+        self._database_execution_locks: dict[str, asyncio.Lock] = {}
         self._current_job_id: str | None = None
         self._start_lock = asyncio.Lock()
         self._closing = False
         self._closed = False
         self.subscribers: dict[str, set[asyncio.Queue[dict[str, Any]]]] = defaultdict(set)
 
-    def set_operation_resolver(self, resolver: OperationResolver) -> None:
-        self._resolver = resolver
+    def set_operation_resolver(
+        self,
+        resolver: OperationResolver,
+        *,
+        database_type: str = LIVINGMEMORY_V8_TYPE,
+    ) -> None:
+        self._resolvers[database_type] = resolver
+
+    def set_database_state_provider(
+        self,
+        provider: DatabaseStateProvider,
+        *,
+        database_type: str = LIVINGMEMORY_V8_TYPE,
+    ) -> None:
+        self._database_state_providers[database_type] = provider
+
+    @asynccontextmanager
+    async def _connect(self):
+        try:
+            connection = self.storage.connect(system=True)
+        except TypeError:
+            db = await self.storage.connect()
+            try:
+                yield db
+            finally:
+                await db.close()
+            return
+        async with connection as db:
+            yield db
 
     def control_request(self, job_id: str) -> str:
         return self._control_requests.get(job_id, "")
@@ -106,18 +152,20 @@ class JobManager:
         self._transition_locks.clear()
         self._control_requests.clear()
         self._last_persisted_at.clear()
+        self._simple_tasks.clear()
+        self._database_execution_locks.clear()
         self.subscribers.clear()
         self._drain_queue()
 
         now = time.time()
         cutoff = now - JOB_HISTORY_DAYS * 24 * 60 * 60
-        async with self.storage.connect(system=True) as db:
+        async with self._connect() as db:
             queued_rows = await (
                 await db.execute("SELECT * FROM jobs WHERE status='queued'")
             ).fetchall()
         for row in queued_rows:
             queued_job = self._decode_row(row)
-            if not queued_job.get("resumable") or self._resolver is None:
+            if not queued_job.get("resumable") or not self._resolvers:
                 continue
             try:
                 operation = await self._resolve(queued_job)
@@ -130,22 +178,73 @@ class JobManager:
                 logger.exception(
                     "启动恢复时清理排队任务资源失败：job_id=%s", queued_job.get("id")
                 )
-        async with self.storage.connect(system=True) as db:
+        async with self._connect() as db:
+            in_flight_rows = await (
+                await db.execute(
+                    "SELECT * FROM jobs WHERE status IN ('running','pausing','stopping')"
+                )
+            ).fetchall()
             queued = await db.execute(
                 """UPDATE jobs SET status='cancelled',progress=0,
                 message='服务重启，排队任务已取消',status_reason='shutdown',
-                control_requested=NULL,updated_at=? WHERE status='queued'""",
-                (now,),
+                control_requested=NULL,finished_at=COALESCE(finished_at,?),updated_at=?
+                WHERE status='queued'""",
+                (now, now),
             )
             interrupted = await db.execute(
                 """UPDATE jobs SET status=CASE WHEN resumable=1 THEN 'interrupted'
                 ELSE 'cancelled' END,
                 message=CASE WHEN resumable=1 THEN '检测到异常退出，已回退到最近安全断点'
                 ELSE '服务异常退出，任务已取消' END,
-                status_reason='process_interrupted',control_requested=NULL,updated_at=?
+                status_reason='process_interrupted',control_requested=NULL,
+                finished_at=CASE WHEN resumable=1 THEN finished_at ELSE COALESCE(finished_at,?) END,
+                updated_at=?
                 WHERE status IN ('running','pausing','stopping')""",
-                (now,),
+                (now, now),
             )
+            for row in queued_rows:
+                payload = self._decode_row(row)
+                self._append_status_history(
+                    payload,
+                    status="cancelled",
+                    timestamp=now,
+                    message="服务重启，排队任务已取消",
+                    reason="shutdown",
+                )
+                await db.execute(
+                    "UPDATE jobs SET status_history=? WHERE id=?",
+                    (
+                        json.dumps(
+                            payload.get("status_history") or [],
+                            ensure_ascii=False,
+                        ),
+                        payload["id"],
+                    ),
+                )
+            for row in in_flight_rows:
+                payload = self._decode_row(row)
+                resumable = bool(payload.get("resumable"))
+                self._append_status_history(
+                    payload,
+                    status="interrupted" if resumable else "cancelled",
+                    timestamp=now,
+                    message=(
+                        "检测到异常退出，已回退到最近安全断点"
+                        if resumable
+                        else "服务异常退出，任务已取消"
+                    ),
+                    reason="process_interrupted",
+                )
+                await db.execute(
+                    "UPDATE jobs SET status_history=? WHERE id=?",
+                    (
+                        json.dumps(
+                            payload.get("status_history") or [],
+                            ensure_ascii=False,
+                        ),
+                        payload["id"],
+                    ),
+                )
             expired = await db.execute(
                 """DELETE FROM jobs WHERE status IN
                 ('completed','failed','stopped','cancelled') AND updated_at<?""",
@@ -250,6 +349,12 @@ class JobManager:
             self._worker_task.cancel()
             await asyncio.gather(self._worker_task, return_exceptions=True)
             self._worker_task = None
+        simple_tasks = list(self._simple_tasks.values())
+        for task in simple_tasks:
+            task.cancel()
+        if simple_tasks:
+            await asyncio.gather(*simple_tasks, return_exceptions=True)
+        self._simple_tasks.clear()
         self._operations.clear()
         self._runtime_lease_jobs.clear()
         self._drain_queue()
@@ -263,16 +368,23 @@ class JobManager:
         kind: str,
         operation: JobOperation,
         *,
+        database_id: str | None = None,
         library_id: str | None = None,
+        database_type: str = LIVINGMEMORY_V8_TYPE,
         dedupe_active: bool = True,
         lease_runtime: bool = True,
     ) -> str:
+        resolved_database_id = self._resolve_start_database_id(
+            database_id,
+            library_id,
+        )
         return await self._start_common(
             kind,
             operation=operation,
             operation_spec=None,
             resumable=False,
-            library_id=library_id,
+            database_id=resolved_database_id,
+            database_type=database_type,
             dedupe_active=dedupe_active,
             lease_runtime=lease_runtime,
         )
@@ -282,20 +394,46 @@ class JobManager:
         kind: str,
         operation_spec: dict[str, Any],
         *,
-        library_id: str,
+        database_id: str | None = None,
+        library_id: str | None = None,
+        database_type: str = LIVINGMEMORY_V8_TYPE,
         dedupe_active: bool = True,
         lease_runtime: bool = False,
     ) -> str:
-        if self._resolver is None:
+        if not self._resolvers:
             raise RuntimeError("resumable job resolver is not configured")
+        resolved_database_id = self._resolve_start_database_id(
+            database_id,
+            library_id,
+        )
         return await self._start_common(
             kind,
             operation=None,
             operation_spec=operation_spec,
             resumable=True,
-            library_id=library_id,
+            database_id=resolved_database_id,
+            database_type=database_type,
             dedupe_active=dedupe_active,
             lease_runtime=lease_runtime,
+        )
+
+    @staticmethod
+    def _resolve_start_database_id(
+        database_id: str | None,
+        deprecated_library_id: str | None,
+    ) -> str | None:
+        """Resolve the frozen ``library_id`` call alias at one boundary."""
+
+        if (
+            database_id not in (None, "")
+            and deprecated_library_id not in (None, "")
+            and database_id != deprecated_library_id
+        ):
+            raise ValueError("database_id conflicts with deprecated library_id")
+        return (
+            database_id
+            if database_id not in (None, "")
+            else deprecated_library_id
         )
 
     async def _start_common(
@@ -305,22 +443,29 @@ class JobManager:
         operation: JobOperation | None,
         operation_spec: dict[str, Any] | None,
         resumable: bool,
-        library_id: str | None,
+        database_id: str | None,
+        database_type: str,
         dedupe_active: bool,
         lease_runtime: bool,
     ) -> str:
+        resource_key = database_id
+        if database_id is not None:
+            driver = database_type_registry.require(database_type)
+            resource_key = driver.resource_key(database_id)
         if self._closed or self._closing:
             raise RuntimeError("任务管理器已关闭")
         async with self._start_lock:
             if dedupe_active:
-                existing = await self._find_active(kind, library_id)
+                existing = await self._find_active(kind, resource_key)
                 if existing:
                     return existing
             job_id = uuid.uuid4().hex
             now = time.time()
             snapshot = {
                 "id": job_id,
-                "library_id": library_id,
+                "database_resource_key": resource_key,
+                "database_type": database_type,
+                "database_id": database_id,
                 "kind": kind,
                 "status": "queued",
                 "progress": 0.0,
@@ -332,24 +477,45 @@ class JobManager:
                 "status_reason": "",
                 "control_requested": "",
                 "resumable": bool(resumable),
+                "started_at": None,
+                "finished_at": None,
+                "attempt_count": 0,
+                "status_history": [
+                    {
+                        "status": "queued",
+                        "timestamp": now,
+                        "message": "等待执行",
+                        "reason": "",
+                    }
+                ],
+                "database_state_before": None,
+                "database_state_after": None,
+                "database_state_capture_error": {},
                 "created_at": now,
                 "updated_at": now,
             }
-            async with self.storage.connect(system=True) as db:
+            async with self._connect() as db:
                 await db.execute(
                     """INSERT INTO jobs
-                    (id,library_id,kind,status,progress,message,result,error,
+                    (id,library_id,database_type,database_id,kind,status,progress,message,result,error,
                     operation,checkpoint,status_reason,control_requested,resumable,
+                    started_at,finished_at,attempt_count,status_history,
+                    database_state_before,database_state_after,database_state_capture_error,
                     created_at,updated_at)
-                    VALUES(?,?,?,'queued',0,'等待执行',NULL,NULL,?,NULL,'',NULL,?,?,?)""",
+                    VALUES(?,?,?,?,?,'queued',0,'等待执行',NULL,NULL,?,NULL,'',NULL,?,
+                    NULL,NULL,0,?,NULL,NULL,?, ?,?)""",
                     (
                         job_id,
-                        library_id,
+                        resource_key,
+                        database_type,
+                        database_id,
                         kind,
                         json.dumps(operation_spec, ensure_ascii=False)
                         if operation_spec is not None
                         else None,
                         1 if resumable else 0,
+                        json.dumps(snapshot["status_history"], ensure_ascii=False),
+                        json.dumps({}, ensure_ascii=False),
                         now,
                         now,
                     ),
@@ -364,31 +530,41 @@ class JobManager:
             self._transition_locks[job_id] = asyncio.Lock()
             if operation is not None:
                 self._operations[job_id] = operation
-            if lease_runtime and library_id and self._runtime_lease_factory is not None:
+            if lease_runtime and resource_key and self._runtime_lease_factory is not None:
                 self._runtime_lease_jobs.add(job_id)
-            await self._queue.put(job_id)
-            self._ensure_worker()
-        logger.info("任务已入队：job_id=%s kind=%s library_id=%s", job_id, kind, library_id or "")
+            definition = task_type_registry.get(database_type, kind)
+            if resumable or definition.lane == "long":
+                await self._queue.put(job_id)
+                self._ensure_worker()
+            else:
+                self._ensure_simple_task(job_id)
+        logger.info(
+            "任务已入队：job_id=%s kind=%s database_type=%s database_id=%s",
+            job_id,
+            kind,
+            database_type if database_id else "",
+            database_id or "",
+        )
         return job_id
 
-    async def _find_active(self, kind: str, library_id: str | None) -> str | None:
+    async def _find_active(self, kind: str, resource_key: str | None) -> str | None:
         for snapshot in sorted(
             self._snapshots.values(), key=lambda item: float(item.get("created_at") or 0)
         ):
             if (
                 snapshot.get("kind") == kind
-                and snapshot.get("library_id") == library_id
+                and snapshot.get("database_resource_key") == resource_key
                 and snapshot.get("status") in ACTIVE_STATUSES
             ):
                 return str(snapshot["id"])
         placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
         params: list[Any] = [kind]
         library_clause = "library_id IS NULL"
-        if library_id is not None:
+        if resource_key is not None:
             library_clause = "library_id=?"
-            params.append(library_id)
+            params.append(resource_key)
         params.extend(sorted(ACTIVE_STATUSES))
-        async with self.storage.connect(system=True) as db:
+        async with self._connect() as db:
             row = await (
                 await db.execute(
                     f"""SELECT id FROM jobs WHERE kind=? AND {library_clause}
@@ -398,27 +574,84 @@ class JobManager:
             ).fetchone()
         return str(row["id"]) if row else None
 
-    async def active_job_id(self, kind: str, library_id: str | None = None) -> str | None:
-        return await self._find_active(kind, library_id)
+    async def active_job_id(
+        self,
+        kind: str,
+        database_resource_key: str | None = None,
+    ) -> str | None:
+        return await self._find_active(kind, database_resource_key)
 
-    async def active_long_job(self, library_id: str) -> dict[str, Any] | None:
-        return (await self.active_long_jobs_map([library_id])).get(library_id)
+    @staticmethod
+    def _busy_resource_key(
+        database: str | DatabaseRef,
+        database_type: str | None = None,
+    ) -> str:
+        if isinstance(database, DatabaseRef):
+            return database_type_registry.require(database.database_type).resource_key(
+                database.id
+            )
+        value = str(database)
+        if database_type:
+            return database_type_registry.require(database_type).resource_key(value)
+        prefix, separator, _identifier = value.partition(":")
+        if separator:
+            try:
+                database_type_registry.require(prefix)
+            except KeyError:
+                pass
+            else:
+                return value
+        return database_type_registry.require(LIVINGMEMORY_V8_TYPE).resource_key(value)
+
+    async def active_long_job(
+        self,
+        database: str | DatabaseRef,
+        *,
+        database_type: str | None = None,
+    ) -> dict[str, Any] | None:
+        resource_key = self._busy_resource_key(database, database_type)
+        return (await self.active_long_jobs_map([resource_key])).get(resource_key)
+
+    async def active_database_job(
+        self,
+        database: str | DatabaseRef,
+        *,
+        database_type: str | None = None,
+        include_read_only: bool = True,
+    ) -> dict[str, Any] | None:
+        """Return the oldest active task for one typed database resource."""
+        resource_key = self._busy_resource_key(database, database_type)
+        for item in await self.list(scope="active"):
+            if str(item.get("database_resource_key") or "") != resource_key:
+                continue
+            definition = task_type_registry.get(
+                str(item.get("database_type") or LIVINGMEMORY_V8_TYPE),
+                str(item.get("kind") or ""),
+            )
+            if include_read_only or not definition.read_only:
+                return item
+        return None
 
     async def active_long_jobs_map(
-        self, library_ids: list[str]
+        self, database_resource_keys: list[str]
     ) -> dict[str, dict[str, Any] | None]:
-        result: dict[str, dict[str, Any] | None] = {value: None for value in library_ids}
-        if not library_ids:
+        result: dict[str, dict[str, Any] | None] = {
+            value: None for value in database_resource_keys
+        }
+        if not database_resource_keys:
             return result
         all_jobs = await self.list(scope="active")
         for item in all_jobs:
-            library_id = str(item.get("library_id") or "")
+            resource_key = str(item.get("database_resource_key") or "")
             if (
-                library_id in result
-                and result[library_id] is None
-                and item.get("kind") in ADAPTER_BUSY_JOB_KINDS
+                resource_key in result
+                and result[resource_key] is None
+                and task_type_registry.get(
+                    str(item.get("database_type") or LIVINGMEMORY_V8_TYPE),
+                    str(item.get("kind") or ""),
+                ).adapter_blocking
             ):
-                result[library_id] = item
+                result[resource_key] = item
         return result
 
     def _ensure_worker(self) -> None:
@@ -426,10 +659,65 @@ class JobManager:
             return
         self._worker_task = asyncio.create_task(self._worker())
 
+    def _ensure_simple_task(self, job_id: str) -> None:
+        current = self._simple_tasks.get(job_id)
+        if current is not None and not current.done():
+            return
+        self._simple_tasks[job_id] = asyncio.create_task(
+            self._run_simple_scheduled(job_id),
+            name=f"personalityrag-job-{job_id}",
+        )
+
+    def _execution_lock(self, database_resource_key: str | None) -> asyncio.Lock:
+        key = str(database_resource_key or "__global__")
+        return self._database_execution_locks.setdefault(key, asyncio.Lock())
+
+    async def _run_simple_scheduled(self, job_id: str) -> None:
+        try:
+            job = await self.get(job_id)
+            if not job:
+                return
+            async with self._execution_lock(job.get("database_resource_key")):
+                job = await self.get(job_id)
+                if not job or job.get("status") in TERMINAL_STATUSES:
+                    self._operations.pop(job_id, None)
+                    return
+                operation = self._operations.pop(job_id, None)
+                if operation is None:
+                    await self._update(
+                        job_id,
+                        status="cancelled",
+                        progress=0,
+                        status_reason="operation_missing",
+                        message="任务操作已丢失",
+                    )
+                    return
+                await self._run_simple(job_id, operation)
+        except asyncio.CancelledError:
+            job = await self.get(job_id)
+            if job and job.get("status") not in TERMINAL_STATUSES:
+                await self._update(
+                    job_id,
+                    status="cancelled",
+                    progress=0,
+                    status_reason="shutdown",
+                    message="服务关闭，任务已取消",
+                )
+            raise
+        except Exception as exc:
+            logger.exception("普通任务 worker 异常：job_id=%s", job_id)
+            await self._best_effort_terminal_update(job_id, exc)
+        finally:
+            self._runtime_lease_jobs.discard(job_id)
+            self._execution_done.setdefault(job_id, asyncio.Event()).set()
+            self._simple_tasks.pop(job_id, None)
+
     async def _resolve(self, job: dict[str, Any]) -> ResolvedJobOperation:
-        if self._resolver is None:
+        database_type = str(job.get("database_type") or LIVINGMEMORY_V8_TYPE)
+        resolver = self._resolvers.get(database_type)
+        if resolver is None:
             raise RuntimeError("resumable job resolver is not configured")
-        value = self._resolver(job)
+        value = resolver(job)
         if inspect.isawaitable(value):
             value = await value
         return value
@@ -448,20 +736,21 @@ class JobManager:
                 job = await self.get(job_id)
                 if not job or job.get("status") in TERMINAL_STATUSES:
                     continue
-                if job.get("resumable"):
-                    await self._run_resumable(job_id)
-                else:
-                    operation = self._operations.pop(job_id, None)
-                    if operation is None:
-                        await self._update(
-                            job_id,
-                            status="cancelled",
-                            progress=0,
-                            status_reason="operation_missing",
-                            message="任务操作已丢失",
-                        )
+                async with self._execution_lock(job.get("database_resource_key")):
+                    if job.get("resumable"):
+                        await self._run_resumable(job_id)
                     else:
-                        await self._run_simple(job_id, operation)
+                        operation = self._operations.pop(job_id, None)
+                        if operation is None:
+                            await self._update(
+                                job_id,
+                                status="cancelled",
+                                progress=0,
+                                status_reason="operation_missing",
+                                message="任务操作已丢失",
+                            )
+                        else:
+                            await self._run_simple(job_id, operation)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -506,9 +795,22 @@ class JobManager:
                 )
 
         job = await self.get(job_id) or {}
-        library_id = str(job.get("library_id") or "")
-        if job_id in self._runtime_lease_jobs and library_id and self._runtime_lease_factory:
-            async with self._runtime_lease_factory(library_id):
+        database_resource_key = str(job.get("database_resource_key") or "")
+        if (
+            job_id in self._runtime_lease_jobs
+            and database_resource_key
+            and self._runtime_lease_factory
+        ):
+            database_id = str(job.get("database_id") or "")
+            database_type = str(
+                job.get("database_type") or LIVINGMEMORY_V8_TYPE
+            )
+            target = (
+                DatabaseRef(database_type, database_id)
+                if database_id
+                else database_resource_key
+            )
+            async with self._runtime_lease_factory(target):
                 await execute()
         else:
             await execute()
@@ -769,6 +1071,83 @@ class JobManager:
         except Exception:
             logger.exception("任务终态补偿失败：job_id=%s", job_id)
 
+    async def _capture_database_state(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        phase: str,
+        captured_at: float,
+    ) -> None:
+        if phase not in {"before", "after"}:
+            raise ValueError("invalid task database-state phase")
+        definition = task_type_registry.get(
+            str(snapshot.get("database_type") or LIVINGMEMORY_V8_TYPE),
+            str(snapshot.get("kind") or ""),
+        )
+        database_id = str(snapshot.get("database_id") or "")
+        field = f"database_state_{phase}"
+        if (
+            not definition.database_state_comparison
+            or not database_id
+            or snapshot.get(field) is not None
+        ):
+            return
+        database_type = str(
+            snapshot.get("database_type") or LIVINGMEMORY_V8_TYPE
+        )
+        provider = self._database_state_providers.get(database_type)
+        errors = dict(snapshot.get("database_state_capture_error") or {})
+        if provider is None:
+            errors[phase] = "database-state provider is unavailable"
+            snapshot["database_state_capture_error"] = errors
+            return
+        try:
+            value = provider(database_id, str(snapshot.get("kind") or ""))
+            if inspect.isawaitable(value):
+                value = await value
+            safe = sanitize_task_value(value)
+            if not isinstance(safe, dict):
+                safe = {"value": safe}
+            snapshot[field] = {
+                "schema_version": 1,
+                "captured_at": captured_at,
+                **safe,
+            }
+            errors.pop(phase, None)
+        except Exception as exc:
+            errors[phase] = safe_summary(str(exc), max_chars=300)
+            logger.warning(
+                "任务库状态快照失败：job_id=%s phase=%s database_type=%s database_id=%s error=%s",
+                snapshot.get("id") or "",
+                phase,
+                database_type,
+                database_id,
+                safe_summary(str(exc), max_chars=160),
+            )
+        snapshot["database_state_capture_error"] = errors
+
+    @staticmethod
+    def _append_status_history(
+        snapshot: dict[str, Any],
+        *,
+        status: str,
+        timestamp: float,
+        message: str,
+        reason: str,
+    ) -> None:
+        history = list(snapshot.get("status_history") or [])
+        if history and str(history[-1].get("status") or "") == status:
+            return
+        history.append(
+            {
+                "status": status,
+                "timestamp": timestamp,
+                "message": message,
+                "reason": reason,
+            }
+        )
+        snapshot["status_history"] = history[-100:]
+
     async def _update(self, job_id: str, **fields: Any) -> None:
         allowed = {
             "status",
@@ -788,8 +1167,43 @@ class JobManager:
                 return
             self._snapshots[job_id] = snapshot
         previous_status = str(snapshot.get("status") or "")
+        next_status = str(updates.get("status") or previous_status)
+        now = time.time()
+        entering_execution = (
+            next_status == "running"
+            and previous_status in {"queued", "paused", "interrupted"}
+        )
+        entering_terminal = (
+            next_status in TERMINAL_STATUSES
+            and previous_status not in TERMINAL_STATUSES
+        )
+        if entering_execution:
+            if snapshot.get("started_at") is None:
+                snapshot["started_at"] = now
+            snapshot["attempt_count"] = int(snapshot.get("attempt_count") or 0) + 1
+            await self._capture_database_state(
+                snapshot,
+                phase="before",
+                captured_at=now,
+            )
+        if entering_terminal:
+            if snapshot.get("started_at") is not None:
+                await self._capture_database_state(
+                    snapshot,
+                    phase="after",
+                    captured_at=now,
+                )
+            snapshot["finished_at"] = now
         snapshot.update(updates)
-        snapshot["updated_at"] = time.time()
+        snapshot["updated_at"] = now
+        if next_status != previous_status:
+            self._append_status_history(
+                snapshot,
+                status=next_status,
+                timestamp=now,
+                message=str(snapshot.get("message") or ""),
+                reason=str(snapshot.get("status_reason") or ""),
+            )
         payload = dict(snapshot)
         terminal = str(payload.get("status") or "") in TERMINAL_STATUSES
         status_changed = str(payload.get("status") or "") != previous_status
@@ -797,7 +1211,6 @@ class JobManager:
         should_persist = (
             terminal
             or status_changed
-            or "checkpoint" in updates
             or now - self._last_persisted_at.get(job_id, 0) >= PROGRESS_PERSIST_INTERVAL_SECONDS
         )
         persisted = False
@@ -833,10 +1246,12 @@ class JobManager:
         def encode(value: Any) -> str | None:
             return json.dumps(value, ensure_ascii=False) if value is not None else None
 
-        async with self.storage.connect(system=True) as db:
+        async with self._connect() as db:
             await db.execute(
                 """UPDATE jobs SET status=?,progress=?,message=?,result=?,error=?,
-                checkpoint=?,status_reason=?,control_requested=?,updated_at=? WHERE id=?""",
+                checkpoint=?,status_reason=?,control_requested=?,started_at=?,finished_at=?,
+                attempt_count=?,status_history=?,database_state_before=?,database_state_after=?,
+                database_state_capture_error=?,updated_at=? WHERE id=?""",
                 (
                     snapshot.get("status"),
                     float(snapshot.get("progress") or 0),
@@ -846,6 +1261,13 @@ class JobManager:
                     encode(snapshot.get("checkpoint")),
                     str(snapshot.get("status_reason") or ""),
                     str(snapshot.get("control_requested") or "") or None,
+                    snapshot.get("started_at"),
+                    snapshot.get("finished_at"),
+                    int(snapshot.get("attempt_count") or 0),
+                    encode(snapshot.get("status_history") or []),
+                    encode(snapshot.get("database_state_before")),
+                    encode(snapshot.get("database_state_after")),
+                    encode(snapshot.get("database_state_capture_error") or {}),
                     float(snapshot.get("updated_at") or time.time()),
                     snapshot["id"],
                 ),
@@ -865,11 +1287,33 @@ class JobManager:
         }
 
     @classmethod
-    def _public_payload(cls, payload: dict[str, Any]) -> dict[str, Any]:
+    def _public_payload(
+        cls,
+        payload: dict[str, Any],
+        *,
+        detail: bool = False,
+    ) -> dict[str, Any]:
         result = dict(payload)
-        result.pop("operation", None)
+        operation = result.pop("operation", None)
+        status_history = list(result.pop("status_history", None) or [])
+        state_before = result.pop("database_state_before", None)
+        state_after = result.pop("database_state_after", None)
+        state_errors = dict(result.pop("database_state_capture_error", None) or {})
+        database_id = str(result.get("database_id") or "")
+        database_type = str(
+            result.get("database_type") or LIVINGMEMORY_V8_TYPE
+        )
+        if database_id:
+            result.update(
+                database_identity_fields(
+                    DatabaseRef(database_type, database_id),
+                    include_deprecated=False,
+                )
+            )
+        # Frozen v0.1.1 task-state compatibility alias.
+        result["library_id"] = result.get("database_resource_key")
         checkpoint = result.get("checkpoint")
-        if isinstance(checkpoint, dict):
+        if isinstance(checkpoint, dict) and not detail:
             result["checkpoint"] = {
                 key: checkpoint.get(key)
                 for key in (
@@ -882,8 +1326,75 @@ class JobManager:
                 )
                 if key in checkpoint
             }
+        elif detail:
+            result["checkpoint"] = sanitize_task_value(checkpoint)
         result["capabilities"] = cls._capabilities(payload)
         result["resumable"] = bool(payload.get("resumable"))
+        definition = task_type_registry.get(
+            str(payload.get("database_type") or LIVINGMEMORY_V8_TYPE),
+            str(payload.get("kind") or ""),
+        )
+        result["task_type"] = definition.public()
+        created_at = float(payload.get("created_at") or 0)
+        terminal = str(payload.get("status") or "") in TERMINAL_STATUSES
+        started_at = (
+            float(payload["started_at"])
+            if payload.get("started_at") is not None
+            else None
+        )
+        finished_at = (
+            float(payload["finished_at"])
+            if payload.get("finished_at") is not None
+            else (
+                float(payload.get("updated_at") or 0) or None
+                if terminal
+                else None
+            )
+        )
+        result["attempt_count"] = int(payload.get("attempt_count") or 0)
+        result["timing"] = {
+            "created_at": created_at or None,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "queue_duration_seconds": (
+                max(0.0, started_at - created_at)
+                if started_at is not None and created_at
+                else None
+            ),
+            "execution_duration_seconds": (
+                max(0.0, finished_at - started_at)
+                if finished_at is not None and started_at is not None
+                else None
+            ),
+            "total_duration_seconds": (
+                max(0.0, finished_at - created_at)
+                if finished_at is not None and created_at
+                else None
+            ),
+        }
+        result["detail_available"] = terminal
+        if detail:
+            if not status_history:
+                status_history = [
+                    {
+                        "status": str(payload.get("status") or ""),
+                        "timestamp": float(payload.get("updated_at") or created_at),
+                        "message": str(payload.get("message") or ""),
+                        "reason": str(payload.get("status_reason") or ""),
+                    }
+                ]
+            result["request_metadata"] = task_request_summary(operation)
+            result["result"] = sanitize_task_value(result.get("result"))
+            result["status_history"] = sanitize_task_value(status_history)
+            result["database_state_comparison"] = (
+                build_database_state_comparison(
+                    state_before,
+                    state_after,
+                    state_errors,
+                )
+                if definition.database_state_comparison
+                else None
+            )
         return result
 
     def _notify(self, job_id: str, payload: dict[str, Any]) -> None:
@@ -899,30 +1410,50 @@ class JobManager:
     @staticmethod
     def _decode_row(row: Any) -> dict[str, Any]:
         result = dict(row)
-        for field in ("result", "operation", "checkpoint"):
+        result["database_resource_key"] = result.pop("library_id", None)
+        for field in (
+            "result",
+            "operation",
+            "checkpoint",
+            "status_history",
+            "database_state_before",
+            "database_state_after",
+            "database_state_capture_error",
+        ):
             if result.get(field):
                 try:
                     result[field] = json.loads(result[field])
                 except (json.JSONDecodeError, TypeError):
                     result[field] = None
         result["resumable"] = bool(result.get("resumable"))
+        result["attempt_count"] = int(result.get("attempt_count") or 0)
+        if not isinstance(result.get("status_history"), list):
+            result["status_history"] = []
+        if not isinstance(result.get("database_state_capture_error"), dict):
+            result["database_state_capture_error"] = {}
         result["control_requested"] = str(result.get("control_requested") or "")
         result["status_reason"] = str(result.get("status_reason") or "")
         return result
 
     async def _read_job(self, job_id: str) -> dict[str, Any] | None:
-        async with self.storage.connect(system=True) as db:
+        async with self._connect() as db:
             row = await (
                 await db.execute("SELECT * FROM jobs WHERE id=?", (job_id,))
             ).fetchone()
         return self._decode_row(row) if row else None
 
-    async def get(self, job_id: str, *, internal: bool = False) -> dict[str, Any] | None:
+    async def get(
+        self,
+        job_id: str,
+        *,
+        internal: bool = False,
+        detail: bool = False,
+    ) -> dict[str, Any] | None:
         snapshot = self._snapshots.get(job_id)
         payload = dict(snapshot) if snapshot is not None else await self._read_job(job_id)
         if payload is None or internal:
             return payload
-        return self._public_payload(payload)
+        return self._public_payload(payload, detail=detail)
 
     async def wait(self, job_id: str, *, poll_interval: float = 0.05) -> dict[str, Any]:
         del poll_interval
@@ -949,7 +1480,7 @@ class JobManager:
             placeholders = ",".join("?" for _ in statuses)
             where = f"WHERE status IN ({placeholders})"
             params = tuple(sorted(statuses))
-        async with self.storage.connect(system=True) as db:
+        async with self._connect() as db:
             rows = await (
                 await db.execute(f"SELECT * FROM jobs {where}", params)
             ).fetchall()
@@ -978,7 +1509,7 @@ class JobManager:
         return [self._public_payload(item) for item in items]
 
     async def clear_finished(self) -> int:
-        async with self.storage.connect(system=True) as db:
+        async with self._connect() as db:
             cursor = await db.execute(
                 "DELETE FROM jobs WHERE status IN ({})".format(
                     ",".join("?" for _ in TERMINAL_STATUSES)

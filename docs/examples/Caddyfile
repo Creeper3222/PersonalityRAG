@@ -1,0 +1,11 @@
+# Replace this hostname with the public adapter hostname.
+memory.example.com {
+	# Do not enable Caddy access logging here. PersonalityRAG records a
+	# query-free, credential-free adapter access log on the upstream.
+	reverse_proxy 127.0.0.1:8766 {
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 70s
+		}
+	}
+}

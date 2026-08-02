@@ -30,10 +30,12 @@ def main() -> int:
         MANAGED_FILES,
         MANIFEST_NAME,
         PRODUCT_NAME,
+        audit_release_source_contract,
         inspect_and_extract_zip,
         write_manifest,
     )
 
+    tracked_files = audit_release_source_contract(source)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="personalityrag-windows-release-") as temporary:
         staging = Path(temporary) / PRODUCT_NAME
@@ -63,6 +65,7 @@ def main() -> int:
             "output": str(output),
             "tag": args.tag,
             "files": len(manifest["files"]),
+            "tracked_source_files": len(tracked_files),
             "manifest": MANIFEST_NAME,
         }, ensure_ascii=False))
     return 0

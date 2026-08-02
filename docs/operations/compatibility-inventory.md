@@ -22,10 +22,11 @@ without a dedicated migration and public compatibility decision.
 
 ## HTTP compatibility
 
-- Unscoped endpoints such as `/api/v1/memories`, `/api/v1/recall`, and
-  `/api/v1/indexes` remain aliases for default-library operations.
-- Library-scoped endpoints under `/api/v1/libraries/{library_id}` remain the
-  canonical multi-library API.
+- Generic database endpoints expose type discovery and the database catalog.
+  Each database type owns its business protocol; LivingMemory v8 uses
+  `/api/v1/memory-libraries/livingmemory_v8/{database_id}`. v0.1.1 intentionally
+  removes `/api/v1/libraries/{library_id}` and generic typed business routes so
+  stale Adapter integrations fail visibly instead of selecting the wrong type.
 - WebUI and adapter authentication headers, status codes, and response core
   fields are contract-tested in `tests/test_operational_contract.py`.
 

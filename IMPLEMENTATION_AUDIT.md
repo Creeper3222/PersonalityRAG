@@ -48,3 +48,8 @@
 - Edge WebUI 运行时异常：0
 
 详细证据位于 `data/libraries/beileite/reports`。
+
+> Current runtime layout note: v0.1.1 migrates the historical
+> `data/libraries/beileite` root to
+> `data/databases/memory_stores/livingmemory_v8/beileite`; the historical
+> paths above describe the original v0.1.0 audit artifacts.

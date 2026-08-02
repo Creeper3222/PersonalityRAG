@@ -9,12 +9,15 @@ from typing import Any
 
 import aiosqlite
 
-from .compat import (
-    LIVINGMEMORY_DATABASE_VERSION,
-    LIVINGMEMORY_DATABASE_VERSION_LABEL,
-    default_library_metadata,
-)
 from .config import ConversationConfig, MaintenanceConfig, ProviderConfig, RecallConfig
+from .database_types import (
+    DATABASE_CATEGORIES,
+    DATABASE_CATEGORY_MEMORY,
+    LIVINGMEMORY_V8_TYPE,
+    DatabaseRef,
+    database_identity_fields,
+    database_type_registry,
+)
 from .identifiers import validate_identifier
 from .providers import (
     PROVIDER_TEMPLATES,
@@ -24,15 +27,22 @@ from .providers import (
     provider_config_hash,
 )
 from .version import VERSION
+from .task_types import task_type_registry
 from .repositories import (
     AdapterRepository,
     JobRepository,
-    LibraryRepository,
+    MemoryStoreRepository,
     ProviderRepository,
     SnapshotRepository,
 )
+from .sqlite_pool import SQLiteConnectionPool
 
 ADAPTER_CONNECTION_TTL_SECONDS = 180.0
+OBSOLETE_MEMORY_STORE_METADATA_KEYS = frozenset(
+    {"livingmemory_database_version"}
+)
+# Deprecated symbol alias retained for external imports.
+OBSOLETE_LIBRARY_METADATA_KEYS = OBSOLETE_MEMORY_STORE_METADATA_KEYS
 
 
 class AdapterForcedOfflineError(ValueError):
@@ -63,8 +73,9 @@ class ProviderRevision:
 
 
 @dataclass(slots=True)
-class LibraryRecord:
+class MemoryStoreRecord:
     id: str
+    database_type: str
     name: str
     description: str
     default_persona_id: str
@@ -80,17 +91,28 @@ class LibraryRecord:
     updated_at: float
 
     def public(self) -> dict[str, Any]:
-        return asdict(self)
+        return {
+            **asdict(self),
+            **database_identity_fields(DatabaseRef(self.database_type, self.id)),
+        }
+
+
+# Deprecated import alias retained for third-party code and old tests.
+LibraryRecord = MemoryStoreRecord
 
 
 class ControlStore:
     def __init__(self, path: Path):
         self.path = path
+        self.pool = SQLiteConnectionPool(path, size=2)
         async def connect():
             return await self.connect()
 
         self.provider_repository = ProviderRepository(connect)
-        self.library_repository = LibraryRepository(connect)
+        self.memory_store_repository = MemoryStoreRepository(connect)
+        # Deprecated compatibility attribute for extensions built before the
+        # memory-store naming migration.
+        self.library_repository = self.memory_store_repository
         self.adapter_repository = AdapterRepository(connect)
         self.job_repository = JobRepository(connect)
         self.snapshot_repository = SnapshotRepository(connect)
@@ -116,8 +138,11 @@ class ControlStore:
         )
 
     @staticmethod
-    def _validate_library_id(library_id: str) -> str:
-        return validate_identifier(library_id, field="记忆库 ID")
+    def _validate_memory_store_id(memory_store_id: str) -> str:
+        return validate_identifier(memory_store_id, field="记忆库 ID")
+
+    # Deprecated compatibility alias.
+    _validate_library_id = _validate_memory_store_id
 
     @staticmethod
     def _merge_settings(defaults: dict[str, Any], *parts: dict[str, Any] | None) -> dict[str, Any]:
@@ -145,11 +170,10 @@ class ControlStore:
         return cls._merge_settings(asdict(MaintenanceConfig()), *parts)
 
     async def connect(self):
-        db = await aiosqlite.connect(self.path)
-        db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA busy_timeout=10000")
-        await db.execute("PRAGMA foreign_keys=ON")
-        return db
+        return await self.pool.acquire()
+
+    async def close(self) -> None:
+        await self.pool.close()
 
     async def initialize(self, seed_provider: ProviderConfig) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -179,6 +203,7 @@ class ControlStore:
                 );
                 CREATE TABLE IF NOT EXISTS libraries (
                     id TEXT PRIMARY KEY,
+                    database_type TEXT NOT NULL DEFAULT 'livingmemory_v8',
                     name TEXT NOT NULL,
                     description TEXT NOT NULL DEFAULT '',
                     default_persona_id TEXT NOT NULL DEFAULT '',
@@ -196,8 +221,19 @@ class ControlStore:
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_libraries_default
                 ON libraries(is_default) WHERE is_default=1 AND deleted_at IS NULL;
+                CREATE TABLE IF NOT EXISTS database_catalog (
+                    database_type TEXT NOT NULL,
+                    id TEXT NOT NULL,
+                    database_category TEXT NOT NULL,
+                    deleted_at REAL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(database_type,id)
+                );
                 CREATE TABLE IF NOT EXISTS library_generation_bindings (
                     library_id TEXT NOT NULL,
+                    database_type TEXT NOT NULL DEFAULT 'livingmemory_v8',
+                    database_id TEXT,
                     generation TEXT NOT NULL,
                     provider_id TEXT NOT NULL,
                     provider_revision INTEGER NOT NULL,
@@ -208,6 +244,8 @@ class ControlStore:
                 CREATE TABLE IF NOT EXISTS jobs (
                     id TEXT PRIMARY KEY,
                     library_id TEXT,
+                    database_type TEXT NOT NULL DEFAULT 'livingmemory_v8',
+                    database_id TEXT,
                     kind TEXT NOT NULL,
                     status TEXT NOT NULL,
                     progress REAL NOT NULL DEFAULT 0,
@@ -219,12 +257,21 @@ class ControlStore:
                     status_reason TEXT NOT NULL DEFAULT '',
                     control_requested TEXT,
                     resumable INTEGER NOT NULL DEFAULT 0,
+                    started_at REAL,
+                    finished_at REAL,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    status_history TEXT NOT NULL DEFAULT '[]',
+                    database_state_before TEXT,
+                    database_state_after TEXT,
+                    database_state_capture_error TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS migration_runs (
                     id TEXT PRIMARY KEY,
                     library_id TEXT,
+                    database_type TEXT NOT NULL DEFAULT 'livingmemory_v8',
+                    database_id TEXT,
                     source_path TEXT NOT NULL,
                     mode TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -234,6 +281,8 @@ class ControlStore:
                 );
                 CREATE TABLE IF NOT EXISTS index_generations (
                     library_id TEXT NOT NULL DEFAULT '',
+                    database_type TEXT NOT NULL DEFAULT 'livingmemory_v8',
+                    database_id TEXT,
                     generation TEXT NOT NULL,
                     status TEXT NOT NULL,
                     manifest TEXT NOT NULL,
@@ -243,6 +292,8 @@ class ControlStore:
                 );
                 CREATE TABLE IF NOT EXISTS adapter_connections (
                     library_id TEXT NOT NULL,
+                    database_type TEXT NOT NULL DEFAULT 'livingmemory_v8',
+                    database_id TEXT,
                     adapter_id TEXT NOT NULL,
                     instance_id TEXT NOT NULL,
                     adapter_type TEXT NOT NULL DEFAULT 'unknown',
@@ -253,9 +304,47 @@ class ControlStore:
                     disconnect_reason TEXT,
                     PRIMARY KEY(library_id, adapter_id)
                 );
+                CREATE TABLE IF NOT EXISTS database_adapter_connections (
+                    database_type TEXT NOT NULL,
+                    database_id TEXT NOT NULL,
+                    adapter_id TEXT NOT NULL,
+                    instance_id TEXT NOT NULL,
+                    adapter_type TEXT NOT NULL DEFAULT 'unknown',
+                    connected_at REAL NOT NULL,
+                    last_seen REAL NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'active',
+                    disconnected_at REAL,
+                    disconnect_reason TEXT,
+                    PRIMARY KEY(database_type,database_id,adapter_id)
+                );
                 """
             )
             await self._ensure_column(db, "jobs", "library_id", "TEXT")
+            await self._ensure_column(db, "migration_runs", "library_id", "TEXT")
+            await self._ensure_column(
+                db,
+                "index_generations",
+                "library_id",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            for table in (
+                "library_generation_bindings",
+                "jobs",
+                "migration_runs",
+                "index_generations",
+                "adapter_connections",
+            ):
+                await self._ensure_column(
+                    db,
+                    table,
+                    "database_type",
+                    "TEXT NOT NULL DEFAULT 'livingmemory_v8'",
+                )
+                await self._ensure_column(db, table, "database_id", "TEXT")
+                await db.execute(
+                    f"UPDATE {table} SET database_id=library_id "
+                    "WHERE database_id IS NULL OR database_id=''"
+                )
             await self._ensure_column(db, "jobs", "operation", "TEXT")
             await self._ensure_column(db, "jobs", "checkpoint", "TEXT")
             await self._ensure_column(
@@ -265,7 +354,23 @@ class ControlStore:
             await self._ensure_column(
                 db, "jobs", "resumable", "INTEGER NOT NULL DEFAULT 0"
             )
-            await self._ensure_column(db, "migration_runs", "library_id", "TEXT")
+            await self._ensure_column(db, "jobs", "started_at", "REAL")
+            await self._ensure_column(db, "jobs", "finished_at", "REAL")
+            await self._ensure_column(
+                db, "jobs", "attempt_count", "INTEGER NOT NULL DEFAULT 0"
+            )
+            await self._ensure_column(
+                db, "jobs", "status_history", "TEXT NOT NULL DEFAULT '[]'"
+            )
+            await self._ensure_column(
+                db, "jobs", "database_state_before", "TEXT"
+            )
+            await self._ensure_column(
+                db, "jobs", "database_state_after", "TEXT"
+            )
+            await self._ensure_column(
+                db, "jobs", "database_state_capture_error", "TEXT"
+            )
             await self._ensure_column(db, "libraries", "rerank_provider_id", "TEXT")
             await self._ensure_column(
                 db, "libraries", "conversation_config_json", "TEXT NOT NULL DEFAULT '{}'"
@@ -295,6 +400,22 @@ class ControlStore:
                 "TEXT",
             )
             await db.execute(
+                """INSERT INTO database_adapter_connections
+                (database_type,database_id,adapter_id,instance_id,adapter_type,
+                 connected_at,last_seen,state,disconnected_at,disconnect_reason)
+                SELECT database_type,database_id,adapter_id,instance_id,adapter_type,
+                       connected_at,last_seen,state,disconnected_at,disconnect_reason
+                FROM adapter_connections WHERE true
+                ON CONFLICT(database_type,database_id,adapter_id) DO UPDATE SET
+                  instance_id=excluded.instance_id,
+                  adapter_type=excluded.adapter_type,
+                  connected_at=excluded.connected_at,
+                  last_seen=excluded.last_seen,
+                  state=excluded.state,
+                  disconnected_at=excluded.disconnected_at,
+                  disconnect_reason=excluded.disconnect_reason"""
+            )
+            await db.execute(
                 "INSERT OR REPLACE INTO schema_info(key,value) VALUES('service_version',?)",
                 (VERSION,),
             )
@@ -320,7 +441,13 @@ class ControlStore:
                 await db.execute(
                     "ALTER TABLE libraries ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'"
                 )
-            await self._backfill_library_metadata(db)
+            if "database_type" not in columns:
+                await db.execute(
+                    "ALTER TABLE libraries ADD COLUMN database_type "
+                    "TEXT NOT NULL DEFAULT 'livingmemory_v8'"
+                )
+            await self._install_database_catalog(db)
+            await self._remove_obsolete_library_metadata(db)
             await db.commit()
         finally:
             await db.close()
@@ -370,30 +497,273 @@ class ControlStore:
         if name not in {row["name"] for row in rows}:
             await db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
 
-    async def _backfill_library_metadata(self, db: aiosqlite.Connection) -> None:
+    async def _remove_obsolete_library_metadata(
+        self, db: aiosqlite.Connection
+    ) -> None:
         rows = await (
             await db.execute("SELECT id,metadata_json FROM libraries")
         ).fetchall()
         for row in rows:
-            metadata = self._decode_library_metadata(row["metadata_json"])
-            if metadata.get("livingmemory_database_version") is None:
-                metadata["livingmemory_database_version"] = (
-                    LIVINGMEMORY_DATABASE_VERSION
-                )
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(metadata, dict):
+                continue
+            if OBSOLETE_MEMORY_STORE_METADATA_KEYS.intersection(metadata):
+                for key in OBSOLETE_MEMORY_STORE_METADATA_KEYS:
+                    metadata.pop(key, None)
                 await db.execute(
                     "UPDATE libraries SET metadata_json=? WHERE id=?",
                     (json.dumps(metadata, ensure_ascii=False), row["id"]),
                 )
 
+    async def _install_database_catalog(self, db: aiosqlite.Connection) -> None:
+        await db.execute(
+            """INSERT INTO database_catalog
+            (database_type,id,database_category,deleted_at,created_at,updated_at)
+            SELECT database_type,id,?,deleted_at,created_at,updated_at FROM libraries
+            WHERE true
+            ON CONFLICT(database_type,id) DO UPDATE SET
+              database_category=excluded.database_category,
+              deleted_at=excluded.deleted_at,
+              created_at=excluded.created_at,
+              updated_at=excluded.updated_at""",
+            (DATABASE_CATEGORY_MEMORY,),
+        )
+        await db.executescript(
+            f"""
+            DROP TRIGGER IF EXISTS trg_libraries_catalog_insert;
+            DROP TRIGGER IF EXISTS trg_libraries_catalog_update;
+            DROP TRIGGER IF EXISTS trg_libraries_catalog_delete;
+            CREATE TRIGGER trg_libraries_catalog_insert AFTER INSERT ON libraries
+            BEGIN
+              INSERT INTO database_catalog
+              (database_type,id,database_category,deleted_at,created_at,updated_at)
+              VALUES(NEW.database_type,NEW.id,'{DATABASE_CATEGORY_MEMORY}',
+                     NEW.deleted_at,NEW.created_at,NEW.updated_at)
+              ON CONFLICT(database_type,id) DO UPDATE SET
+                database_category=excluded.database_category,
+                deleted_at=excluded.deleted_at,
+                created_at=excluded.created_at,
+                updated_at=excluded.updated_at;
+            END;
+            CREATE TRIGGER trg_libraries_catalog_update AFTER UPDATE ON libraries
+            BEGIN
+              DELETE FROM database_catalog
+              WHERE database_type=OLD.database_type AND id=OLD.id
+                AND (OLD.database_type != NEW.database_type OR OLD.id != NEW.id);
+              INSERT INTO database_catalog
+              (database_type,id,database_category,deleted_at,created_at,updated_at)
+              VALUES(NEW.database_type,NEW.id,'{DATABASE_CATEGORY_MEMORY}',
+                     NEW.deleted_at,NEW.created_at,NEW.updated_at)
+              ON CONFLICT(database_type,id) DO UPDATE SET
+                database_category=excluded.database_category,
+                deleted_at=excluded.deleted_at,
+                created_at=excluded.created_at,
+                updated_at=excluded.updated_at;
+            END;
+            CREATE TRIGGER trg_libraries_catalog_delete AFTER DELETE ON libraries
+            BEGIN
+              DELETE FROM database_catalog
+              WHERE database_type=OLD.database_type AND id=OLD.id;
+            END;
+            """
+        )
+
+    async def register_database_identity(
+        self,
+        ref: DatabaseRef,
+        *,
+        category: str,
+        created_at: float | None = None,
+        updated_at: float | None = None,
+    ) -> dict[str, Any]:
+        if category not in DATABASE_CATEGORIES:
+            raise ValueError(f"unsupported database category: {category}")
+        created = float(created_at or time.time())
+        updated = float(updated_at or created)
+        db = await self.connect()
+        try:
+            await db.execute(
+                """INSERT INTO database_catalog
+                (database_type,id,database_category,deleted_at,created_at,updated_at)
+                VALUES(?,?,?,NULL,?,?)""",
+                (ref.database_type, ref.id, category, created, updated),
+            )
+            await db.commit()
+        except aiosqlite.IntegrityError as exc:
+            raise ValueError(f"database already exists: {ref.key}") from exc
+        finally:
+            await db.close()
+        result = await self.database_identity(ref)
+        if result is None:
+            raise RuntimeError(f"database registration was not persisted: {ref.key}")
+        return result
+
+    async def register_database_identities(
+        self,
+        refs: list[DatabaseRef],
+        *,
+        category: str,
+    ) -> list[dict[str, Any]]:
+        if category not in DATABASE_CATEGORIES:
+            raise ValueError(f"invalid database category: {category}")
+        unique = {(ref.database_type, ref.id): ref for ref in refs}
+        if len(unique) != len(refs):
+            raise ValueError("duplicate database identity in batch")
+        now = time.time()
+        db = await self.connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            for ref in refs:
+                await db.execute(
+                    """INSERT INTO database_catalog
+                    (database_type,id,database_category,deleted_at,created_at,updated_at)
+                    VALUES(?,?,?,NULL,?,?)""",
+                    (ref.database_type, ref.id, category, now, now),
+                )
+            await db.commit()
+        except aiosqlite.IntegrityError as exc:
+            await db.rollback()
+            raise ValueError("database identity conflict in batch") from exc
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+        return [item for ref in refs if (item := await self.database_identity(ref))]
+
+    async def database_identity(self, ref: DatabaseRef) -> dict[str, Any] | None:
+        db = await self.connect()
+        try:
+            row = await (
+                await db.execute(
+                    """SELECT database_type,id,database_category,deleted_at,
+                    created_at,updated_at FROM database_catalog
+                    WHERE database_type=? AND id=?""",
+                    (ref.database_type, ref.id),
+                )
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            await db.close()
+
+    async def delete_database_identity(self, ref: DatabaseRef) -> None:
+        db = await self.connect()
+        try:
+            await db.execute(
+                "DELETE FROM database_catalog WHERE database_type=? AND id=?",
+                (ref.database_type, ref.id),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    async def rename_database_identity(self, ref: DatabaseRef, next_id: str) -> DatabaseRef:
+        next_ref = DatabaseRef(ref.database_type, next_id)
+        driver = database_type_registry.require(ref.database_type)
+        current_key = driver.resource_key(ref.id)
+        next_key = driver.resource_key(next_ref.id)
+        now = time.time()
+        db = await self.connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            current = await (
+                await db.execute(
+                    "SELECT 1 FROM database_catalog WHERE database_type=? AND id=? AND deleted_at IS NULL",
+                    (ref.database_type, ref.id),
+                )
+            ).fetchone()
+            if not current:
+                raise KeyError(ref.key)
+            occupied = await (
+                await db.execute(
+                    "SELECT 1 FROM database_catalog WHERE database_type=? AND id=?",
+                    (next_ref.database_type, next_ref.id),
+                )
+            ).fetchone()
+            if occupied:
+                raise ValueError(f"database already exists: {next_ref.key}")
+            await db.execute(
+                "UPDATE database_catalog SET id=?,updated_at=? WHERE database_type=? AND id=?",
+                (next_ref.id, now, ref.database_type, ref.id),
+            )
+            await db.execute(
+                """UPDATE database_adapter_connections SET database_id=?
+                WHERE database_type=? AND database_id=?""",
+                (next_ref.id, ref.database_type, ref.id),
+            )
+            for table in ("jobs", "migration_runs", "index_generations", "library_generation_bindings"):
+                columns = {
+                    row["name"]
+                    for row in await (await db.execute(f"PRAGMA table_info({table})")).fetchall()
+                }
+                if not {"database_type", "database_id"}.issubset(columns):
+                    continue
+                assignments = "database_id=?"
+                params: list[Any] = [next_ref.id]
+                if "library_id" in columns:
+                    assignments += ",library_id=?"
+                    params.append(next_key)
+                params.extend((ref.database_type, ref.id))
+                await db.execute(
+                    f"UPDATE {table} SET {assignments} WHERE database_type=? AND database_id=?",
+                    tuple(params),
+                )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+        return next_ref
+
+    async def delete_database_identities_by_type(self, database_type: str) -> None:
+        db = await self.connect()
+        try:
+            await db.execute(
+                "DELETE FROM database_catalog WHERE database_type=?",
+                (database_type,),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    async def list_database_identities(
+        self,
+        *,
+        include_deleted: bool = False,
+    ) -> list[dict[str, Any]]:
+        db = await self.connect()
+        try:
+            where = "" if include_deleted else "WHERE deleted_at IS NULL"
+            rows = await (
+                await db.execute(
+                    f"""SELECT database_type,id,database_category,deleted_at,
+                    created_at,updated_at FROM database_catalog {where}
+                    ORDER BY database_type,id"""
+                )
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            await db.close()
     @staticmethod
-    def _decode_library_metadata(value: Any) -> dict[str, Any]:
+    def _clean_library_metadata(value: dict[str, Any]) -> dict[str, Any]:
+        data = dict(value)
+        for key in OBSOLETE_MEMORY_STORE_METADATA_KEYS:
+            data.pop(key, None)
+        return data
+
+    @classmethod
+    def _decode_library_metadata(cls, value: Any) -> dict[str, Any]:
         try:
             data = json.loads(value or "{}")
         except (TypeError, json.JSONDecodeError):
             data = {}
         if not isinstance(data, dict):
             data = {}
-        return data
+        return cls._clean_library_metadata(data)
 
     @staticmethod
     def _rewrite_manifest_provider_id(
@@ -491,7 +861,7 @@ class ControlStore:
             )
             embedding_rows = await (
                 await db.execute(
-                    """SELECT id,name,provider_revision FROM libraries
+                    """SELECT id,database_type,name,provider_revision FROM libraries
                     WHERE provider_id=? AND deleted_at IS NULL ORDER BY name""",
                     (provider_id,),
                 )
@@ -520,7 +890,18 @@ class ControlStore:
                 )
                 embedding_usage.append(
                     {
-                        "library_id": row["id"],
+                        **database_identity_fields(
+                            DatabaseRef(
+                                str(
+                                    row["database_type"]
+                                    or LIVINGMEMORY_V8_TYPE
+                                ),
+                                str(row["id"]),
+                            ),
+                            include_deprecated=True,
+                        ),
+                        "database_name": row["name"],
+                        # Deprecated compatibility alias for v0.1.1 clients.
                         "library_name": row["name"],
                         "provider_revision": provider_revision,
                         "usage_kind": "embedding",
@@ -529,14 +910,25 @@ class ControlStore:
                 )
             rerank_rows = await (
                 await db.execute(
-                    """SELECT id,name FROM libraries
+                    """SELECT id,database_type,name FROM libraries
                     WHERE rerank_provider_id=? AND deleted_at IS NULL ORDER BY name""",
                     (provider_id,),
                 )
             ).fetchall()
             return embedding_usage + [
                 {
-                    "library_id": row["id"],
+                    **database_identity_fields(
+                        DatabaseRef(
+                            str(
+                                row["database_type"]
+                                or LIVINGMEMORY_V8_TYPE
+                            ),
+                            str(row["id"]),
+                        ),
+                        include_deprecated=True,
+                    ),
+                    "database_name": row["name"],
+                    # Deprecated compatibility alias for v0.1.1 clients.
                     "library_name": row["name"],
                     "provider_revision": None,
                     "usage_kind": "rerank",
@@ -561,9 +953,22 @@ class ControlStore:
         return text
 
     @staticmethod
+    def _adapter_database_ref(database: str | DatabaseRef) -> DatabaseRef:
+        return (
+            database
+            if isinstance(database, DatabaseRef)
+            else DatabaseRef(LIVINGMEMORY_V8_TYPE, database)
+        )
+
+    @staticmethod
     def _adapter_connection_public(row: aiosqlite.Row) -> dict[str, Any]:
+        database_id = str(row["database_id"])
+        ref = DatabaseRef(
+            str(row["database_type"] or LIVINGMEMORY_V8_TYPE),
+            database_id,
+        )
         return {
-            "library_id": row["library_id"],
+            **database_identity_fields(ref, include_deprecated=True),
             "adapter_id": row["adapter_id"],
             "instance_id": row["instance_id"],
             "adapter_type": row["adapter_type"],
@@ -580,7 +985,7 @@ class ControlStore:
 
     async def register_adapter_connection(
         self,
-        library_id: str,
+        database: str | DatabaseRef,
         *,
         adapter_id: str,
         instance_id: str,
@@ -588,9 +993,11 @@ class ControlStore:
         ttl_seconds: float = ADAPTER_CONNECTION_TTL_SECONDS,
         manual_reconnect: bool = False,
     ) -> dict[str, Any]:
-        library_id = self._validate_library_id(library_id)
-        if not await self.get_library(library_id):
-            raise KeyError(library_id)
+        ref = self._adapter_database_ref(database)
+        self._validate_memory_store_id(ref.id)
+        record = await self.database_identity(ref)
+        if not record:
+            raise KeyError(ref.key)
         adapter_id = self._normalize_adapter_text(adapter_id, field="适配器标识ID")
         instance_id = self._normalize_adapter_text(instance_id, field="适配器实例ID")
         adapter_type = str(adapter_type or "unknown").strip()[:64] or "unknown"
@@ -601,9 +1008,9 @@ class ControlStore:
             await db.execute("BEGIN IMMEDIATE")
             row = await (
                 await db.execute(
-                    """SELECT * FROM adapter_connections
-                    WHERE library_id=? AND adapter_id=?""",
-                    (library_id, adapter_id),
+                    """SELECT * FROM database_adapter_connections
+                    WHERE database_type=? AND database_id=? AND adapter_id=?""",
+                    (ref.database_type, ref.id, adapter_id),
                 )
             ).fetchone()
             if (
@@ -630,11 +1037,11 @@ class ControlStore:
             )
             connected_at = float(row["connected_at"]) if same_instance else now
             await db.execute(
-                """INSERT INTO adapter_connections
-                (library_id,adapter_id,instance_id,adapter_type,connected_at,last_seen,
+                """INSERT INTO database_adapter_connections
+                (database_type,database_id,adapter_id,instance_id,adapter_type,connected_at,last_seen,
                  state,disconnected_at,disconnect_reason)
-                VALUES(?,?,?,?,?,?,'active',NULL,NULL)
-                ON CONFLICT(library_id,adapter_id) DO UPDATE SET
+                VALUES(?,?,?,?,?,?,?,'active',NULL,NULL)
+                ON CONFLICT(database_type,database_id,adapter_id) DO UPDATE SET
                     instance_id=excluded.instance_id,
                     adapter_type=excluded.adapter_type,
                     connected_at=excluded.connected_at,
@@ -643,7 +1050,8 @@ class ControlStore:
                     disconnected_at=NULL,
                     disconnect_reason=NULL""",
                 (
-                    library_id,
+                    ref.database_type,
+                    ref.id,
                     adapter_id,
                     instance_id,
                     adapter_type,
@@ -651,6 +1059,32 @@ class ControlStore:
                     now,
                 ),
             )
+            if ref.database_type == LIVINGMEMORY_V8_TYPE:
+                await db.execute(
+                    """INSERT INTO adapter_connections
+                    (library_id,database_type,database_id,adapter_id,instance_id,
+                     adapter_type,connected_at,last_seen,state,disconnected_at,
+                     disconnect_reason)
+                    VALUES(?,?,?,?,?,?,?,?,'active',NULL,NULL)
+                    ON CONFLICT(library_id,adapter_id) DO UPDATE SET
+                      database_type=excluded.database_type,
+                      database_id=excluded.database_id,
+                      instance_id=excluded.instance_id,
+                      adapter_type=excluded.adapter_type,
+                      connected_at=excluded.connected_at,
+                      last_seen=excluded.last_seen,
+                      state='active',disconnected_at=NULL,disconnect_reason=NULL""",
+                    (
+                        ref.id,
+                        ref.database_type,
+                        ref.id,
+                        adapter_id,
+                        instance_id,
+                        adapter_type,
+                        connected_at,
+                        now,
+                    ),
+                )
             await db.commit()
         except Exception:
             await db.rollback()
@@ -658,9 +1092,9 @@ class ControlStore:
         finally:
             await db.close()
         return (
-            await self.adapter_connection(library_id, adapter_id)
+            await self.adapter_connection(ref, adapter_id)
         ) or {
-            "library_id": library_id,
+            **database_identity_fields(ref, include_deprecated=True),
             "adapter_id": adapter_id,
             "instance_id": instance_id,
             "adapter_type": adapter_type,
@@ -673,13 +1107,14 @@ class ControlStore:
 
     async def force_disconnect_adapter(
         self,
-        library_id: str,
+        database: str | DatabaseRef,
         adapter_id: str,
         *,
         expected_instance_id: str,
         reason: str = "forced_by_admin",
     ) -> dict[str, Any]:
-        library_id = self._validate_library_id(library_id)
+        ref = self._adapter_database_ref(database)
+        self._validate_memory_store_id(ref.id)
         adapter_id = self._normalize_adapter_text(adapter_id, field="适配器标识ID")
         expected_instance_id = self._normalize_adapter_text(
             expected_instance_id,
@@ -690,9 +1125,9 @@ class ControlStore:
             await db.execute("BEGIN IMMEDIATE")
             row = await (
                 await db.execute(
-                    """SELECT * FROM adapter_connections
-                    WHERE library_id=? AND adapter_id=?""",
-                    (library_id, adapter_id),
+                    """SELECT * FROM database_adapter_connections
+                    WHERE database_type=? AND database_id=? AND adapter_id=?""",
+                    (ref.database_type, ref.id, adapter_id),
                 )
             ).fetchone()
             if not row:
@@ -703,32 +1138,51 @@ class ControlStore:
                 )
             disconnected_at = time.time()
             await db.execute(
-                """UPDATE adapter_connections
+                """UPDATE database_adapter_connections
                 SET state='forced_offline',disconnected_at=?,disconnect_reason=?
-                WHERE library_id=? AND adapter_id=?""",
-                (disconnected_at, str(reason or "forced_by_admin"), library_id, adapter_id),
+                WHERE database_type=? AND database_id=? AND adapter_id=?""",
+                (
+                    disconnected_at,
+                    str(reason or "forced_by_admin"),
+                    ref.database_type,
+                    ref.id,
+                    adapter_id,
+                ),
             )
+            if ref.database_type == LIVINGMEMORY_V8_TYPE:
+                await db.execute(
+                    """UPDATE adapter_connections
+                    SET state='forced_offline',disconnected_at=?,disconnect_reason=?
+                    WHERE library_id=? AND adapter_id=?""",
+                    (
+                        disconnected_at,
+                        str(reason or "forced_by_admin"),
+                        ref.id,
+                        adapter_id,
+                    ),
+                )
             await db.commit()
         except Exception:
             await db.rollback()
             raise
         finally:
             await db.close()
-        connection = await self.adapter_connection(library_id, adapter_id)
+        connection = await self.adapter_connection(ref, adapter_id)
         if not connection:
             raise KeyError(adapter_id)
         return connection
 
     async def adapter_connection(
-        self, library_id: str, adapter_id: str
+        self, database: str | DatabaseRef, adapter_id: str
     ) -> dict[str, Any] | None:
+        ref = self._adapter_database_ref(database)
         db = await self.connect()
         try:
             row = await (
                 await db.execute(
-                    """SELECT * FROM adapter_connections
-                    WHERE library_id=? AND adapter_id=?""",
-                    (library_id, adapter_id),
+                    """SELECT * FROM database_adapter_connections
+                    WHERE database_type=? AND database_id=? AND adapter_id=?""",
+                    (ref.database_type, ref.id, adapter_id),
                 )
             ).fetchone()
             return self._adapter_connection_public(row) if row else None
@@ -740,9 +1194,9 @@ class ControlStore:
         try:
             rows = await (
                 await db.execute(
-                    """SELECT * FROM adapter_connections
+                    """SELECT * FROM database_adapter_connections
                     WHERE state='forced_offline'
-                    ORDER BY library_id,adapter_id"""
+                    ORDER BY database_type,database_id,adapter_id"""
                 )
             ).fetchall()
             return [self._adapter_connection_public(row) for row in rows]
@@ -751,15 +1205,28 @@ class ControlStore:
 
     async def active_adapter_connections(
         self,
-        library_id: str,
+        database: str | DatabaseRef,
         *,
         ttl_seconds: float = ADAPTER_CONNECTION_TTL_SECONDS,
     ) -> list[dict[str, Any]]:
+        ref = self._adapter_database_ref(database)
         cutoff = time.time() - float(ttl_seconds)
-        rows = await self.adapter_repository.active_rows(
-            [library_id], cutoff=cutoff
-        )
+        rows = await self.adapter_repository.active_database_rows([ref], cutoff=cutoff)
         return [self._adapter_connection_public(row) for row in rows]
+
+    async def active_database_adapter_connections_map(
+        self,
+        databases: list[DatabaseRef],
+        *,
+        ttl_seconds: float = ADAPTER_CONNECTION_TTL_SECONDS,
+    ) -> dict[str, list[dict[str, Any]]]:
+        cutoff = time.time() - float(ttl_seconds)
+        rows = await self.adapter_repository.active_database_rows(databases, cutoff=cutoff)
+        result = {ref.key: [] for ref in databases}
+        for row in rows:
+            item = self._adapter_connection_public(row)
+            result.setdefault(f"{item['database_type']}:{item['database_id']}", []).append(item)
+        return result
 
     async def active_adapter_connections_map(
         self,
@@ -769,20 +1236,25 @@ class ControlStore:
     ) -> dict[str, list[dict[str, Any]]]:
         if not library_ids:
             return {}
-        cutoff = time.time() - float(ttl_seconds)
-        rows = await self.adapter_repository.active_rows(
-            library_ids, cutoff=cutoff
-        )
-        result: dict[str, list[dict[str, Any]]] = {library_id: [] for library_id in library_ids}
-        for row in rows:
-            result.setdefault(str(row["library_id"]), []).append(
-                self._adapter_connection_public(row)
-            )
-        return result
+        refs = [DatabaseRef(LIVINGMEMORY_V8_TYPE, library_id) for library_id in library_ids]
+        typed = await self.active_database_adapter_connections_map(refs, ttl_seconds=ttl_seconds)
+        return {library_id: typed.get(DatabaseRef(LIVINGMEMORY_V8_TYPE, library_id).key, []) for library_id in library_ids}
 
     @staticmethod
     def _job_public(row: aiosqlite.Row) -> dict[str, Any]:
         result = dict(row)
+        result["database_resource_key"] = str(result.get("library_id") or "")
+        database_id = str(result.get("database_id") or "")
+        database_type = str(
+            result.get("database_type") or LIVINGMEMORY_V8_TYPE
+        )
+        if database_id:
+            result.update(
+                database_identity_fields(
+                    DatabaseRef(database_type, database_id),
+                    include_deprecated=False,
+                )
+            )
         if result.get("result"):
             try:
                 result["result"] = json.loads(result["result"])
@@ -790,20 +1262,57 @@ class ControlStore:
                 result["result"] = None
         return result
 
-    async def active_long_job(self, library_id: str) -> dict[str, Any] | None:
-        return (await self.active_long_jobs_map([library_id])).get(library_id)
+    @staticmethod
+    def _job_resource_key(
+        database: str | DatabaseRef,
+        database_type: str | None = None,
+    ) -> str:
+        if isinstance(database, DatabaseRef):
+            return database_type_registry.require(database.database_type).resource_key(
+                database.id
+            )
+        value = str(database)
+        if database_type:
+            return database_type_registry.require(database_type).resource_key(value)
+        prefix, separator, _identifier = value.partition(":")
+        if separator:
+            try:
+                database_type_registry.require(prefix)
+            except KeyError:
+                pass
+            else:
+                return value
+        return database_type_registry.require(LIVINGMEMORY_V8_TYPE).resource_key(value)
+
+    async def active_long_job(
+        self,
+        database: str | DatabaseRef,
+        *,
+        database_type: str | None = None,
+    ) -> dict[str, Any] | None:
+        resource_key = self._job_resource_key(database, database_type)
+        return (await self.active_long_jobs_map([resource_key])).get(resource_key)
 
     async def active_long_jobs_map(
-        self, library_ids: list[str]
+        self, database_resource_keys: list[str]
     ) -> dict[str, dict[str, Any] | None]:
-        if not library_ids:
+        if not database_resource_keys:
             return {}
-        rows = await self.job_repository.active_long_rows(library_ids)
-        result: dict[str, dict[str, Any] | None] = {library_id: None for library_id in library_ids}
+        rows = await self.job_repository.active_long_rows(database_resource_keys)
+        result: dict[str, dict[str, Any] | None] = {
+            resource_key: None for resource_key in database_resource_keys
+        }
         for row in rows:
-            library_id = str(row["library_id"] or "")
-            if library_id and result.get(library_id) is None:
-                result[library_id] = self._job_public(row)
+            resource_key = str(row["library_id"] or "")
+            if (
+                resource_key
+                and result.get(resource_key) is None
+                and task_type_registry.get(
+                    str(row["database_type"] or LIVINGMEMORY_V8_TYPE),
+                    str(row["kind"] or ""),
+                ).adapter_blocking
+            ):
+                result[resource_key] = self._job_public(row)
         return result
 
     async def debug_provider_revisions(self, provider_id: str) -> dict[str, Any]:
@@ -881,6 +1390,178 @@ class ControlStore:
                 for row in binding_rows
             ],
         }
+
+    async def debug_revision_inventory(self) -> dict[str, list[dict[str, Any]]]:
+        """Capture revision references from the process-global control DB.
+
+        This is intentionally one connection-wide scan so the Debug overview
+        can combine it with one scan from each typed database manager without
+        repeatedly walking providers or databases.
+        """
+
+        cutoff = time.time() - ADAPTER_CONNECTION_TTL_SECONDS
+        queries = {
+            "providers": """SELECT id,latest_revision,deleted_at,created_at,updated_at
+                FROM providers WHERE deleted_at IS NULL ORDER BY created_at,id""",
+            "provider_revisions": """SELECT provider_id,revision,config_json,
+                config_sha256,created_at FROM provider_revisions
+                ORDER BY provider_id,revision""",
+            "memory_databases": """SELECT id,database_type,name,provider_id,
+                provider_revision,rerank_provider_id,created_at,updated_at
+                FROM libraries WHERE deleted_at IS NULL ORDER BY created_at,id""",
+            "livingmemory_generations": """SELECT library_id,database_type,
+                database_id,generation,provider_id,provider_revision,
+                manifest_json,activated_at FROM library_generation_bindings
+                ORDER BY activated_at DESC""",
+            "index_generations": """SELECT library_id,database_type,database_id,
+                generation,status,manifest,created_at,activated_at
+                FROM index_generations ORDER BY created_at DESC""",
+            "revision_jobs": """SELECT id,library_id,database_type,database_id,
+                kind,status,operation,checkpoint,created_at,updated_at FROM jobs
+                WHERE checkpoint IS NOT NULL OR operation IS NOT NULL OR
+                status IN ('queued','running','pausing','paused','interrupted','stopping')
+                ORDER BY created_at DESC""",
+            "active_adapters": """SELECT database_type,database_id,adapter_id,
+                instance_id,connected_at,last_seen,state
+                FROM database_adapter_connections
+                WHERE state='active' AND last_seen>=?
+                ORDER BY database_type,database_id,adapter_id""",
+        }
+        db = await self.connect()
+        try:
+            result: dict[str, list[dict[str, Any]]] = {}
+            for name, query in queries.items():
+                parameters = (cutoff,) if name == "active_adapters" else ()
+                rows = await (await db.execute(query, parameters)).fetchall()
+                result[name] = [dict(row) for row in rows]
+            return result
+        finally:
+            await db.close()
+
+    @staticmethod
+    def _rewrite_revision_manifest(
+        raw: str | dict[str, Any] | None,
+        *,
+        provider_id: str,
+        revision: int,
+        fingerprint: str,
+    ) -> dict[str, Any]:
+        if isinstance(raw, dict):
+            manifest = dict(raw)
+        else:
+            try:
+                parsed = json.loads(str(raw or "{}"))
+            except json.JSONDecodeError:
+                parsed = {}
+            manifest = dict(parsed) if isinstance(parsed, dict) else {}
+        manifest["provider_id"] = provider_id
+        manifest["provider_revision"] = int(revision)
+        if "provider_config_sha256" in manifest or fingerprint:
+            manifest["provider_config_sha256"] = fingerprint
+        if "provider_fingerprint" in manifest:
+            manifest["provider_fingerprint"] = fingerprint
+        capability = manifest.get("embedding_capability")
+        if isinstance(capability, dict):
+            capability = dict(capability)
+            capability["provider_id"] = provider_id
+            capability["provider_revision"] = int(revision)
+            capability["provider_config_sha256"] = fingerprint
+            manifest["embedding_capability"] = capability
+        return manifest
+
+    async def debug_bind_livingmemory_revision(
+        self,
+        database_id: str,
+        *,
+        provider_id: str,
+        revision: int,
+        fingerprint: str,
+    ) -> None:
+        now = time.time()
+        db = await self.connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            row = await (
+                await db.execute(
+                    """SELECT provider_id FROM libraries WHERE id=? AND
+                    database_type=? AND deleted_at IS NULL LIMIT 1""",
+                    (database_id, LIVINGMEMORY_V8_TYPE),
+                )
+            ).fetchone()
+            if row is None:
+                raise KeyError(database_id)
+            if str(row["provider_id"]) != provider_id:
+                raise ValueError("revision repair cannot change the bound Provider ID")
+            await db.execute(
+                """UPDATE libraries SET provider_revision=?,updated_at=?
+                WHERE id=? AND database_type=?""",
+                (int(revision), now, database_id, LIVINGMEMORY_V8_TYPE),
+            )
+            generation_rows = await (
+                await db.execute(
+                    """SELECT library_id,generation,manifest_json
+                    FROM library_generation_bindings WHERE database_type=?
+                    AND database_id=? AND provider_id=?""",
+                    (LIVINGMEMORY_V8_TYPE, database_id, provider_id),
+                )
+            ).fetchall()
+            for generation in generation_rows:
+                manifest = self._rewrite_revision_manifest(
+                    generation["manifest_json"],
+                    provider_id=provider_id,
+                    revision=revision,
+                    fingerprint=fingerprint,
+                )
+                await db.execute(
+                    """UPDATE library_generation_bindings SET
+                    provider_revision=?,manifest_json=?
+                    WHERE library_id=? AND generation=?""",
+                    (
+                        int(revision),
+                        json.dumps(manifest, ensure_ascii=False),
+                        generation["library_id"],
+                        generation["generation"],
+                    ),
+                )
+            index_rows = await (
+                await db.execute(
+                    """SELECT library_id,generation,manifest FROM index_generations
+                    WHERE database_type=? AND database_id=?""",
+                    (LIVINGMEMORY_V8_TYPE, database_id),
+                )
+            ).fetchall()
+            for generation in index_rows:
+                raw_manifest = generation["manifest"]
+                try:
+                    parsed_manifest = json.loads(str(raw_manifest or "{}"))
+                except json.JSONDecodeError:
+                    parsed_manifest = {}
+                manifest_provider_id = str(
+                    (parsed_manifest or {}).get("provider_id") or ""
+                )
+                if manifest_provider_id and manifest_provider_id != provider_id:
+                    continue
+                manifest = self._rewrite_revision_manifest(
+                    parsed_manifest,
+                    provider_id=provider_id,
+                    revision=revision,
+                    fingerprint=fingerprint,
+                )
+                await db.execute(
+                    """UPDATE index_generations SET manifest=?
+                    WHERE library_id=? AND generation=?""",
+                    (
+                        json.dumps(manifest, ensure_ascii=False),
+                        generation["library_id"],
+                        generation["generation"],
+                    ),
+                )
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
 
     async def debug_patch_provider_revision(
         self,
@@ -1160,7 +1841,10 @@ class ControlStore:
         libraries = list(snapshot.get("libraries") or [])
         if not libraries:
             raise ValueError("library snapshot is empty")
-        ids = [self._validate_library_id(str(item.get("id") or "")) for item in libraries]
+        ids = [
+            self._validate_memory_store_id(str(item.get("id") or ""))
+            for item in libraries
+        ]
         if len(set(ids)) != len(ids):
             raise ValueError("library snapshot contains duplicate IDs")
         default_ids = [str(item.get("id")) for item in libraries if bool(item.get("is_default"))]
@@ -1174,13 +1858,16 @@ class ControlStore:
                 "library_generation_bindings",
                 "index_generations",
                 "adapter_connections",
+                "database_adapter_connections",
                 "migration_runs",
                 "jobs",
                 "libraries",
             ):
                 await db.execute(f"DELETE FROM {table}")
             for item in libraries:
-                library_id = self._validate_library_id(str(item.get("id") or ""))
+                library_id = self._validate_memory_store_id(
+                    str(item.get("id") or "")
+                )
                 provider_id = validate_identifier(
                     item.get("provider_id"), field="Provider ID"
                 )
@@ -1191,13 +1878,14 @@ class ControlStore:
                     )
                 await db.execute(
                     """INSERT INTO libraries
-                    (id,name,description,default_persona_id,is_default,provider_id,
+                    (id,database_type,name,description,default_persona_id,is_default,provider_id,
                      provider_revision,rerank_provider_id,conversation_config_json,
                      recall_config_json,maintenance_config_json,metadata_json,
                      deleted_at,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,?)""",
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,?)""",
                     (
                         library_id,
+                        str(item.get("database_type") or LIVINGMEMORY_V8_TYPE),
                         str(item.get("name") or library_id),
                         str(item.get("description") or ""),
                         str(item.get("default_persona_id") or ""),
@@ -1222,10 +1910,9 @@ class ControlStore:
                             ensure_ascii=False,
                         ),
                         json.dumps(
-                            {
-                                **default_library_metadata(),
-                                **dict(item.get("metadata") or {}),
-                            },
+                            ControlStore._clean_library_metadata(
+                                dict(item.get("metadata") or {})
+                            ),
                             ensure_ascii=False,
                         ),
                         float(item.get("created_at") or now),
@@ -1529,8 +2216,8 @@ class ControlStore:
         conversation_settings: dict[str, Any] | None = None,
         recall_settings: dict[str, Any] | None = None,
         maintenance_settings: dict[str, Any] | None = None,
-    ) -> LibraryRecord:
-        library_id = self._validate_library_id(library_id)
+    ) -> MemoryStoreRecord:
+        library_id = self._validate_memory_store_id(library_id)
         provider_id = validate_identifier(provider_id, field="Provider ID")
         existing = await self.get_library(library_id)
         if existing:
@@ -1572,14 +2259,15 @@ class ControlStore:
             )
             await db.execute(
                 """INSERT INTO libraries
-                (id,name,description,default_persona_id,is_default,provider_id,
+                (id,database_type,name,description,default_persona_id,is_default,provider_id,
                  provider_revision,rerank_provider_id,conversation_config_json,
                  recall_config_json,maintenance_config_json,metadata_json,created_at,updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     library_id,
+                    LIVINGMEMORY_V8_TYPE,
                     name,
-                    f"由 {LIVINGMEMORY_DATABASE_VERSION_LABEL} 正式数据迁移",
+                    "由 LivingMemory v8 正式数据迁移",
                     "",
                     1 if count == 0 else 0,
                     provider_id,
@@ -1594,7 +2282,7 @@ class ControlStore:
                         self._maintenance_settings(maintenance_settings),
                         ensure_ascii=False,
                     ),
-                    json.dumps(default_library_metadata(), ensure_ascii=False),
+                    "{}",
                     now,
                     now,
                 ),
@@ -1606,8 +2294,10 @@ class ControlStore:
 
     async def create_library(
         self, payload: dict[str, Any], provider: ProviderRevision
-    ) -> LibraryRecord:
-        library_id = self._validate_library_id(str(payload.get("id") or ""))
+    ) -> MemoryStoreRecord:
+        library_id = self._validate_memory_store_id(
+            str(payload.get("id") or "")
+        )
         name = str(payload.get("name") or "").strip()
         if not name:
             raise ValueError("记忆库名称不能为空")
@@ -1624,12 +2314,13 @@ class ControlStore:
                 await self._delete_soft_deleted_library_row(db, library_id)
             await db.execute(
                 """INSERT INTO libraries
-                (id,name,description,default_persona_id,is_default,provider_id,
+                (id,database_type,name,description,default_persona_id,is_default,provider_id,
                  provider_revision,rerank_provider_id,conversation_config_json,
                  recall_config_json,maintenance_config_json,metadata_json,created_at,updated_at)
-                VALUES(?,?,?,?,0,?,?,?,?,?,?,?,?,?)""",
+                VALUES(?,?,?,?,?,0,?,?,?,?,?,?,?,?,?)""",
                 (
                     library_id,
+                    str(payload.get("database_type") or LIVINGMEMORY_V8_TYPE),
                     name,
                     str(payload.get("description") or ""),
                     str(payload.get("default_persona_id") or ""),
@@ -1653,10 +2344,9 @@ class ControlStore:
                         ensure_ascii=False,
                     ),
                     json.dumps(
-                        {
-                            **default_library_metadata(),
-                            **dict(payload.get("metadata") or {}),
-                        },
+                        self._clean_library_metadata(
+                            dict(payload.get("metadata") or {})
+                        ),
                         ensure_ascii=False,
                     ),
                     now,
@@ -1670,15 +2360,16 @@ class ControlStore:
             await db.close()
         return (await self.get_library(library_id))  # type: ignore[return-value]
 
-    async def get_library(self, library_id: str) -> LibraryRecord | None:
-        row = await self.library_repository.get_row(library_id)
+    async def get_library(self, library_id: str) -> MemoryStoreRecord | None:
+        row = await self.memory_store_repository.get_row(library_id)
         if not row:
             return None
         return self._library_row(row)
 
-    def _library_row(self, row: aiosqlite.Row) -> LibraryRecord:
-        return LibraryRecord(
+    def _library_row(self, row: aiosqlite.Row) -> MemoryStoreRecord:
+        return MemoryStoreRecord(
             id=row["id"],
+            database_type=str(row["database_type"] or LIVINGMEMORY_V8_TYPE),
             name=row["name"],
             description=row["description"],
             default_persona_id=row["default_persona_id"],
@@ -1734,20 +2425,25 @@ class ControlStore:
             (library_id,),
         )
         await db.execute(
+            """DELETE FROM database_adapter_connections
+            WHERE database_type=? AND database_id=?""",
+            (LIVINGMEMORY_V8_TYPE, library_id),
+        )
+        await db.execute(
             "DELETE FROM libraries WHERE id=? AND deleted_at IS NOT NULL",
             (library_id,),
         )
 
-    async def list_libraries(self) -> list[LibraryRecord]:
-        rows = await self.library_repository.list_rows()
+    async def list_libraries(self) -> list[MemoryStoreRecord]:
+        rows = await self.memory_store_repository.list_rows()
         return [self._library_row(row) for row in rows]
 
-    async def default_library(self) -> LibraryRecord:
+    async def default_library(self) -> MemoryStoreRecord:
         db = await self.connect()
         try:
             row = await (
                 await db.execute(
-                    """SELECT id FROM libraries WHERE is_default=1
+                    """SELECT * FROM libraries WHERE is_default=1
                     AND deleted_at IS NULL LIMIT 1"""
                 )
             ).fetchone()
@@ -1755,19 +2451,19 @@ class ControlStore:
             await db.close()
         if not row:
             raise RuntimeError("尚未配置默认记忆库")
-        record = await self.get_library(row["id"])
+        record = self._library_row(row)
         if not record:
             raise RuntimeError("默认记忆库不存在")
         return record
 
     async def update_library(
         self, library_id: str, payload: dict[str, Any]
-    ) -> LibraryRecord:
+    ) -> MemoryStoreRecord:
         current = await self.get_library(library_id)
         if not current:
             raise KeyError(library_id)
         next_library_id = (
-            self._validate_library_id(payload["id"])
+            self._validate_memory_store_id(payload["id"])
             if "id" in payload
             else current.id
         )
@@ -1834,6 +2530,11 @@ class ControlStore:
                     "UPDATE adapter_connections SET library_id=? WHERE library_id=?",
                     (next_library_id, current.id),
                 )
+                await db.execute(
+                    """UPDATE database_adapter_connections SET database_id=?
+                    WHERE database_type=? AND database_id=?""",
+                    (next_library_id, LIVINGMEMORY_V8_TYPE, current.id),
+                )
             await db.execute(
                 """UPDATE libraries SET id=?,name=?,description=?,default_persona_id=?,
                 rerank_provider_id=?,conversation_config_json=?,recall_config_json=?,
@@ -1883,10 +2584,12 @@ class ControlStore:
                         ensure_ascii=False,
                     ),
                     json.dumps(
-                        {
-                            **current.metadata,
-                            **dict(payload.get("metadata") or {}),
-                        },
+                        self._clean_library_metadata(
+                            {
+                                **current.metadata,
+                                **dict(payload.get("metadata") or {}),
+                            }
+                        ),
                         ensure_ascii=False,
                     ),
                     time.time(),
@@ -1900,11 +2603,13 @@ class ControlStore:
 
     async def update_library_metadata(
         self, library_id: str, updates: dict[str, Any]
-    ) -> LibraryRecord:
+    ) -> MemoryStoreRecord:
         current = await self.get_library(library_id)
         if not current:
             raise KeyError(library_id)
-        metadata = {**current.metadata, **updates}
+        metadata = self._clean_library_metadata(
+            {**current.metadata, **updates}
+        )
         db = await self.connect()
         try:
             await db.execute(
@@ -1920,7 +2625,7 @@ class ControlStore:
             await db.close()
         return (await self.get_library(library_id))  # type: ignore[return-value]
 
-    async def set_default_library(self, library_id: str) -> LibraryRecord:
+    async def set_default_library(self, library_id: str) -> MemoryStoreRecord:
         if not await self.get_library(library_id):
             raise KeyError(library_id)
         db = await self.connect()
@@ -1953,9 +2658,11 @@ class ControlStore:
             )
             await db.execute(
                 """INSERT OR REPLACE INTO library_generation_bindings
-                (library_id,generation,provider_id,provider_revision,
-                 manifest_json,activated_at) VALUES(?,?,?,?,?,?)""",
+                (library_id,database_type,database_id,generation,provider_id,provider_revision,
+                 manifest_json,activated_at) VALUES(?,?,?,?,?,?,?,?)""",
                 (
+                    library_id,
+                    LIVINGMEMORY_V8_TYPE,
                     library_id,
                     manifest["generation"],
                     provider.provider_id,

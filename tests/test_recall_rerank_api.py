@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 
 from personalityrag import app as app_module
 from personalityrag.config import RecallConfig
@@ -15,6 +15,18 @@ from personalityrag.schemas import RecallRequest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _request() -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/v1/memory-libraries/livingmemory_v8/fixture/recall",
+            "headers": [],
+            "state": {"request_id": "fixture-request-id"},
+        }
+    )
 
 
 def _result(memory_id: int) -> SearchResult:
@@ -100,7 +112,9 @@ async def test_recall_uses_embedding_k_as_candidate_pool_and_rerank_k_output(
             rerank=True,
             include_baseline=True,
         ),
+        _request(),
         "fixture",
+        database_type="livingmemory_v8",
     )
 
     assert target.retrieval.calls == [75]
@@ -134,7 +148,9 @@ async def test_recall_rerank_failure_falls_back_to_full_embedding_baseline(
             rerank=True,
             include_baseline=True,
         ),
+        _request(),
         "fixture",
+        database_type="livingmemory_v8",
     )
 
     assert target.retrieval.calls == [20]
@@ -157,7 +173,9 @@ async def test_recall_rejects_rerank_k_larger_than_embedding_k(
     with pytest.raises(HTTPException) as exc:
         await app_module.recall(
             RecallRequest(query="fixture", k=5, rerank_k=6, rerank=True),
+            _request(),
             "fixture",
+            database_type="livingmemory_v8",
         )
     assert exc.value.status_code == 400
 
@@ -185,7 +203,9 @@ async def test_recall_uses_target_library_persona_and_session_filter_settings(
             persona_id="astrbot-persona",
             rerank=False,
         ),
+        _request(),
         "fixture",
+        database_type="livingmemory_v8",
     )
 
     assert target.retrieval.filter_calls == [
@@ -199,7 +219,9 @@ async def test_recall_uses_target_library_persona_and_session_filter_settings(
             session_id="astrbot-session",
             rerank=False,
         ),
+        _request(),
         "fixture",
+        database_type="livingmemory_v8",
     )
 
     assert target.retrieval.filter_calls[-1] == (
@@ -223,7 +245,9 @@ async def test_recall_disables_rerank_chain_without_bound_provider(
 
     response = await app_module.recall(
         RecallRequest(query="fixture", k=5, rerank_k=10, rerank=True),
+        _request(),
         "fixture",
+        database_type="livingmemory_v8",
     )
 
     assert target.retrieval.calls == [5]
@@ -246,7 +270,7 @@ async def test_retrieval_search_does_not_cap_runtime_k_at_fifty():
         DummyStorage(),
         SimpleNamespace(),
         SimpleNamespace(),
-        RecallConfig(search_cache_enabled=False),
+        RecallConfig(search_cache_enabled=False, recent_memory_count=0),
     )
 
     async def fake_document_route(query, k, session_id, persona_id):

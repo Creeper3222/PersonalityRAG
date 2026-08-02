@@ -1,5 +1,9 @@
-export function createMemoriesController({ $, state, t, toast, api, libraryApi, escapeHtml, formatMemoryTime, displayMemoryType, displayStatus, memoryStatusPill, memoryTypeTag, memoryImportanceBar, normalizeMemoryDetail, memoryMetaItem, memoryListSection, memoryTagsSection, renderMemoryMiniGraph, loadLibraries, debounce, confirmDialog }) {
+export function createMemoriesController({ $, state, t, toast, api, selectedDatabaseApi, escapeHtml, formatMemoryTime, displayStatus, memoryStatusPill, memoryImportanceBar, normalizeMemoryDetail, memoryMetaItem, memoryListSection, memoryTagsSection, renderMemoryMiniGraph, loadDatabases, debounce, confirmDialog, asyncGuard }) {
 async function loadMemories() {
+  if (state.memoryTransferDatabaseId && state.memoryTransferDatabaseId !== state.selectedDatabaseId) {
+    resetTransferPreview();
+  }
+  state.memoryTransferDatabaseId = state.selectedDatabaseId;
   const params = new URLSearchParams({
     page: state.memoryPage,
     page_size: state.memoryPageSize,
@@ -7,11 +11,10 @@ async function loadMemories() {
     session_id: $("memory-session")?.value || "",
     persona_id: $("memory-persona").value,
     status: $("memory-status")?.value || "",
-    memory_type: $("memory-type")?.value || "",
     sort: $("memory-sort").value,
   });
   try {
-    const data = await libraryApi("/memories?" + params);
+    const data = await selectedDatabaseApi("/memories?" + params);
     state.memoryHasMore = data.has_more;
     state.memoryItems = Array.isArray(data.items) ? data.items : [];
     $("memory-rows").innerHTML =
@@ -19,19 +22,19 @@ async function loadMemories() {
         .map(
           (item) => {
             const metadata = item.metadata || {};
+            const personaSummary = String(metadata.persona_summary || item.text || "");
             const updated = formatMemoryTime(metadata.updated_at ?? item.updated_at ?? metadata.create_time);
             const created = formatMemoryTime(metadata.create_time ?? item.created_at);
             return `<tr class="memory-row" data-id="${escapeHtml(item.id)}" tabindex="0">
             <td class="memory-id">${escapeHtml(item.id)}</td>
-            <td class="memory-summary-cell" title="${escapeHtml(item.text)}"><div class="memory-summary-text">${escapeHtml(item.text)}</div><div class="memory-summary-meta">${escapeHtml(t("updatedAt"))} ${escapeHtml(updated)}</div></td>
-            <td>${memoryTypeTag(metadata.memory_type || "GENERAL")}</td>
+            <td class="memory-summary-cell" title="${escapeHtml(personaSummary)}"><div class="memory-summary-text">${escapeHtml(personaSummary)}</div><div class="memory-summary-meta">${escapeHtml(t("updatedAt"))} ${escapeHtml(updated)}</div></td>
             <td>${memoryImportanceBar(metadata.importance ?? 0.5)}</td>
             <td>${memoryStatusPill(metadata.status || "active")}</td>
             <td>${escapeHtml(created)}</td>
           </tr>`;
           },
         )
-        .join("") || `<tr><td colspan="6">${escapeHtml(t("tableEmpty"))}</td></tr>`;
+        .join("") || `<tr><td colspan="5">${escapeHtml(t("tableEmpty"))}</td></tr>`;
     $("memory-page-info").textContent = t("pageOfTotal", { page: state.memoryPage, total: data.total });
     $("memory-prev").disabled = state.memoryPage <= 1;
     $("memory-next").disabled = !data.has_more;
@@ -46,6 +49,7 @@ async function loadMemories() {
       };
     });
   } catch (error) {
+    if (error?.name === "AbortError") return;
     toast(error.message, true);
   }
 }
@@ -71,10 +75,6 @@ $("memory-status").onchange = () => {
   state.memoryPage = 1;
   loadMemories();
 };
-$("memory-type").onchange = () => {
-  state.memoryPage = 1;
-  loadMemories();
-};
 $("memory-sort").onchange = () => loadMemories();
 $("memory-page-size").onchange = () => {
   state.memoryPageSize = Number($("memory-page-size").value) || 20;
@@ -94,15 +94,132 @@ $("memory-next").onclick = () => {
   }
 };
 
+function transferApiPath(suffix = "") {
+  if (!state.selectedDatabaseId) throw new Error(t("selectLibraryFirst"));
+  return `/api/v1/memory-libraries/livingmemory_v8/${encodeURIComponent(state.selectedDatabaseId)}/transfers${suffix}`;
+}
+
+function transferPreviewCard(item) {
+  const summary = String(item?.canonical_summary || item?.content || "");
+  const flags = [
+    item?.duplicate ? t("transferDuplicate") : "",
+    item?.needs_summary ? t("transferNeedsSummary") : "",
+  ].filter(Boolean);
+  return `<article class="memory-transfer-item ${item?.duplicate ? "is-duplicate" : ""} ${item?.needs_summary ? "needs-summary" : ""}">
+    <header><strong>${escapeHtml(t("transferRow", { row: item?.row_number ?? "—" }))}</strong><span>${escapeHtml(flags.join(" · ") || t("transferReady"))}</span></header>
+    <p>${escapeHtml(summary || t("transferSourceOnly"))}</p>
+    <footer><code>${escapeHtml(item?.session_id || "—")}</code><code>${escapeHtml(item?.persona_id || "—")}</code></footer>
+  </article>`;
+}
+
+function renderTransferPreview(data) {
+  const counts = data?.counts || {};
+  const items = Array.isArray(data?.items) ? data.items : [];
+  const invalid = Array.isArray(data?.invalid_items) ? data.invalid_items : [];
+  const needsSummary = Number(counts.needs_summary || 0);
+  state.memoryTransferPreview = data;
+  $("memory-transfer-preview-result").classList.remove("hidden");
+  $("memory-transfer-preview-result").innerHTML = `
+    <div class="memory-transfer-stat-grid">
+      ${memoryMetaItem(t("transferInput"), escapeHtml(String(counts.input || 0)))}
+      ${memoryMetaItem(t("transferPlannedImport"), escapeHtml(String(counts.planned_import || 0)))}
+      ${memoryMetaItem(t("transferDuplicates"), escapeHtml(String(counts.duplicates || 0)))}
+      ${memoryMetaItem(t("transferInvalid"), escapeHtml(String(counts.invalid || 0)))}
+      ${memoryMetaItem(t("transferNeedsSummary"), escapeHtml(String(needsSummary)))}
+    </div>
+    ${needsSummary ? `<div class="info-banner warning">${escapeHtml(t("transferNeedsAdapterSummary"))}</div>` : ""}
+    ${invalid.length ? `<details><summary>${escapeHtml(t("transferInvalidDetails", { count: invalid.length }))}</summary><div class="memory-transfer-errors">${invalid.slice(0, 50).map((entry) => `<div><strong>${escapeHtml(t("transferRow", { row: entry.row_number }))}</strong><span>${escapeHtml(entry.error || t("unknownError"))}</span></div>`).join("")}</div></details>` : ""}
+    <div class="memory-transfer-list">${items.slice(0, 50).map(transferPreviewCard).join("")}</div>
+    ${items.length > 50 ? `<p class="panel-hint">${escapeHtml(t("transferPreviewLimited", { count: items.length }))}</p>` : ""}
+    <div class="memory-detail-actions">
+      <button id="memory-transfer-reset" type="button" class="ghost">${escapeHtml(t("clearPreview"))}</button>
+      <button id="memory-transfer-commit" type="button" class="primary" ${needsSummary || !Number(counts.planned_import || 0) ? "disabled" : ""}>${escapeHtml(t("commitImport"))}</button>
+    </div>`;
+  $("memory-transfer-reset").onclick = resetTransferPreview;
+  $("memory-transfer-commit").onclick = commitTransferImport;
+}
+
+function resetTransferPreview() {
+  state.memoryTransferPreview = null;
+  const result = $("memory-transfer-preview-result");
+  result?.classList.add("hidden");
+  if (result) result.innerHTML = "";
+}
+
+$("memory-transfer-file")?.addEventListener("change", resetTransferPreview);
+$("memory-transfer-preview")?.addEventListener("click", async (event) => {
+  const file = $("memory-transfer-file")?.files?.[0];
+  if (!file) {
+    toast(t("chooseTransferFile"), true);
+    return;
+  }
+  await asyncGuard.run("memory-transfer:preview", async () => {
+    try {
+      const form = new FormData();
+      form.append("file", file, file.name);
+      const data = await selectedDatabaseApi("/transfers/imports/preview", { method: "POST", body: form });
+      renderTransferPreview(data);
+    } catch (error) {
+      toast(error.message, true);
+    }
+  }, { button: event.currentTarget, busyText: t("loading") });
+});
+
+async function commitTransferImport() {
+  const preview = state.memoryTransferPreview;
+  if (!preview?.preview_id) return;
+  await asyncGuard.run("memory-transfer:commit", async () => {
+    try {
+      const result = await selectedDatabaseApi(`/transfers/imports/${encodeURIComponent(preview.preview_id)}/commit`, {
+        method: "POST",
+        body: JSON.stringify({
+          duplicate_mode: $("memory-transfer-duplicate-mode")?.value || "skip",
+          summaries: [],
+        }),
+      });
+      resetTransferPreview();
+      toast(t("transferTaskQueued"));
+      if (result?.job_id) toast(`${t("taskId")}: ${result.job_id}`);
+    } catch (error) {
+      toast(error.message, true);
+    }
+  }, { button: $("memory-transfer-commit"), busyText: t("loading") });
+}
+
+$("memory-transfer-export")?.addEventListener("click", async (event) => {
+  await asyncGuard.run("memory-transfer:export", async () => {
+    try {
+      const format = $("memory-transfer-export-format")?.value || "json";
+      const response = await fetch(transferApiPath(`/export?format=${encodeURIComponent(format)}`), {
+        credentials: "same-origin",
+        redirect: "error",
+      });
+      if (!response.ok) throw new Error((await response.text()) || response.statusText);
+      const blob = await response.blob();
+      const disposition = response.headers.get("Content-Disposition") || "";
+      const match = disposition.match(/filename="?([^";]+)"?/i);
+      const filename = match?.[1] || `${state.selectedDatabaseId}-memories.${format}`;
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      anchor.click();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+      toast(t("transferExported"));
+    } catch (error) {
+      toast(error.message, true);
+    }
+  }, { button: event.currentTarget, busyText: t("loading") });
+});
+
 async function openMemoryDetail(id, fallback = null) {
   state.selectedMemoryId = id;
   $("memory-detail-title").textContent = t("memoryDetails", { id });
-  $("memory-detail-badge").textContent = "memory";
   $("memory-detail-body").innerHTML = `<div class="memory-detail-empty">${escapeHtml(t("loading"))}</div>`;
   $("memory-detail-overlay").classList.remove("hidden");
   $("memory-detail-panel").classList.add("visible");
   try {
-    const item = await libraryApi("/memories/" + id);
+    const item = await selectedDatabaseApi("/memories/" + id);
     state.selectedMemoryDetail = item;
     renderMemoryDetailView(item);
   } catch (error) {
@@ -128,7 +245,6 @@ function renderMemoryDetailView(raw) {
   const detail = normalizeMemoryDetail(raw);
   state.selectedMemoryDetail = raw;
   $("memory-detail-title").textContent = t("memoryDetails", { id: detail.id });
-  $("memory-detail-badge").textContent = displayMemoryType(detail.type);
   const historyItems = detail.updateHistory.map((item) => {
     const time = formatMemoryTime(item.timestamp || item.time);
     const text = item.description || `${item.field || ""}: ${item.old_value ?? ""} -> ${item.new_value ?? ""}`;
@@ -138,17 +254,24 @@ function renderMemoryDetailView(raw) {
     <div class="memory-detail-top">
       <div class="memory-detail-header">
         ${memoryStatusPill(detail.status)}
-        ${memoryTypeTag(detail.type)}
-        <span class="memory-type-tag">${escapeHtml(t("importanceField"))}: ${detail.importance.toFixed(1)}/10</span>
+        <span class="memory-detail-tag">${escapeHtml(t("importanceField"))}: ${detail.importance.toFixed(1)}/10</span>
       </div>
       <div class="memory-detail-actions">
         <button type="button" class="ghost" id="memory-detail-edit">${escapeHtml(t("editMemory"))}</button>
+        ${detail.hasSource ? `<button type="button" class="ghost" id="memory-detail-source">${escapeHtml(t("viewSourceMessages"))}</button>` : ""}
+        ${detail.status === "archived"
+          ? `<button type="button" class="primary" id="memory-detail-restore">${escapeHtml(t("restoreMemory"))}</button>`
+          : `<button type="button" class="ghost" id="memory-detail-archive">${escapeHtml(t("archiveMemory"))}</button>`}
         <button type="button" class="ghost danger" id="memory-detail-delete">${escapeHtml(t("deleteMemory"))}</button>
       </div>
     </div>
     <div class="memory-detail-section">
-      <div class="memory-detail-section-title">${escapeHtml(t("content"))}</div>
-      <div class="memory-detail-content">${escapeHtml(detail.text)}</div>
+      <div class="memory-detail-section-title">${escapeHtml(t("personaSummary"))}</div>
+      <div class="memory-detail-content">${escapeHtml(detail.personaSummary || detail.canonicalSummary || detail.text)}</div>
+    </div>
+    <div class="memory-detail-section">
+      <div class="memory-detail-section-title">${escapeHtml(t("canonicalSummary"))}</div>
+      <div class="memory-detail-content">${escapeHtml(detail.canonicalSummary || detail.text)}</div>
     </div>
     <div class="memory-detail-section">
       <div class="memory-detail-section-title">${escapeHtml(t("graphContext"))}</div>
@@ -158,15 +281,17 @@ function renderMemoryDetailView(raw) {
       <div class="memory-detail-section-title">${escapeHtml(t("metadata"))}</div>
       <div class="memory-detail-meta-grid">
         ${memoryMetaItem(t("statusField"), memoryStatusPill(detail.status))}
-        ${memoryMetaItem(t("typeLabel"), memoryTypeTag(detail.type))}
         ${memoryMetaItem(t("importanceField"), `${detail.importance.toFixed(1)} / 10`)}
         ${memoryMetaItem(t("sessionField"), `<code>${escapeHtml(detail.sessionId)}</code>`)}
         ${memoryMetaItem(t("personaField"), `<div class="memory-persona-value"><code>${escapeHtml(detail.personaId)}</code><button type="button" class="ghost" id="memory-detail-edit-persona">${escapeHtml(t("editPersona"))}</button></div>`)}
         ${memoryMetaItem(t("createdAt"), escapeHtml(detail.createdAt))}
         ${memoryMetaItem(t("updatedAt"), escapeHtml(detail.updatedAt))}
         ${memoryMetaItem("last_access_time", escapeHtml(detail.lastAccess))}
+        ${memoryMetaItem(t("sourceRetention"), detail.hasSource ? escapeHtml(t("sourceAvailableOnDemand")) : escapeHtml(t("sourceUnavailable")))}
+        ${memoryMetaItem(t("sourceTimeStrategy"), escapeHtml(t(`sourceTimeStrategy_${detail.sourceTimeStrategy}`)))}
       </div>
     </div>
+    ${renderSourceTimeTags(detail.sourceTimeTags)}
     ${memoryListSection(t("factsField"), detail.keyFacts)}
     ${memoryTagsSection(t("topicsField"), detail.topics)}
     ${memoryTagsSection(t("participantsField"), detail.participants)}
@@ -178,13 +303,90 @@ function renderMemoryDetailView(raw) {
   `;
   $("memory-detail-edit").onclick = () => renderMemoryEditView(raw);
   $("memory-detail-edit-persona").onclick = () => renderMemoryPersonaEditView(raw);
+  if (detail.hasSource) $("memory-detail-source").onclick = () => loadMemorySource(detail, raw);
+  if (detail.status === "archived") $("memory-detail-restore").onclick = () => restoreMemory(detail.id);
+  else $("memory-detail-archive").onclick = () => archiveMemory(detail.id);
   $("memory-detail-delete").onclick = () => deleteMemory(detail.id);
+}
+
+function renderSourceTimeTags(tags = {}) {
+  const items = Object.entries(tags).filter(([, value]) => value !== null && value !== undefined && value !== "");
+  if (!items.length) return "";
+  return `<div class="memory-detail-section">
+    <div class="memory-detail-section-title">${escapeHtml(t("sourceTimeTags"))}</div>
+    <div class="memory-detail-meta-grid">${items.map(([key, value]) => memoryMetaItem(
+      t(`sourceTimeTag_${key}`),
+      escapeHtml(typeof value === "number" ? formatMemoryTime(value) : String(value)),
+    )).join("")}</div>
+  </div>`;
+}
+
+function renderSourceMessage(message, index) {
+  const role = String(message?.role || message?.sender_name || t("unknownRole"));
+  const sender = String(message?.sender_name || message?.sender_id || "");
+  const timestamp = message?.timestamp == null ? "" : formatMemoryTime(message.timestamp);
+  const content = String(message?.content || message?.text || "");
+  return `<article class="memory-source-message">
+    <header><strong>${escapeHtml(role)}</strong><span>${escapeHtml(sender)}</span><time>${escapeHtml(timestamp)}</time></header>
+    <div>${escapeHtml(content || t("emptySourceMessage"))}</div>
+    <small>${escapeHtml(t("sourceMessageNumber", { number: index + 1 }))}</small>
+  </article>`;
+}
+
+async function loadMemorySource(detail, raw) {
+  const button = $("memory-detail-source");
+  if (button) button.disabled = true;
+  try {
+    const data = await selectedDatabaseApi(`/memories/${detail.id}/source`);
+    const messages = Array.isArray(data?.source_messages) ? data.source_messages : [];
+    $("memory-detail-body").innerHTML = `
+      <div class="memory-detail-top">
+        <div class="memory-detail-header"><span class="memory-detail-tag">${escapeHtml(t("sourceMessageCount", { count: messages.length }))}</span></div>
+        <div class="memory-detail-actions"><button type="button" class="ghost" id="memory-source-back">${escapeHtml(t("backToMemoryDetail"))}</button></div>
+      </div>
+      <p class="panel-hint">${escapeHtml(t("sourceMessagesPrivacyHint"))}</p>
+      <div class="memory-source-list">${messages.map(renderSourceMessage).join("") || `<div class="memory-detail-empty">${escapeHtml(t("sourceUnavailable"))}</div>`}</div>`;
+    $("memory-source-back").onclick = () => renderMemoryDetailView(raw);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function archiveMemory(id) {
+  return asyncGuard.run(`memory:${id}:archive`, async () => {
+    if (!(await confirmDialog({
+      title: t("archiveMemory"),
+      message: t("archiveMemoryConfirm"),
+      confirmText: t("archiveMemory"),
+    }))) return;
+    await selectedDatabaseApi(`/memories/${id}/archive`, { method: "POST", body: JSON.stringify({}) });
+    toast(t("memoryArchived"));
+    await loadMemories();
+    await loadDatabases(false);
+    await openMemoryDetail(id);
+  }, { button: $("memory-detail-archive"), busyText: t("loading") });
+}
+
+async function restoreMemory(id) {
+  return asyncGuard.run(`memory:${id}:restore`, async () => {
+    if (!(await confirmDialog({
+      title: t("restoreMemory"),
+      message: t("restoreMemoryConfirm"),
+      confirmText: t("restoreMemory"),
+    }))) return;
+    await selectedDatabaseApi(`/memories/${id}/restore`, { method: "POST", body: JSON.stringify({}) });
+    toast(t("memoryRestored"));
+    await loadMemories();
+    await loadDatabases(false);
+    await openMemoryDetail(id);
+  }, { button: $("memory-detail-restore"), busyText: t("loading") });
 }
 
 function renderMemoryPersonaEditView(raw) {
   const detail = normalizeMemoryDetail(raw);
   $("memory-detail-title").textContent = t("editingMemoryPersona", { id: detail.id });
-  $("memory-detail-badge").textContent = displayMemoryType(detail.type);
   $("memory-detail-body").innerHTML = `
     <div class="memory-detail-actions">
       <button type="button" class="primary" id="memory-persona-save">${escapeHtml(t("savePersona"))}</button>
@@ -211,7 +413,7 @@ async function saveMemoryPersonaEdit(detail) {
   const saveButton = $("memory-persona-save");
   saveButton.disabled = true;
   try {
-    const updated = await libraryApi(`/memories/${detail.id}/persona`, {
+    const updated = await selectedDatabaseApi(`/memories/${detail.id}/persona`, {
       method: "PATCH",
       body: JSON.stringify({ persona_id: personaId }),
     });
@@ -229,7 +431,6 @@ async function saveMemoryPersonaEdit(detail) {
 function renderMemoryEditView(raw) {
   const detail = normalizeMemoryDetail(raw);
   $("memory-detail-title").textContent = t("editingMemory", { id: detail.id });
-  $("memory-detail-badge").textContent = displayMemoryType(detail.type);
   $("memory-detail-body").innerHTML = `
     <div class="memory-detail-actions">
       <button type="button" class="primary" id="memory-detail-save">${escapeHtml(t("saveMemory"))}</button>
@@ -242,12 +443,7 @@ function renderMemoryEditView(raw) {
     <div class="memory-detail-section">
       <div class="memory-detail-section-title">${escapeHtml(t("metadata"))}</div>
       <div class="memory-detail-edit-grid">
-        <label><span>${escapeHtml(t("statusField"))}</span><select id="memory-edit-status">
-          <option value="active" ${detail.status === "active" ? "selected" : ""}>${escapeHtml(displayStatus("active"))}</option>
-          <option value="archived" ${detail.status === "archived" ? "selected" : ""}>${escapeHtml(displayStatus("archived"))}</option>
-          <option value="deleted" ${detail.status === "deleted" ? "selected" : ""}>${escapeHtml(displayStatus("deleted"))}</option>
-        </select></label>
-        <label><span>${escapeHtml(t("typeLabel"))}</span><input id="memory-edit-type" value="${escapeHtml(detail.type)}"></label>
+        <label><span>${escapeHtml(t("statusField"))}</span><div class="readonly-output">${memoryStatusPill(detail.status)}</div><small>${escapeHtml(t("memoryStatusManagedHint"))}</small></label>
         <label class="wide"><span>${escapeHtml(t("importanceField"))}</span><div class="memory-detail-slider"><input id="memory-edit-importance" type="range" min="0" max="10" step="0.1" value="${detail.importance.toFixed(1)}"><strong id="memory-edit-importance-value">${detail.importance.toFixed(1)}</strong></div></label>
         <label class="wide"><span>${escapeHtml(t("updateReason"))}</span><input id="memory-edit-reason" placeholder="${escapeHtml(t("reasonPlaceholder"))}"></label>
       </div>
@@ -262,8 +458,7 @@ function renderMemoryEditView(raw) {
 
 async function saveMemoryDetailEdit(detail) {
   const content = $("memory-edit-content").value.trim();
-  const status = $("memory-edit-status").value;
-  const memoryType = $("memory-edit-type").value.trim() || "GENERAL";
+  const status = detail.status;
   const importance = Number($("memory-edit-importance").value);
   const reason = $("memory-edit-reason").value.trim();
   if (!content) {
@@ -282,7 +477,6 @@ async function saveMemoryDetailEdit(detail) {
   }
   const payload = {
     status,
-    memory_type: memoryType,
     importance,
     value_scale: "display",
     metadata,
@@ -291,7 +485,6 @@ async function saveMemoryDetailEdit(detail) {
   if (
     content === detail.text
     && status === detail.status
-    && memoryType === detail.type
     && Math.abs(importance - detail.importance) < 0.01
     && !reason
   ) {
@@ -301,14 +494,14 @@ async function saveMemoryDetailEdit(detail) {
   const saveButton = $("memory-detail-save");
   saveButton.disabled = true;
   try {
-    const updated = await libraryApi("/memories/" + detail.id, {
+    const updated = await selectedDatabaseApi("/memories/" + detail.id, {
       method: "PATCH",
       body: JSON.stringify(payload),
     });
     state.selectedMemoryDetail = updated;
     toast(t("saved"));
     await loadMemories();
-    await loadLibraries(false);
+    await loadDatabases(false);
     await openMemoryDetail(updated.new_memory_id || updated.id || detail.id, updated);
   } catch (error) {
     toast(error.message, true);
@@ -336,7 +529,6 @@ function openModal(item = null) {
   $("form-session").value = item?.metadata?.session_id || "";
   $("form-importance").value = item?.metadata?.importance ?? 0.5;
   $("form-status").value = item?.metadata?.status || "active";
-  $("form-type").value = item?.metadata?.memory_type || "GENERAL";
   $("form-topics").value = (item?.metadata?.topics || []).join(", ");
   $("form-participants").value = (item?.metadata?.participants || []).join(", ");
   $("form-facts").value = (item?.metadata?.key_facts || []).join(", ");
@@ -363,7 +555,6 @@ $("memory-form").onsubmit = async (event) => {
     session_id: $("form-session").value || null,
     importance: Number($("form-importance").value),
     status: $("form-status").value,
-    memory_type: $("form-type").value,
     topics,
     participants,
     key_facts: facts,
@@ -376,21 +567,28 @@ $("memory-form").onsubmit = async (event) => {
   if (id) {
     payload.value_scale = "stored";
   }
+  await asyncGuard.run(`memory-form:${id || "new"}`, async () => {
   try {
-    await libraryApi(id ? "/memories/" + id : "/memories", {
+    await selectedDatabaseApi(id ? "/memories/" + id : "/memories", {
       method: id ? "PATCH" : "POST",
       body: JSON.stringify(payload),
     });
     closeModal();
     toast(t("saved"));
     await loadMemories();
-    await loadLibraries(false);
+    await loadDatabases(false);
   } catch (error) {
     toast(error.message, true);
   }
+  }, {
+    form: event.currentTarget,
+    button: event.submitter,
+    busyText: t("loading"),
+  });
 };
 
 async function deleteMemory(id) {
+  return asyncGuard.run(`memory:${id}:delete`, async () => {
   if (!(await confirmDialog({
     title: t("confirmTitle"),
     message: `${t("confirmDelete")}${id}？`,
@@ -400,14 +598,18 @@ async function deleteMemory(id) {
     return;
   }
   try {
-    await libraryApi("/memories/" + id, { method: "DELETE" });
+    await selectedDatabaseApi("/memories/" + id, { method: "DELETE" });
     toast(t("deleted"));
     closeMemoryDetail();
     await loadMemories();
-    await loadLibraries(false);
+    await loadDatabases(false);
   } catch (error) {
     toast(error.message, true);
   }
+  }, {
+    button: $("memory-detail-delete"),
+    busyText: t("loading"),
+  });
 }
 
   return { loadMemories };

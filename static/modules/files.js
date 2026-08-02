@@ -10,6 +10,7 @@ export function createFileManagerController({
   parseDownloadFilename,
   confirmDialog,
   escapeHtml,
+  asyncGuard,
 }) {
   state.files ||= {
     root: "",
@@ -283,6 +284,7 @@ export function createFileManagerController({
       files.items = Array.isArray(payload.items) ? payload.items : [];
       files.selectedPaths.clear();
     } catch (error) {
+      if (error?.name === "AbortError") return;
       toast(error.message, true);
     } finally {
       files.loading = false;
@@ -407,6 +409,7 @@ export function createFileManagerController({
   }
 
   async function createItem() {
+    return asyncGuard.run("files:create", async () => {
     try {
       const name = validateBaseName($("file-create-name").value);
       await api("/files/create", {
@@ -419,6 +422,10 @@ export function createFileManagerController({
     } catch (error) {
       toast(error.message, true);
     }
+    }, {
+      form: $("file-create-form"),
+      busyText: t("loading"),
+    });
   }
 
   function toggleUpload() {
@@ -446,8 +453,9 @@ export function createFileManagerController({
     }
   }
 
-  async function deletePaths(paths) {
+  async function deletePaths(paths, button = null) {
     if (!paths.length) return;
+    return asyncGuard.run(`files:delete:${paths.join("|")}`, async () => {
     const confirmed = await confirmDialog({
       title: t("fileDeleteTitle"),
       message: t("fileDeleteConfirm", { count: paths.length }),
@@ -465,6 +473,10 @@ export function createFileManagerController({
     } catch (error) {
       toast(error.message, true);
     }
+    }, {
+      button,
+      busyText: t("loading"),
+    });
   }
 
   function openRename(item) {
@@ -476,6 +488,7 @@ export function createFileManagerController({
   }
 
   async function renameItem() {
+    return asyncGuard.run("files:rename", async () => {
     try {
       const name = validateBaseName($("file-rename-name").value);
       await api("/files/rename", {
@@ -488,6 +501,10 @@ export function createFileManagerController({
     } catch (error) {
       toast(error.message, true);
     }
+    }, {
+      form: $("file-rename-form"),
+      busyText: t("loading"),
+    });
   }
 
   async function loadMoveNode(path) {
@@ -650,6 +667,7 @@ export function createFileManagerController({
 
   async function saveEditor() {
     if (!files.editPayload) return;
+    return asyncGuard.run(`files:write:${files.editPayload.path}`, async () => {
     const confirmed = await confirmDialog({
       title: t("fileSaveTitle"),
       message: t("fileSaveConfirm", { path: formatPath(files.editPayload.path) }),
@@ -672,6 +690,10 @@ export function createFileManagerController({
     } catch (error) {
       toast(error.message, true);
     }
+    }, {
+      button: $("file-edit-save"),
+      busyText: t("loading"),
+    });
   }
 
   function bind() {
@@ -693,7 +715,7 @@ export function createFileManagerController({
       if (event.target.checked) files.items.forEach((item) => files.selectedPaths.add(normalizePath(item.path)));
       renderFiles();
     });
-    $("file-delete-selected")?.addEventListener("click", () => deletePaths(selectedItems().map((item) => item.path)));
+    $("file-delete-selected")?.addEventListener("click", (event) => deletePaths(selectedItems().map((item) => item.path), event.currentTarget));
     $("file-move-selected")?.addEventListener("click", () => openMove(selectedItems().map((item) => item.path)));
     $("file-download-selected")?.addEventListener("click", () => downloadItems(selectedItems()));
     $("file-create-form")?.addEventListener("submit", (event) => { event.preventDefault(); createItem(); });
@@ -741,7 +763,7 @@ export function createFileManagerController({
       if (action.dataset.fileAction === "move") openMove([item.path]);
       if (action.dataset.fileAction === "copy") copyPath(item);
       if (action.dataset.fileAction === "download") downloadItems([item]);
-      if (action.dataset.fileAction === "delete") deletePaths([item.path]);
+      if (action.dataset.fileAction === "delete") deletePaths([item.path], action);
     });
     $("file-move-tree")?.addEventListener("click", async (event) => {
       const toggle = event.target.closest("[data-file-move-toggle]");

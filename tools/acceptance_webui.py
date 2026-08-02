@@ -30,12 +30,21 @@ def default_credential(state_root: Path) -> str:
     return str(config.get("api_key") or "")
 
 
+def default_api_key(state_root: Path) -> str:
+    config_path = state_root / "config" / "config.json"
+    if not config_path.exists():
+        return ""
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    return str(config.get("api_key") or "")
+
+
 async def run(
     devtools_url: str,
     *,
     base_url: str,
     credential: str,
     report_dir: Path,
+    api_key: str = "",
 ) -> dict:
     base_url = base_url.rstrip("/")
     pages = json.loads(
@@ -75,6 +84,12 @@ async def run(
 
         await call("Runtime.enable")
         await call("Page.enable")
+        if api_key:
+            await call("Network.enable")
+            await call(
+                "Network.setExtraHTTPHeaders",
+                {"headers": {"Authorization": f"Bearer {api_key}"}},
+            )
         await call(
             "Emulation.setDeviceMetricsOverride",
             {
@@ -124,6 +139,66 @@ async def run(
         (report_dir / "multilibrary-ui.png").write_bytes(
             base64.b64decode(screenshot["data"])
         )
+        async def capture_library_key(theme: str, filename: str) -> dict:
+            current_theme = await call(
+                "Runtime.evaluate",
+                {
+                    "expression": "document.documentElement.dataset.theme",
+                    "returnByValue": True,
+                },
+            )
+            if current_theme["result"]["value"] != theme:
+                await call(
+                    "Runtime.evaluate",
+                    {"expression": "document.querySelector('#theme-toggle').click()"},
+                )
+                await asyncio.sleep(0.2)
+            style = await call(
+                "Runtime.evaluate",
+                {
+                    "expression": (
+                        "(()=>{const el=document.querySelector('.key-library-fab');"
+                        "if(!el)return {visible:false};const s=getComputedStyle(el);"
+                        "const root=getComputedStyle(document.documentElement);return {"
+                        "visible:el.getBoundingClientRect().width>0,"
+                        "inViewport:(()=>{const r=el.getBoundingClientRect();return "
+                        "r.top>=0&&r.left>=0&&r.bottom<=innerHeight&&r.right<=innerWidth})(),"
+                        "color:s.color,accent:root.getPropertyValue('--accent').trim(),"
+                        "overflow:document.documentElement.scrollWidth>innerWidth}})()"
+                    ),
+                    "returnByValue": True,
+                },
+            )
+            image = await call(
+                "Page.captureScreenshot",
+                {"format": "png", "captureBeyondViewport": False},
+            )
+            (report_dir / filename).write_bytes(base64.b64decode(image["data"]))
+            return style["result"]["value"]
+
+        library_key_light = await capture_library_key(
+            "light", "library-key-light-desktop.png"
+        )
+        library_key_dark = await capture_library_key(
+            "dark", "library-key-dark-desktop.png"
+        )
+        await call(
+            "Emulation.setDeviceMetricsOverride",
+            {"width": 390, "height": 844, "deviceScaleFactor": 1, "mobile": True},
+        )
+        await call(
+            "Runtime.evaluate",
+            {"expression": "document.querySelector('.key-library-fab').scrollIntoView({block:'center'})"},
+        )
+        await asyncio.sleep(0.2)
+        library_key_mobile = await capture_library_key(
+            "dark", "library-key-dark-mobile.png"
+        )
+        await call(
+            "Emulation.setDeviceMetricsOverride",
+            {"width": 1600, "height": 1000, "deviceScaleFactor": 1, "mobile": False},
+        )
+        await capture_library_key("light", "library-key-light-restored.png")
         await call(
             "Runtime.evaluate",
             {
@@ -456,6 +531,11 @@ async def run(
             page_smoke[page_name] = snapshot["result"]["value"]
         return {
             "libraries": libraries["result"]["value"],
+            "library_key": {
+                "light": library_key_light,
+                "dark": library_key_dark,
+                "mobile": library_key_mobile,
+            },
             "providers": providers["result"]["value"],
             "provider_editor": {
                 "type_cards": type_picker["result"]["value"]["cards"],
@@ -494,6 +574,7 @@ def main() -> int:
     parser.add_argument("--base-url", default="http://127.0.0.1:8765")
     parser.add_argument("--state-root", type=Path, default=default_state_root())
     parser.add_argument("--credential", default="")
+    parser.add_argument("--api-key", default="")
     parser.add_argument(
         "--report-dir",
         type=Path,
@@ -501,9 +582,10 @@ def main() -> int:
     )
     args = parser.parse_args()
     credential = args.credential or default_credential(args.state_root.resolve())
-    if not credential:
+    api_key = args.api_key or default_api_key(args.state_root.resolve())
+    if not credential and not api_key:
         parser.error(
-            "--credential is required when the configured WebUI login uses a password"
+            "--credential or --api-key is required for WebUI authentication"
         )
     report_dir = args.report_dir.resolve()
     result = asyncio.run(
@@ -511,6 +593,7 @@ def main() -> int:
             args.devtools_url,
             base_url=args.base_url,
             credential=credential,
+            api_key=api_key,
             report_dir=report_dir,
         )
     )
@@ -524,8 +607,12 @@ def main() -> int:
     return 0 if (
         result["runtime_exceptions"] == 0
         and result["libraries"]["cards"] >= 1
+        and all(
+            item["visible"] and item["inViewport"] and not item["overflow"]
+            for item in result["library_key"].values()
+        )
         and result["providers"]["cards"] >= 1
-        and result["provider_editor"]["type_cards"] == 3
+        and result["provider_editor"]["type_cards"] >= 3
         and result["provider_editor"]["fields"] == 12
         and result["provider_editor"]["createIdEditable"]
         and (

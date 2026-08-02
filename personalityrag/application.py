@@ -11,6 +11,7 @@ from . import __version__
 from .application_context import ApplicationContext, activate_context, reset_context
 from .http_middleware import (
     RequestContextMiddleware,
+    adapter_access_surface_guard,
     adapter_busy_guard,
     static_asset_cache_policy,
 )
@@ -58,11 +59,15 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
     app.mount("/static", StaticFiles(directory=context.static_dir), name="static")
 
     from .routes import ROUTERS
+    from .database_types import database_type_registry
 
     for router in ROUTERS:
         app.include_router(router)
+    for router in database_type_registry.api_routers():
+        app.include_router(router)
     app.middleware("http")(static_asset_cache_policy)
     app.middleware("http")(adapter_busy_guard)
+    app.middleware("http")(adapter_access_surface_guard)
     app.add_middleware(GZipMiddleware, minimum_size=500)
     app.add_middleware(RequestContextMiddleware, context=context)
     return app

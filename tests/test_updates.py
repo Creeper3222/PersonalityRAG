@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 import threading
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,11 +16,13 @@ from personalityrag.update_manifest import (
     MANAGED_FILES,
     MANIFEST_NAME,
     UpdatePackageError,
+    audit_release_source_contract,
     compare_tags,
     inspect_and_extract_zip,
     validate_manifest,
     write_manifest,
 )
+from personalityrag.storage_layout import DATABASE_LAYOUT_VERSION
 from personalityrag.updates import UpdateService
 from tools import update_helper
 
@@ -49,11 +52,41 @@ def _zip(root: Path, target: Path) -> Path:
 
 def test_semver_comparison_includes_prereleases() -> None:
     assert compare_tags("v0.1.1", "v0.1.0") > 0
+    assert compare_tags("v0.1.10", "v0.1.9") > 0
     assert compare_tags("v0.1.1-rc.2", "v0.1.1-rc.1") > 0
     assert compare_tags("v0.1.1", "v0.1.1-rc.2") > 0
     assert compare_tags("v0.1.0", "v0.1.0") == 0
     with pytest.raises(UpdatePackageError):
         compare_tags("latest", "v0.1.0")
+
+
+def _commit_contract_fixture(root: Path) -> None:
+    subprocess.run(["git", "init", "-b", "main", str(root)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(root), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-m", "fixture"], check=True, capture_output=True)
+
+
+def test_release_source_contract_rejects_unclassified_tracked_runtime_file(tmp_path: Path) -> None:
+    root = _candidate(tmp_path)
+    (root / MANIFEST_NAME).unlink()
+    _commit_contract_fixture(root)
+    assert "personalityrag/version.py" in audit_release_source_contract(root)
+
+    (root / "future_runtime.py").write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", "future_runtime.py"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-m", "runtime"], check=True, capture_output=True)
+    with pytest.raises(UpdatePackageError, match="not classified"):
+        audit_release_source_contract(root)
+
+
+def test_release_source_contract_accepts_new_code_inside_managed_directory(tmp_path: Path) -> None:
+    root = _candidate(tmp_path)
+    (root / MANIFEST_NAME).unlink()
+    (root / "personalityrag" / "future_runtime.py").write_text("VALUE = 1\n", encoding="utf-8")
+    _commit_contract_fixture(root)
+    assert "personalityrag/future_runtime.py" in audit_release_source_contract(root)
 
 
 def test_runtime_version_is_centralized_in_python_metadata() -> None:
@@ -78,8 +111,36 @@ def test_manifest_validates_every_managed_file(tmp_path: Path) -> None:
 def test_manifest_blocks_incompatible_persistent_schema(tmp_path: Path) -> None:
     root = _candidate(tmp_path)
     manifest = json.loads((root / MANIFEST_NAME).read_text(encoding="utf-8"))
-    manifest["persistent_compatibility"]["livingmemory_database"] = {"minimum": 9, "maximum": 9}
-    with pytest.raises(UpdatePackageError, match="incompatible with livingmemory_database"):
+    manifest["persistent_compatibility"]["control_schema"] = {"minimum": 9, "maximum": 9}
+    with pytest.raises(UpdatePackageError, match="incompatible with control_schema"):
+        validate_manifest(manifest, expected_tag="v0.1.0")
+
+
+def test_manifest_keeps_v010_livingmemory_compatibility_bridge(tmp_path: Path) -> None:
+    root = _candidate(tmp_path)
+    manifest = json.loads((root / MANIFEST_NAME).read_text(encoding="utf-8"))
+
+    assert manifest["persistent_compatibility"]["livingmemory_database"] == {
+        "minimum": 8,
+        "maximum": 8,
+    }
+    manifest["persistent_compatibility"]["livingmemory_database"] = {
+        "minimum": 9,
+        "maximum": 9,
+    }
+    validate_manifest(manifest, expected_tag="v0.1.0")
+
+
+def test_manifest_requires_database_layout_compatibility(tmp_path: Path) -> None:
+    root = _candidate(tmp_path)
+    manifest = json.loads((root / MANIFEST_NAME).read_text(encoding="utf-8"))
+
+    assert manifest["persistent_compatibility"]["database_layout"] == {
+        "minimum": DATABASE_LAYOUT_VERSION,
+        "maximum": DATABASE_LAYOUT_VERSION,
+    }
+    del manifest["persistent_compatibility"]["database_layout"]
+    with pytest.raises(UpdatePackageError, match="database_layout"):
         validate_manifest(manifest, expected_tag="v0.1.0")
 
 

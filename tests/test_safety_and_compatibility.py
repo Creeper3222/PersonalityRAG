@@ -304,7 +304,11 @@ async def test_merge_routes_backfills_memory_for_graph_only_hits():
 
     assert [item.doc_id for item in results] == [7]
     assert results[0].content == "canonical memory text"
-    assert results[0].metadata == {"importance": 0.9, "source": "memory"}
+    assert results[0].metadata == {
+        "importance": 0.9,
+        "source": "memory",
+        "has_source": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -377,7 +381,7 @@ async def test_service_repairs_incomplete_fts_during_index_rebuild():
 
 
 @pytest.mark.asyncio
-async def test_importance_weight_scales_document_route_importance():
+async def test_document_route_matches_livingmemory_250_weighting():
     class FakeStorage:
         async def get_document(self, doc_id: int):
             importance = 0.9 if doc_id == 2 else 0.2
@@ -410,8 +414,14 @@ async def test_importance_weight_scales_document_route_importance():
     results = await engine._document_route("memory", 2, None, None)
 
     assert [item.doc_id for item in results] == [2, 1]
-    assert results[0].final_score == pytest.approx(1.8)
-    assert results[0].score_breakdown["importance_weight"] == 2
+    assert results[0].final_score == pytest.approx(0.9)
+    assert results[0].score_breakdown == {
+        "rrf_normalized": pytest.approx(0.9839),
+        "importance": 0.9,
+        "recency_weight": 1.0,
+        "days_old": 0.0,
+        "final_score": 0.9,
+    }
 
 
 def _rerank_service(

@@ -25,7 +25,11 @@ class ValidationStorage:
 
 class ValidationIndexes:
     def status(self):
-        return {"document_vectors": 2, "graph_vectors": 3}
+        return {
+            "generation": "gen-test",
+            "document_vectors": 2,
+            "graph_vectors": 3,
+        }
 
     def indexed_ids(self):
         return {11, 12}, {21, 22, 23}
@@ -48,11 +52,18 @@ async def test_startup_validation_is_local_and_provider_independent(
 
 
 @pytest.mark.asyncio
-async def test_startup_validation_rejects_exact_faiss_id_drift(tmp_path) -> None:
+async def test_startup_validation_defers_exact_faiss_id_drift_to_background_rebuild(
+    tmp_path, caplog
+) -> None:
     manager = LibraryManager(tmp_path, AppConfig())
     indexes = ValidationIndexes()
     indexes.indexed_ids = lambda: ({11, 99}, {21, 22, 23})
-    runtime = SimpleNamespace(storage=ValidationStorage(), indexes=indexes)
+    runtime = SimpleNamespace(
+        memory_store_id="validation-test",
+        storage=ValidationStorage(),
+        indexes=indexes,
+    )
 
-    with pytest.raises(RuntimeError, match="文档 FAISS ID 数量"):
-        await manager._validate_runtime(runtime)
+    await manager._validate_runtime(runtime)
+
+    assert "document_id_set_changed" in caplog.text

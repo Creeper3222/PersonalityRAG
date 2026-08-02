@@ -4,6 +4,7 @@ import asyncio
 import json
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import numpy as np
@@ -14,11 +15,16 @@ from personalityrag.config import (
     ProviderConfig,
     RuntimeResidencyConfig,
 )
-from personalityrag.compat import LIVINGMEMORY_DATABASE_VERSION
+from personalityrag.database_types import (
+    DatabaseRef,
+    LIVINGMEMORY_V8_TYPE,
+    database_type_registry,
+)
 from personalityrag.control import ControlStore
 from personalityrag.graph import GraphBuilder
 from personalityrag.indexes import IndexManager
 from personalityrag.libraries import DEFAULT_LIBRARY_ID, LibraryManager
+from personalityrag.library_types.livingmemory_v8.manager import LivingMemoryV8Manager
 from personalityrag.providers import (
     EmbeddingProvider,
     GeminiEmbeddingProvider,
@@ -84,7 +90,7 @@ def _patch_fake_providers(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda config: FakeProvider(config),
     )
     monkeypatch.setattr(
-        "personalityrag.libraries.build_provider",
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider",
         lambda config: FakeProvider(config),
     )
 
@@ -99,7 +105,8 @@ async def test_new_install_uses_Default_and_existing_default_is_preserved(
         "personalityrag.service.build_provider", lambda config: FakeProvider(config)
     )
     monkeypatch.setattr(
-        "personalityrag.libraries.build_provider", lambda config: FakeProvider(config)
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider",
+        lambda config: FakeProvider(config),
     )
 
     manager = LibraryManager(root, AppConfig(provider=provider_config))
@@ -501,7 +508,7 @@ async def test_manager_detects_context_length_only_on_provider_create_or_endpoin
             }
 
     monkeypatch.setattr(
-        "personalityrag.libraries.build_provider",
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider",
         lambda config: CountingProvider(config),
     )
     manager = LibraryManager(tmp_path / "PersonalityRAG", AppConfig())
@@ -557,7 +564,7 @@ async def test_manager_manual_context_probe_for_saved_provider_keeps_secret(
             }
 
     monkeypatch.setattr(
-        "personalityrag.libraries.build_provider",
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider",
         lambda config: SecretAwareProvider(config),
     )
     manager = LibraryManager(tmp_path / "PersonalityRAG", AppConfig())
@@ -863,7 +870,7 @@ async def test_long_rebuild_probes_context_once_and_persists_display_metadata(
         lambda config: LongTaskProbeProvider(config),
     )
     monkeypatch.setattr(
-        "personalityrag.libraries.build_provider",
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider",
         lambda config: LongTaskProbeProvider(config),
     )
     manager = LibraryManager(root, AppConfig(provider=provider_config))
@@ -932,7 +939,7 @@ async def test_long_rebuild_falls_back_to_manual_when_context_probe_fails(
         lambda config: FailedProbeProvider(config),
     )
     monkeypatch.setattr(
-        "personalityrag.libraries.build_provider",
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider",
         lambda config: FailedProbeProvider(config),
     )
     manager = LibraryManager(root, AppConfig(provider=provider_config))
@@ -1008,7 +1015,7 @@ async def test_library_rerank_binding_does_not_queue_rebuild(
         lambda config: FakeProvider(config),
     )
     monkeypatch.setattr(
-        "personalityrag.libraries.build_provider",
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider",
         lambda config: FakeProvider(config),
     )
     manager = LibraryManager(root, AppConfig(provider=provider_config))
@@ -1071,7 +1078,7 @@ async def test_legacy_data_migrates_to_Default_and_libraries_are_isolated(
         lambda config: FakeProvider(config),
     )
     monkeypatch.setattr(
-        "personalityrag.libraries.build_provider",
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider",
         lambda config: FakeProvider(config),
     )
     manager = LibraryManager(root, AppConfig(provider=provider_config))
@@ -1081,7 +1088,12 @@ async def test_legacy_data_migrates_to_Default_and_libraries_are_isolated(
         assert default["name"] == "贝雷特"
         assert default["stats"]["total_memories"] == 1
         assert not (data / "livingmemory.db").exists()
-        assert (data / "libraries" / "Default" / "livingmemory.db").exists()
+        assert (
+            database_type_registry.data_dir(
+                data, DatabaseRef(LIVINGMEMORY_V8_TYPE, "Default")
+            )
+            / "livingmemory.db"
+        ).exists()
         marker = json.loads(
             (data / ".multilibrary_migrated_v1.json").read_text(
                 encoding="utf-8"
@@ -1104,14 +1116,8 @@ async def test_legacy_data_migrates_to_Default_and_libraries_are_isolated(
         assert second["indexes"]["generation"] is None
         assert second["indexes"]["document_vectors"] == 0
         assert second["indexes"]["graph_vectors"] == 0
-        assert (
-            second["metadata"]["livingmemory_database_version"]
-            == LIVINGMEMORY_DATABASE_VERSION
-        )
-        assert (
-            second["compatibility"]["livingmemory_database_version"]
-            == LIVINGMEMORY_DATABASE_VERSION
-        )
+        assert "livingmemory_database_version" not in second["metadata"]
+        assert "compatibility" not in second
         second_runtime = await manager.get_runtime(second["id"])
         await second_runtime.create_memory(
             {
@@ -1139,7 +1145,7 @@ async def test_empty_library_with_legacy_empty_generation_is_reported_pending(
         lambda config: FakeProvider(config),
     )
     monkeypatch.setattr(
-        "personalityrag.libraries.build_provider",
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider",
         lambda config: FakeProvider(config),
     )
 
@@ -1153,7 +1159,9 @@ async def test_empty_library_with_legacy_empty_generation_is_reported_pending(
                 "provider_id": provider_config.id,
             }
         )
-        library_dir = root / "data" / "libraries" / "legacy_pending"
+        library_dir = database_type_registry.data_dir(
+            manager.data_dir, DatabaseRef(LIVINGMEMORY_V8_TYPE, "legacy_pending")
+        )
         generation = "gen-legacy-empty"
         generation_dir = library_dir / "indexes" / generation
         generation_dir.mkdir(parents=True, exist_ok=True)
@@ -1182,8 +1190,57 @@ async def test_empty_library_with_legacy_empty_generation_is_reported_pending(
         await manager.close()
 
 
+def test_offline_index_status_uses_memory_granularity_vector_count(
+    tmp_path: Path,
+) -> None:
+    library_dir = tmp_path / "offline-memory-store"
+    generation = "gen-memory-granularity"
+    generation_dir = library_dir / "indexes" / generation
+    generation_dir.mkdir(parents=True)
+    (library_dir / "indexes" / "CURRENT").write_text(generation, encoding="utf-8")
+    (generation_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "generation": generation,
+                "document_count": 175,
+                "graph_entry_count": 14274,
+                "graph_source_memory_count": 175,
+                "graph_vector_count": 175,
+                "graph_vector_granularity": "memory",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    status = LivingMemoryV8Manager._offline_index_status(
+        library_dir,
+        SimpleNamespace(provider_id="embedding", provider_revision=1),
+    )
+
+    assert status["document_vectors"] == 175
+    assert status["graph_vectors"] == 175
+
+    (generation_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "generation": generation,
+                "document_count": 0,
+                "graph_entry_count": 14274,
+                "graph_vector_count": 0,
+                "graph_vector_granularity": "memory",
+            }
+        ),
+        encoding="utf-8",
+    )
+    empty_status = LivingMemoryV8Manager._offline_index_status(
+        library_dir,
+        SimpleNamespace(provider_id="embedding", provider_revision=1),
+    )
+    assert empty_status["graph_vectors"] == 0
+
+
 @pytest.mark.asyncio
-async def test_failed_legacy_layout_validation_rolls_back_source(
+async def test_legacy_layout_without_index_stays_online_and_rebuilds_in_background(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     root = tmp_path / "PersonalityRAG"
@@ -1195,19 +1252,29 @@ async def test_failed_legacy_layout_validation_rolls_back_source(
         TextProcessor().tokenize,
         GraphBuilder().build,
     )
-    system_before = (data / "personalityrag_system.db").read_bytes()
     provider_config = ProviderConfig(dimensions=8)
     monkeypatch.setattr(
         "personalityrag.service.build_provider",
         lambda config: FakeProvider(config),
     )
     manager = LibraryManager(root, AppConfig(provider=provider_config))
-    with pytest.raises(RuntimeError, match="文档 FAISS ID 数量"):
-        await manager.initialize()
-    assert (data / "livingmemory.db").exists()
-    assert not (data / "libraries" / "Default").exists()
-    assert not (data / ".multilibrary_migrated_v1.json").exists()
-    assert (data / "personalityrag_system.db").read_bytes() == system_before
+    await manager.initialize()
+    try:
+        target = await manager.get_runtime("Default")
+        for _ in range(1000):
+            if target.maintenance_status().get("status") == "ready":
+                break
+            await asyncio.sleep(0.01)
+        assert target.maintenance_status()["status"] == "ready"
+        assert target.maintenance_status()["index_available"] is True
+        assert target.indexes.status()["document_vectors"] == 1
+        assert not (data / "livingmemory.db").exists()
+        assert database_type_registry.data_dir(
+            data, DatabaseRef(LIVINGMEMORY_V8_TYPE, "Default")
+        ).exists()
+        assert (data / ".multilibrary_migrated_v1.json").exists()
+    finally:
+        await manager.close()
 
 
 @pytest.mark.asyncio
@@ -1221,7 +1288,7 @@ async def test_library_listing_stays_lazy_and_rejected_default_delete_keeps_runt
         lambda config: FakeProvider(config),
     )
     monkeypatch.setattr(
-        "personalityrag.libraries.build_provider",
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider",
         lambda config: FakeProvider(config),
     )
 
@@ -1235,12 +1302,12 @@ async def test_library_listing_stays_lazy_and_rejected_default_delete_keeps_runt
     manager = LibraryManager(root, AppConfig(provider=provider_config))
     await manager.initialize()
     try:
-        assert set(manager.runtimes) == {"Default"}
+        assert set(manager.runtimes) == {DatabaseRef(LIVINGMEMORY_V8_TYPE, "Default")}
         libraries = await manager.list_libraries()
         assert {item["id"] for item in libraries} == {"Default", "second"}
-        assert set(manager.runtimes) == {"Default"}
+        assert set(manager.runtimes) == {DatabaseRef(LIVINGMEMORY_V8_TYPE, "Default")}
 
-        runtime = manager.runtimes["Default"]
+        runtime = manager.runtimes[DatabaseRef(LIVINGMEMORY_V8_TYPE, "Default")]
         provider = runtime.provider
         await manager.update_library(
             "second", {"recall_settings": {"top_k": 3, "importance_weight": 2.5}}
@@ -1255,7 +1322,7 @@ async def test_library_listing_stays_lazy_and_rejected_default_delete_keeps_runt
         assert not hasattr(runtime.config.recall, "top_k")
         with pytest.raises(ValueError, match="默认记忆库不能删除"):
             await manager.delete_library("Default")
-        assert manager.runtimes["Default"] is runtime
+        assert manager.runtimes[DatabaseRef(LIVINGMEMORY_V8_TYPE, "Default")] is runtime
         assert provider.closed is False
     finally:
         await manager.close()
@@ -1272,7 +1339,7 @@ async def test_library_copy_uses_numbered_fallback_after_soft_delete(
         lambda config: FakeProvider(config),
     )
     monkeypatch.setattr(
-        "personalityrag.libraries.build_provider",
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider",
         lambda config: FakeProvider(config),
     )
 
@@ -1290,9 +1357,18 @@ async def test_library_copy_uses_numbered_fallback_after_soft_delete(
         third = await manager.copy_library("Default")
         assert third["id"] == "Default_copy3"
         assert third["name"] == "贝雷特(副本3)"
-        assert not (root / "data" / "libraries" / first["id"]).exists()
+        assert not database_type_registry.data_dir(
+            manager.data_dir, DatabaseRef(LIVINGMEMORY_V8_TYPE, first["id"])
+        ).exists()
         trash_candidates = list(
-            (root / "data" / "trash" / "libraries").glob("Default_copy-*")
+            (
+                root
+                / "data"
+                / "trash"
+                / "databases"
+                / "memory_stores"
+                / "livingmemory_v8"
+            ).glob("Default_copy-*")
         )
         assert trash_candidates
         assert sorted(item.name for item in trash_candidates[0].iterdir()) == [
@@ -1339,13 +1415,19 @@ async def test_empty_library_copy_can_be_loaded_renamed_and_deleted(
         assert renamed["id"] == "renamed_empty_copy"
         assert renamed["name"] == "Renamed empty copy"
         assert await manager.control.get_library(copied_id) is None
-        assert not (root / "data" / "libraries" / copied_id).exists()
-        assert (root / "data" / "libraries" / renamed["id"]).is_dir()
+        assert not database_type_registry.data_dir(
+            manager.data_dir, DatabaseRef(LIVINGMEMORY_V8_TYPE, copied_id)
+        ).exists()
+        assert database_type_registry.data_dir(
+            manager.data_dir, DatabaseRef(LIVINGMEMORY_V8_TYPE, renamed["id"])
+        ).is_dir()
 
         deleted = await manager.delete_library(renamed["id"])
         assert deleted["library_id"] == renamed["id"]
         assert await manager.control.get_library(renamed["id"]) is None
-        assert not (root / "data" / "libraries" / renamed["id"]).exists()
+        assert not database_type_registry.data_dir(
+            manager.data_dir, DatabaseRef(LIVINGMEMORY_V8_TYPE, renamed["id"])
+        ).exists()
 
         copied_again = await manager.copy_library(source["id"])
         reclaimed = await manager.update_library(
@@ -1354,7 +1436,9 @@ async def test_empty_library_copy_can_be_loaded_renamed_and_deleted(
         )
         assert reclaimed["id"] == renamed["id"]
         assert reclaimed["name"] == "Reclaimed empty copy"
-        assert (root / "data" / "libraries" / reclaimed["id"]).is_dir()
+        assert database_type_registry.data_dir(
+            manager.data_dir, DatabaseRef(LIVINGMEMORY_V8_TYPE, reclaimed["id"])
+        ).is_dir()
     finally:
         await manager.close()
 
@@ -1370,7 +1454,7 @@ async def test_deleted_library_id_can_be_recreated(
         lambda config: FakeProvider(config),
     )
     monkeypatch.setattr(
-        "personalityrag.libraries.build_provider",
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider",
         lambda config: FakeProvider(config),
     )
 
@@ -1388,7 +1472,9 @@ async def test_deleted_library_id_can_be_recreated(
 
         deleted = await manager.delete_library("test_import")
         assert deleted["library_id"] == "test_import"
-        assert not (root / "data" / "libraries" / "test_import").exists()
+        assert not database_type_registry.data_dir(
+            manager.data_dir, DatabaseRef(LIVINGMEMORY_V8_TYPE, "test_import")
+        ).exists()
 
         recreated = await manager.create_library(
             {
@@ -1399,7 +1485,9 @@ async def test_deleted_library_id_can_be_recreated(
         )
         assert recreated["id"] == "test_import"
         assert recreated["name"] == "重新创建的测试导入库"
-        assert (root / "data" / "libraries" / "test_import").exists()
+        assert database_type_registry.data_dir(
+            manager.data_dir, DatabaseRef(LIVINGMEMORY_V8_TYPE, "test_import")
+        ).exists()
     finally:
         await manager.close()
 
@@ -1415,7 +1503,7 @@ async def test_recreate_library_id_after_legacy_index_generation_schema_upgrade(
         lambda config: FakeProvider(config),
     )
     monkeypatch.setattr(
-        "personalityrag.libraries.build_provider",
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider",
         lambda config: FakeProvider(config),
     )
 
@@ -1482,7 +1570,9 @@ async def test_provider_switch_is_atomic_and_failed_switch_preserves_binding(
         return FakeProvider(config)
 
     monkeypatch.setattr("personalityrag.service.build_provider", factory)
-    monkeypatch.setattr("personalityrag.libraries.build_provider", factory)
+    monkeypatch.setattr(
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider", factory
+    )
     manager = LibraryManager(root, AppConfig(provider=provider_config))
     await manager.initialize()
     try:
@@ -1612,7 +1702,9 @@ async def test_queries_keep_using_old_snapshot_during_provider_rebuild(
         return SlowProvider(config) if config.model == "slow" else FakeProvider(config)
 
     monkeypatch.setattr("personalityrag.service.build_provider", factory)
-    monkeypatch.setattr("personalityrag.libraries.build_provider", factory)
+    monkeypatch.setattr(
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider", factory
+    )
     manager = LibraryManager(root, AppConfig(provider=provider_config))
     await manager.initialize()
     try:
@@ -1676,11 +1768,11 @@ async def test_runtime_residency_keeps_default_and_evicts_non_default_lru(
                 }
             )
 
-        assert set(manager.runtimes) == {"Default", "second", "third"}
-        assert manager.runtimes["Default"] is not None
+        assert {ref.id for ref in manager.runtimes} == {"Default", "second", "third"}
+        assert manager.runtimes[DatabaseRef(LIVINGMEMORY_V8_TYPE, "Default")] is not None
 
         await manager.get_runtime("first")
-        assert set(manager.runtimes) == {"Default", "first", "third"}
+        assert {ref.id for ref in manager.runtimes} == {"Default", "first", "third"}
     finally:
         await manager.close()
 
@@ -1709,13 +1801,13 @@ async def test_runtime_residency_lease_allows_temporary_overflow_then_converges(
             {"id": "waiting", "name": "waiting", "provider_id": provider.id}
         )
 
-        assert set(manager.runtimes) == {"Default", "held", "waiting"}
-        assert manager.runtime_residency_status()["runtimes"]["held"][
+        assert {ref.id for ref in manager.runtimes} == {"Default", "held", "waiting"}
+        assert manager.runtime_residency_status()["runtimes"]["livingmemory_v8:held"][
             "lease_count"
         ] == 1
 
         await manager.release_runtime("held")
-        non_default = set(manager.runtimes) - {"Default"}
+        non_default = {ref.id for ref in manager.runtimes} - {"Default"}
         assert len(non_default) == 1
     finally:
         await manager.close()
@@ -1746,12 +1838,12 @@ async def test_job_runtime_lease_is_acquired_only_during_execution(
         await manager.create_library(
             {"id": "worker", "name": "worker", "provider_id": provider.id}
         )
-        assert set(manager.runtimes) == {"Default", "held", "worker"}
+        assert {ref.id for ref in manager.runtimes} == {"Default", "held", "worker"}
         observed: list[int] = []
 
         async def operation(progress):
             observed.append(
-                manager.runtime_residency_status()["runtimes"]["worker"][
+                manager.runtime_residency_status()["runtimes"]["livingmemory_v8:worker"][
                     "lease_count"
                 ]
             )
@@ -1768,7 +1860,7 @@ async def test_job_runtime_lease_is_acquired_only_during_execution(
 
         assert result["status"] == "completed"
         assert observed == [1]
-        assert set(manager.runtimes) == {"Default", "held"}
+        assert {ref.id for ref in manager.runtimes} == {"Default", "held"}
         await manager.release_runtime("held")
     finally:
         await manager.close()
@@ -1810,14 +1902,15 @@ async def test_runtime_hot_limit_and_idle_reload_preserve_recall_results(
 
         config.runtime_residency.max_non_default_runtimes = 1
         await manager.apply_runtime_residency()
-        assert len(set(manager.runtimes) - {"Default"}) == 1
+        assert len({ref.id for ref in manager.runtimes} - {"Default"}) == 1
 
-        if "recall" not in manager.runtimes:
+        recall_ref = DatabaseRef(LIVINGMEMORY_V8_TYPE, "recall")
+        if recall_ref not in manager.runtimes:
             runtime = await manager.get_runtime("recall")
-        manager._runtime_residency["recall"].last_used_at -= 120
+        manager._runtime_residency[recall_ref].last_used_at -= 120
         assert await manager.sweep_runtimes() == ["recall"]
-        assert "recall" not in manager.runtimes
-        assert "Default" in manager.runtimes
+        assert recall_ref not in manager.runtimes
+        assert DatabaseRef(LIVINGMEMORY_V8_TYPE, "Default") in manager.runtimes
 
         reloaded = await manager.get_runtime("recall")
         after = await reloaded.retrieval.search("贝雷特 星辰", 5)

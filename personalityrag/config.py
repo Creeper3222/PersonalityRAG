@@ -10,6 +10,18 @@ from urllib.parse import urlsplit
 
 
 DEFAULT_ACCESS_BASE_URL = "http://127.0.0.1"
+DEFAULT_PUBLIC_ADAPTER_URL = ""
+LOOPBACK_BIND_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def normalize_bind_host(value: str | None) -> str:
+    host = str(value or "127.0.0.1").strip().lower()
+    if host not in LOOPBACK_BIND_HOSTS:
+        raise ValueError(
+            "host must be a loopback address; expose adapter access through "
+            "an HTTPS reverse proxy"
+        )
+    return host
 
 
 def normalize_access_base_url(value: str | None) -> str:
@@ -37,6 +49,43 @@ def normalize_access_base_url(value: str | None) -> str:
 
 def build_access_url(base_url: str, port: int) -> str:
     return f"{normalize_access_base_url(base_url)}:{port}/"
+
+
+def normalize_public_adapter_url(value: str | None) -> str:
+    raw = (value or DEFAULT_PUBLIC_ADAPTER_URL).strip().rstrip("/")
+    if not raw:
+        return DEFAULT_PUBLIC_ADAPTER_URL
+    parsed = urlsplit(raw)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError("public_adapter_url must be an https URL origin")
+    if parsed.username or parsed.password:
+        raise ValueError("public_adapter_url must not include credentials")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("public_adapter_url has an invalid port") from exc
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise ValueError(
+            "public_adapter_url must not include a path, query, or fragment"
+        )
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    port_suffix = f":{port}" if port is not None else ""
+    return f"https://{host}{port_suffix}"
+
+
+def build_adapter_connection_url(
+    config: "AppConfig",
+    *,
+    access_port: int | None = None,
+) -> str:
+    if config.public_adapter_url:
+        return normalize_public_adapter_url(config.public_adapter_url)
+    return build_access_url(
+        config.access_base_url,
+        access_port if access_port is not None else config.access_port,
+    ).rstrip("/")
 
 
 @dataclass(slots=True)
@@ -92,6 +141,11 @@ class RecallConfig:
     score_beta: float = 0.25
     score_gamma: float = 0.25
     importance_weight: float = 1.0
+    min_importance_for_retrieval: float = 0.0
+    min_similarity_for_retrieval: float = 0.0
+    recent_memory_count: int = 2
+    recent_memory_max_age_hours: int = 72
+    memory_type_filter: str = "all"
     mmr_lambda: float = 0.7
     graph_memory_enabled: bool = True
     document_route_weight: float = 0.65
@@ -118,8 +172,10 @@ class MaintenanceConfig:
     atom_forget_delay_days: float = 7.0
     atom_purge_delay_days: float = 30.0
     auto_cleanup_enabled: bool = False
+    auto_archived_enabled: bool = False
     cleanup_days_threshold: int = 7
     cleanup_importance_threshold: float = 0.3
+    protected_importance_threshold: float = 1.0
     backup_enabled: bool = True
     backup_keep_days: int = 7
 
@@ -154,6 +210,7 @@ class AppConfig:
     version: int = 1
     host: str = "127.0.0.1"
     access_base_url: str = DEFAULT_ACCESS_BASE_URL
+    public_adapter_url: str = DEFAULT_PUBLIC_ADAPTER_URL
     port: int = 8765
     access_port: int = 8766
     api_key: str = field(default_factory=lambda: f"prag_{secrets.token_urlsafe(32)}")
@@ -228,6 +285,7 @@ def load_config(path: Path) -> AppConfig:
             "version",
             "host",
             "access_base_url",
+            "public_adapter_url",
             "port",
             "access_port",
             "api_key",
@@ -261,7 +319,11 @@ def load_config(path: Path) -> AppConfig:
         config.session_secret = secrets.token_urlsafe(48)
     if not config.library_psk_secret:
         config.library_psk_secret = secrets.token_urlsafe(48)
+    config.host = normalize_bind_host(config.host)
     config.access_base_url = normalize_access_base_url(config.access_base_url)
+    config.public_adapter_url = normalize_public_adapter_url(
+        config.public_adapter_url
+    )
     save_config(path, config)
     return config
 
@@ -284,6 +346,7 @@ def app_config_from_dict(
             "version",
             "host",
             "access_base_url",
+            "public_adapter_url",
             "port",
             "access_port",
             "api_key",
@@ -315,7 +378,11 @@ def app_config_from_dict(
         config.session_secret = secrets.token_urlsafe(48)
     if not config.library_psk_secret:
         config.library_psk_secret = secrets.token_urlsafe(48)
+    config.host = normalize_bind_host(config.host)
     config.access_base_url = normalize_access_base_url(config.access_base_url)
+    config.public_adapter_url = normalize_public_adapter_url(
+        config.public_adapter_url
+    )
     return config
 
 
