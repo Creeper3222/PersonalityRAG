@@ -175,7 +175,7 @@ class ControlStore:
     async def close(self) -> None:
         await self.pool.close()
 
-    async def initialize(self, seed_provider: ProviderConfig) -> None:
+    async def initialize(self, seed_provider: ProviderConfig | None) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         db = await self.connect()
         try:
@@ -451,7 +451,8 @@ class ControlStore:
             await db.commit()
         finally:
             await db.close()
-        await self.seed_provider(seed_provider)
+        if seed_provider is not None:
+            await self.seed_provider(seed_provider)
 
     async def _provider_exists_any(self, provider_id: str) -> bool:
         db = await self.connect()

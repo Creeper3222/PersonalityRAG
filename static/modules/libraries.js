@@ -1190,20 +1190,28 @@ function libraryMaintenanceFromForm() {
 function openLibraryModal(library = null, databaseType = DEFAULT_DATABASE_TYPE) {
   const hasAdapters = Boolean((library?.adapter_connections || []).length);
   const idLocked = hasAdapters;
+  const firstLivingMemoryLibrary = !library
+    && databaseType === DEFAULT_DATABASE_TYPE
+    && !state.databases.some((item) => (
+      (item.database_type || DEFAULT_DATABASE_TYPE) === DEFAULT_DATABASE_TYPE
+    ));
   $("library-original-id").value = library?.id || "";
   $("library-database-type").value = library?.database_type || databaseType;
-  $("library-id").value = library?.id || "";
+  $("library-id").value = library?.id || (firstLivingMemoryLibrary ? "Default" : "");
   $("library-id").readOnly = idLocked;
   $("library-id").classList.toggle("readonly-lock", idLocked);
   $("library-id").setAttribute("aria-readonly", idLocked ? "true" : "false");
   $("library-id-readonly-note").textContent = t("adapterProtectedLibrary");
   $("library-id-readonly-note").classList.toggle("hidden", !idLocked);
-  $("library-name").value = library?.name || "";
+  $("library-name").value = library?.name || (firstLivingMemoryLibrary ? "Default" : "");
   $("library-description").value = library?.description || "";
   $("library-persona").value = library?.default_persona_id || "";
   fillLibrarySettingsFields(library);
   $("library-provider-field").classList.remove("hidden");
-  fillProviderSelect($("library-provider"), library?.provider_id, "embedding");
+  fillProviderSelect($("library-provider"), library?.provider_id, "embedding", {
+    requireExplicit: !library,
+    emptyLabel: t("selectEmbeddingProvider"),
+  });
   fillProviderSelect(
     $("library-rerank-provider"),
     library?.rerank_provider_id || library?.rerank_provider?.id || "",

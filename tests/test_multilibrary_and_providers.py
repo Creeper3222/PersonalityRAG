@@ -130,6 +130,47 @@ async def test_new_install_uses_Default_and_existing_default_is_preserved(
 
 
 @pytest.mark.asyncio
+async def test_fresh_release_waits_for_explicit_provider_and_first_library(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "PersonalityRAG"
+    config = AppConfig(bootstrap_provider_enabled=False)
+    _patch_fake_providers(monkeypatch)
+
+    manager = LibraryManager(root, config)
+    await manager.initialize()
+    try:
+        assert await manager.control.list_providers() == []
+        assert await manager.control.list_libraries() == []
+
+        provider = await manager.create_provider(
+            {
+                "id": "explicit_embedding",
+                "display_name": "Explicit Embedding",
+                "type": "vllm_embedding",
+                "enabled": True,
+                "api_base": "http://127.0.0.1:8001/v1",
+                "model": "fixture-model",
+                "dimensions": 8,
+            }
+        )
+        library = await manager.create_library(
+            {
+                "id": "Default",
+                "name": "Default",
+                "provider_id": provider["id"],
+            }
+        )
+
+        assert library["id"] == "Default"
+        assert library["name"] == "Default"
+        assert library["is_default"] is True
+        assert (await manager.control.default_library()).id == "Default"
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_vllm_resolves_served_model_and_never_sends_dimensions():
     requests: list[dict] = []
 
@@ -1085,7 +1126,7 @@ async def test_legacy_data_migrates_to_Default_and_libraries_are_isolated(
     await manager.initialize()
     try:
         default = await manager.library_detail("Default")
-        assert default["name"] == "贝雷特"
+        assert default["name"] == "Default"
         assert default["stats"]["total_memories"] == 1
         assert not (data / "livingmemory.db").exists()
         assert (
@@ -1349,14 +1390,14 @@ async def test_library_copy_uses_numbered_fallback_after_soft_delete(
         first = await manager.copy_library("Default")
         second = await manager.copy_library("Default")
         assert first["id"] == "Default_copy"
-        assert first["name"] == "贝雷特(副本)"
+        assert first["name"] == "Default(副本)"
         assert second["id"] == "Default_copy2"
-        assert second["name"] == "贝雷特(副本2)"
+        assert second["name"] == "Default(副本2)"
 
         await manager.delete_library(first["id"])
         third = await manager.copy_library("Default")
         assert third["id"] == "Default_copy3"
-        assert third["name"] == "贝雷特(副本3)"
+        assert third["name"] == "Default(副本3)"
         assert not database_type_registry.data_dir(
             manager.data_dir, DatabaseRef(LIVINGMEMORY_V8_TYPE, first["id"])
         ).exists()

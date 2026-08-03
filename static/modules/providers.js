@@ -831,11 +831,11 @@ function fillProviderSelect(select, selectedId = "", kind = "embedding", options
     (provider) => providerKindOf(provider) === kind
       && (provider.enabled || provider.id === selectedId),
   );
-  const allowEmpty = Boolean(options.optional);
+  const allowEmpty = Boolean(options.optional || options.requireExplicit);
   const resolvedSelectedId = candidates.some((provider) => provider.id === selectedId)
     ? selectedId
     : (allowEmpty ? "" : (candidates[0]?.id || ""));
-  select.disabled = candidates.length === 0 && !allowEmpty;
+  select.disabled = candidates.length === 0 && Boolean(options.optional);
   const optionRows = candidates
     .map(
       (provider) => `<option value="${escapeHtml(provider.id)}" ${provider.id === resolvedSelectedId ? "selected" : ""}>${escapeHtml(provider.display_name)} · ${escapeHtml(provider.model)}</option>`,

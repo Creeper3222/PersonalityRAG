@@ -42,7 +42,7 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
                 if os.environ.get(warning_key):
                     logger.warning(os.environ[warning_key])
             await context.manager.initialize()
-            logger.info("服务初始化完成：默认记忆库与模型提供商已加载")
+            logger.info("服务初始化完成：数据库目录与模型提供商目录已加载")
             yield
         finally:
             logger.info("服务正在关闭：释放记忆库 runtime 与模型提供商连接")

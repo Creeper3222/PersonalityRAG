@@ -285,6 +285,7 @@ const enUS = {
   "pendingRebuild": "Pending rebuild · {libraries}",
   "stillUsesRevision": "{library} still uses r{revision}",
   "noProviders": "No model providers",
+  "selectEmbeddingProvider": "Select an embedding provider",
   "libraryId": "Library ID",
   "invalidIdentifier": "IDs may only use [a-zA-Z0-9_-] characters.",
   "displayName": "Display name",

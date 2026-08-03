@@ -1013,6 +1013,22 @@ def test_acceptance_runner_is_not_bound_to_live_library_paths() -> None:
     assert 'result["provider_editor"]["type_cards"] >= 3' in source
 
 
+def test_first_library_form_uses_neutral_defaults_and_explicit_provider_choice() -> None:
+    index = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
+    libraries = (STATIC_ROOT / "modules" / "libraries.js").read_text(
+        encoding="utf-8"
+    )
+    providers = (STATIC_ROOT / "modules" / "providers.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'id="library-name" required placeholder="Default"' in index
+    assert 'firstLivingMemoryLibrary ? "Default" : ""' in libraries
+    assert "requireExplicit: !library" in libraries
+    assert "options.optional || options.requireExplicit" in providers
+    assert "例如 贝雷特" not in index
+
+
 def test_memory_persona_editor_is_separate_from_content_editor() -> None:
     source = (STATIC_ROOT / "modules" / "memories.js").read_text(
         encoding="utf-8"

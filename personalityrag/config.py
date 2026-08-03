@@ -218,6 +218,10 @@ class AppConfig:
     library_psk_secret: str = field(default_factory=lambda: secrets.token_urlsafe(48))
     webui_password_hash: str = ""
     provider: ProviderConfig = field(default_factory=ProviderConfig)
+    # Compatibility bridge for installs created before providers moved into the
+    # control database.  Direct AppConfig users keep the historical seed
+    # behaviour, while a genuinely new config file disables it explicitly.
+    bootstrap_provider_enabled: bool = field(default=True, repr=False)
     recall: RecallConfig = field(default_factory=RecallConfig)
     maintenance: MaintenanceConfig = field(default_factory=MaintenanceConfig)
     conversation: ConversationConfig = field(default_factory=ConversationConfig)
@@ -273,7 +277,7 @@ def _normalize_runtime_residency(config: AppConfig) -> None:
 
 def load_config(path: Path) -> AppConfig:
     if not path.exists():
-        config = AppConfig()
+        config = AppConfig(bootstrap_provider_enabled=False)
         save_config(path, config)
         return config
     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -295,6 +299,7 @@ def load_config(path: Path) -> AppConfig:
         }
     }
     provider_raw = dict(raw.get("provider") or {})
+    top["bootstrap_provider_enabled"] = bool(provider_raw)
     if provider_raw.get("type") == "openai_compatible":
         # v0.1.0 初版的 openai_compatible 实际实现的是 vLLM 语义：
         # 不发送 dimensions，并自动对齐 served-model-name。
@@ -356,6 +361,7 @@ def app_config_from_dict(
         }
     }
     provider_raw = dict(payload.get("provider") or {})
+    top["bootstrap_provider_enabled"] = bool(provider_raw)
     if provider_raw.get("type") == "openai_compatible":
         provider_raw["type"] = "vllm_embedding"
     top["provider"] = _merge_dataclass(ProviderConfig, provider_raw)
@@ -389,8 +395,12 @@ def app_config_from_dict(
 def save_config(path: Path, config: AppConfig) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(".tmp")
+    payload = asdict(config)
+    payload.pop("bootstrap_provider_enabled", None)
+    if not config.bootstrap_provider_enabled:
+        payload.pop("provider", None)
     temp.write_text(
-        json.dumps(asdict(config), ensure_ascii=False, indent=2),
+        json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     temp.replace(path)

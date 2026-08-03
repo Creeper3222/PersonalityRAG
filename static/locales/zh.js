@@ -436,6 +436,7 @@ const zhCN = {
   "pendingRebuild": "待重建 · {libraries}",
   "stillUsesRevision": "{library} 仍使用 r{revision}",
   "noProviders": "暂无模型提供商",
+  "selectEmbeddingProvider": "请选择嵌入模型提供商",
   "libraryId": "记忆库 ID",
   "invalidIdentifier": "只能使用[a-zA-Z0-9_-]中的字符来命名ID",
   "displayName": "显示名称",

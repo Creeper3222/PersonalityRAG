@@ -160,6 +160,7 @@ def _safe_member(name: str) -> str:
 def _global_config_payload(config: AppConfig) -> dict[str, Any]:
     payload = asdict(config)
     payload.pop("provider", None)
+    payload.pop("bootstrap_provider_enabled", None)
     return payload
 
 
@@ -976,7 +977,14 @@ async def import_prag_package(
             _load_json,
             extract_dir / "config" / "global.json",
         )
-        next_config = app_config_from_dict(global_config, provider=config.provider)
+        next_config = app_config_from_dict(
+            global_config,
+            provider=(
+                config.provider
+                if config.bootstrap_provider_enabled
+                else None
+            ),
+        )
         provider_snapshot = None
         if scope.get("include_providers"):
             provider_snapshot = await run_blocking(

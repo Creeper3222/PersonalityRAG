@@ -283,6 +283,7 @@ const ruRU = {
   "pendingRebuild": "Ожидает перестройки · {libraries}",
   "stillUsesRevision": "{library} использует r{revision}",
   "noProviders": "Нет провайдеров моделей",
+  "selectEmbeddingProvider": "Выберите провайдера эмбеддингов",
   "libraryId": "ID библиотеки",
   "invalidIdentifier": "Для ID допускаются только символы [a-zA-Z0-9_-].",
   "displayName": "Отображаемое имя",

@@ -55,7 +55,7 @@ from ...task_control import JobControlSignal, JobInterrupted
 
 
 DEFAULT_LIBRARY_ID = "Default"
-DEFAULT_LIBRARY_NAME = "贝雷特"
+DEFAULT_LIBRARY_NAME = DEFAULT_LIBRARY_ID
 LEGACY_ITEMS = (
     "livingmemory.db",
     "conversations.db",
@@ -157,7 +157,12 @@ class LivingMemoryV8Manager:
         default_library_id = DEFAULT_LIBRARY_ID
         self._initializing = True
         try:
-            await self.control.initialize(self.config.provider)
+            seed_config = (
+                self.config.provider
+                if self.config.bootstrap_provider_enabled
+                else None
+            )
+            await self.control.initialize(seed_config)
             self.jobs = JobManager(
                 self.control,
                 runtime_lease_factory=self.runtime_lease,
@@ -171,18 +176,31 @@ class LivingMemoryV8Manager:
                 self.task_database_state,
                 database_type=LIVINGMEMORY_V8_TYPE,
             )
-            seed = await self.control.get_provider(self.config.provider.id)
-            if not seed:
-                raise RuntimeError("默认 Provider 初始化失败")
-            logger.info(
-                "系统 Provider 已加载：provider=%s revision=%s",
-                seed.provider_id,
-                seed.revision,
+            seed = (
+                await self.control.get_provider(seed_config.id)
+                if seed_config is not None
+                else None
             )
+            if seed_config is not None and not seed:
+                raise RuntimeError("默认 Provider 初始化失败")
+            if seed is not None:
+                logger.info(
+                    "系统 Provider 已加载：provider=%s revision=%s",
+                    seed.provider_id,
+                    seed.revision,
+                )
             migration = await self._migrate_legacy_layout()
             try:
                 default_library = await self.control.default_library()
             except RuntimeError:
+                if seed is None:
+                    self._default_library_id = DEFAULT_LIBRARY_ID
+                    self._start_runtime_sweeper()
+                    logger.info(
+                        "全新安装未创建默认 Provider 或记忆库，等待用户完成首次配置"
+                    )
+                    self._initializing = False
+                    return
                 default_library = await self.control.ensure_default_library(
                     library_id=DEFAULT_LIBRARY_ID,
                     name=DEFAULT_LIBRARY_NAME,
@@ -1524,6 +1542,11 @@ class LivingMemoryV8Manager:
         }
         record = await self.control.create_library(payload, provider)
         try:
+            try:
+                await self.control.default_library()
+            except RuntimeError:
+                record = await self.control.set_default_library(record.id)
+                self._default_library_id = record.id
             await self.get_runtime(record.id)
             logger.info(
                 "新记忆库创建完成，索引保持待构建：memory_store_id=%s provider=%s revision=%s",

@@ -16,6 +16,7 @@ from personalityrag.config import (
     AppConfig,
     build_access_url,
     build_adapter_connection_url,
+    load_config,
     normalize_access_base_url,
     normalize_bind_host,
     normalize_public_adapter_url,
@@ -110,6 +111,20 @@ def test_core_listener_host_is_loopback_only():
         normalize_bind_host("0.0.0.0")
     with pytest.raises(ValueError, match="loopback"):
         normalize_bind_host("192.168.1.10")
+
+
+def test_brand_new_config_does_not_persist_a_bootstrap_provider(tmp_path):
+    config_path = tmp_path / "config" / "config.json"
+
+    config = load_config(config_path)
+    persisted = config_path.read_text(encoding="utf-8")
+
+    assert config.bootstrap_provider_enabled is False
+    assert '"provider"' not in persisted
+    assert "bge-m3" not in persisted
+
+    reloaded = load_config(config_path)
+    assert reloaded.bootstrap_provider_enabled is False
 
 
 def test_faiss_thread_limit_defaults_to_eight_and_accepts_environment_override(
