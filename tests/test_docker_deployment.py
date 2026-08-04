@@ -20,6 +20,21 @@ from personalityrag.routes import auth_settings
 from personalityrag.schemas import SettingsUpdate
 
 
+def test_docker_release_defaults_match_runtime_version() -> None:
+    root = Path(__file__).resolve().parents[1]
+    from personalityrag.version import TAG_NAME
+
+    assert f"ARG PERSONALITYRAG_VERSION={TAG_NAME}" in (
+        root / "Dockerfile"
+    ).read_text(encoding="utf-8")
+    assert f"PERSONALITYRAG_VERSION: {TAG_NAME}" in (
+        root / "docker-compose.local.yml"
+    ).read_text(encoding="utf-8")
+    assert f'default="{TAG_NAME}"' in (
+        root / "tools" / "build_linux_release.py"
+    ).read_text(encoding="utf-8")
+
+
 def test_docker_load_config_enforces_network_without_seeding_provider(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

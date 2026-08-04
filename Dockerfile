@@ -29,7 +29,7 @@ CMD ["python", "-m", "pytest", "-q"]
 
 FROM base AS runtime
 
-ARG PERSONALITYRAG_VERSION=v0.1.1
+ARG PERSONALITYRAG_VERSION=v0.1.2
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="PersonalityRAG Linux" \
       org.opencontainers.image.version="${PERSONALITYRAG_VERSION}" \

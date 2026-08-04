@@ -71,7 +71,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path, default=Path.cwd())
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--tag", default="v0.1.0")
+    parser.add_argument("--tag", default="v0.1.2")
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--index-digest", required=True)
     parser.add_argument("--amd64-digest", required=True)

@@ -7,7 +7,7 @@ services:
       dockerfile: Dockerfile
       target: runtime
       args:
-        PERSONALITYRAG_VERSION: v0.1.1
+        PERSONALITYRAG_VERSION: v0.1.2
         VCS_REF: ${PERSONALITYRAG_VCS_REF:-development}
     image: personalityrag-linux:dev
     pull_policy: never
