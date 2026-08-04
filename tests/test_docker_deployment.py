@@ -26,6 +26,7 @@ def test_docker_release_defaults_match_runtime_version() -> None:
 
     dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
     assert f"ARG PERSONALITYRAG_VERSION={TAG_NAME}" in dockerfile
+    assert "https://deb.debian.org" in dockerfile
     assert "Acquire::Retries=3" in dockerfile
     assert f"PERSONALITYRAG_VERSION: {TAG_NAME}" in (
         root / "docker-compose.local.yml"

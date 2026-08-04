@@ -12,7 +12,8 @@ RUN python -m pip install --upgrade pip \
 
 FROM base AS test
 
-RUN apt-get -o Acquire::Retries=3 update \
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Retries=3 update \
     && apt-get -o Acquire::Retries=3 install -y --no-install-recommends git nodejs \
     && rm -rf /var/lib/apt/lists/*
 COPY requirements-dev.txt pyproject.toml ./
