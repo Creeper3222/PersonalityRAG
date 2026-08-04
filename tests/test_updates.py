@@ -308,6 +308,39 @@ def test_update_helper_pid_detection() -> None:
     assert update_helper._pid_is_running(2_147_483_647) is False
 
 
+def test_update_helper_forces_only_recorded_pid_after_graceful_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits = iter((False, True))
+    terminated: list[int] = []
+    monkeypatch.setattr(
+        update_helper,
+        "_wait_for_pid",
+        lambda pid, timeout: next(waits),
+    )
+    monkeypatch.setattr(
+        update_helper,
+        "_terminate_pid_tree",
+        terminated.append,
+    )
+
+    assert update_helper._stop_service_process(4321) == (True, True)
+    assert terminated == [4321]
+
+
+def test_update_helper_keeps_graceful_shutdown_on_fast_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(update_helper, "_wait_for_pid", lambda pid, timeout: True)
+    monkeypatch.setattr(
+        update_helper,
+        "_terminate_pid_tree",
+        lambda pid: pytest.fail("graceful exit must not be force-terminated"),
+    )
+
+    assert update_helper._stop_service_process(4321) == (True, False)
+
+
 def test_update_helper_loopback_health_ignores_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     class HealthHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802

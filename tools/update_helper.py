@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -25,6 +26,8 @@ MANAGED_FILES = (
 INCOMPLETE_STAGES = frozenset(
     {"prepared", "helper_started", "backing_up", "replacing", "starting_target", "checking_target"}
 )
+GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 75.0
+FORCED_SHUTDOWN_TIMEOUT_SECONDS = 15.0
 
 
 def _read(path: Path) -> dict[str, Any]:
@@ -79,6 +82,35 @@ def _pid_is_running(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def _terminate_pid_tree(pid: int) -> None:
+    """Terminate the exact service process after graceful shutdown expires."""
+    if not _pid_is_running(pid):
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+
+
+def _stop_service_process(pid: int) -> tuple[bool, bool]:
+    """Wait for normal shutdown, then force only the recorded service PID."""
+    if _wait_for_pid(pid, timeout=GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS):
+        return True, False
+    _terminate_pid_tree(pid)
+    return (
+        _wait_for_pid(pid, timeout=FORCED_SHUTDOWN_TIMEOUT_SECONDS),
+        True,
+    )
 
 
 def _copy_path(source: Path, target: Path) -> None:
@@ -205,7 +237,15 @@ def apply_transaction(transaction_file: Path) -> int:
     old_pid = int(payload["service_pid"])
     urls = [str(url) for url in payload.get("health_urls") or []]
     _write(transaction_file, payload, status="running", stage="helper_started", helper_pid=os.getpid())
-    if not _wait_for_pid(old_pid):
+    stopped, forced_shutdown = _stop_service_process(old_pid)
+    if forced_shutdown:
+        _write(
+            transaction_file,
+            payload,
+            stage="forcing_shutdown",
+            forced_shutdown=True,
+        )
+    if not stopped:
         _write(transaction_file, payload, status="failed", stage="waiting_for_shutdown", error="service did not stop")
         return 3
     target_process: subprocess.Popen[Any] | None = None

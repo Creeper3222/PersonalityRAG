@@ -107,15 +107,30 @@ async def serve_dual_ports(host: str, webui_port: int, access_port: int) -> None
         if webui_task.done():
             webui_task.result()
         access_task = asyncio.create_task(access_server.serve())
-        done, pending = await asyncio.wait(
+        done, _ = await asyncio.wait(
             {webui_task, access_task},
             return_when=asyncio.FIRST_COMPLETED,
         )
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
         for task in done:
             task.result()
+        # One listener finishing must ask the sibling listener to stop through
+        # Uvicorn's normal shutdown path.  Cancelling the sibling task here
+        # interrupts the shared WebUI lifespan while it is closing the job
+        # manager, which can leave the Python process alive after both sockets
+        # have already disappeared.  The detached update helper then waits for
+        # a PID that no longer serves health checks and eventually aborts the
+        # transaction.
+        request_shutdown()
+        results = await asyncio.gather(
+            webui_task,
+            access_task,
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(
+                result, asyncio.CancelledError
+            ):
+                raise result
     finally:
         app_module.set_process_shutdown_callback(None)
 
