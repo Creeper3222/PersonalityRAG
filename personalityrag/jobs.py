@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import inspect
 import json
 import time
@@ -16,6 +18,7 @@ from .database_types import (
     database_identity_fields,
     database_type_registry,
 )
+from .resource_quotas import resource_lane
 from . import library_types as _registered_database_types  # noqa: F401
 from .task_control import (
     JobExecutionContext,
@@ -43,6 +46,18 @@ JOB_HISTORY_DAYS = 30
 JOB_HISTORY_LIMIT = 1000
 PROGRESS_PERSIST_INTERVAL_SECONDS = 1.0
 SUBSCRIBER_QUEUE_SIZE = 1
+JOB_SUMMARY_COLUMNS = """id,library_id,database_type,database_id,kind,status,
+progress,message,error,
+CASE WHEN checkpoint IS NULL THEN NULL ELSE json_object(
+  'phase',json_extract(checkpoint,'$.phase'),
+  'completed_documents',json_extract(checkpoint,'$.completed_documents'),
+  'completed_graph_entries',json_extract(checkpoint,'$.completed_graph_entries'),
+  'total_documents',json_extract(checkpoint,'$.total_documents'),
+  'total_graph_entries',json_extract(checkpoint,'$.total_graph_entries'),
+  'saved_at',json_extract(checkpoint,'$.saved_at')
+) END AS checkpoint,
+status_reason,control_requested,resumable,started_at,finished_at,attempt_count,
+created_at,updated_at"""
 
 ProgressCallback = Callable[[float, str], Awaitable[None]]
 JobOperation = Callable[[ProgressCallback], Awaitable[Any]]
@@ -770,7 +785,8 @@ class JobManager:
 
         async def execute() -> None:
             try:
-                result = await operation(progress)
+                with resource_lane("task"):
+                    result = await operation(progress)
                 await self._update(
                     job_id,
                     status="completed",
@@ -842,7 +858,8 @@ class JobManager:
                 error=None,
             )
             try:
-                result = await operation.run(context)
+                with resource_lane("task"):
+                    result = await operation.run(context)
                 async with self._transition_locks.setdefault(job_id, asyncio.Lock()):
                     await context.control_point()
                     await self._update(
@@ -857,7 +874,8 @@ class JobManager:
                     )
                 if operation.finalize_completed:
                     try:
-                        await operation.finalize_completed(context)
+                        with resource_lane("task"):
+                            await operation.finalize_completed(context)
                     except Exception:
                         logger.exception(
                             "已完成任务的断点工作区清理失败：job_id=%s", job_id
@@ -920,7 +938,8 @@ class JobManager:
             except Exception as exc:
                 logger.exception("可恢复任务失败，开始回滚：job_id=%s", job_id)
                 try:
-                    await operation.rollback(context)
+                    with resource_lane("task"):
+                        await operation.rollback(context)
                 except Exception as rollback_exc:
                     logger.exception("任务失败后的回滚也失败：job_id=%s", job_id)
                     await self._update(
@@ -954,7 +973,8 @@ class JobManager:
             message="正在回滚到任务执行前状态",
         )
         try:
-            await operation.rollback(context)
+            with resource_lane("task"):
+                await operation.rollback(context)
         except Exception as exc:
             logger.exception("停止任务回滚失败：job_id=%s", job_id)
             await self._update(
@@ -1166,6 +1186,13 @@ class JobManager:
             if snapshot is None:
                 return
             self._snapshots[job_id] = snapshot
+        updates = {
+            key: value
+            for key, value in updates.items()
+            if snapshot.get(key) != value
+        }
+        if not updates:
+            return
         previous_status = str(snapshot.get("status") or "")
         next_status = str(updates.get("status") or previous_status)
         now = time.time()
@@ -1211,6 +1238,10 @@ class JobManager:
         should_persist = (
             terminal
             or status_changed
+            or bool(
+                {"checkpoint", "control_requested", "status_reason"}
+                & updates.keys()
+            )
             or now - self._last_persisted_at.get(job_id, 0) >= PROGRESS_PERSIST_INTERVAL_SECONDS
         )
         persisted = False
@@ -1470,9 +1501,78 @@ class JobManager:
             await execution_done.wait()
         return payload
 
-    async def list(self, *, scope: str = "active") -> list[dict[str, Any]]:
+    @staticmethod
+    def _summary_source(payload: dict[str, Any]) -> dict[str, Any]:
+        fields = {
+            "id",
+            "database_resource_key",
+            "database_type",
+            "database_id",
+            "kind",
+            "status",
+            "progress",
+            "message",
+            "error",
+            "checkpoint",
+            "status_reason",
+            "control_requested",
+            "resumable",
+            "started_at",
+            "finished_at",
+            "attempt_count",
+            "created_at",
+            "updated_at",
+        }
+        result = {key: payload.get(key) for key in fields}
+        checkpoint = payload.get("checkpoint")
+        if isinstance(checkpoint, dict):
+            result["checkpoint"] = {
+                key: checkpoint.get(key)
+                for key in (
+                    "phase",
+                    "completed_documents",
+                    "completed_graph_entries",
+                    "total_documents",
+                    "total_graph_entries",
+                    "saved_at",
+                )
+                if key in checkpoint
+            }
+        return result
+
+    @staticmethod
+    def _encode_page_cursor(offset: int) -> str:
+        return base64.urlsafe_b64encode(str(max(0, offset)).encode("ascii")).decode(
+            "ascii"
+        ).rstrip("=")
+
+    @staticmethod
+    def _decode_page_cursor(cursor: str | None) -> int:
+        if not cursor:
+            return 0
+        try:
+            padded = cursor + "=" * (-len(cursor) % 4)
+            raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("ascii")
+            offset = int(raw)
+        except (ValueError, UnicodeError, binascii.Error) as exc:
+            raise ValueError("invalid job cursor") from exc
+        if offset < 0:
+            raise ValueError("invalid job cursor")
+        return offset
+
+    async def list_page(
+        self,
+        *,
+        scope: str = "active",
+        limit: int | None = None,
+        cursor: str | None = None,
+        include_details: bool = False,
+    ) -> tuple[list[dict[str, Any]], str | None]:
         if scope not in {"active", "finished", "all"}:
             raise ValueError("invalid job scope")
+        if limit is not None and not 1 <= int(limit) <= 200:
+            raise ValueError("job limit must be between 1 and 200")
+        offset = self._decode_page_cursor(cursor)
         statuses = ACTIVE_STATUSES if scope == "active" else TERMINAL_STATUSES
         where = ""
         params: tuple[Any, ...] = ()
@@ -1480,9 +1580,42 @@ class JobManager:
             placeholders = ",".join("?" for _ in statuses)
             where = f"WHERE status IN ({placeholders})"
             params = tuple(sorted(statuses))
+        if limit is not None and scope == "finished":
+            page_size = int(limit)
+            async with self._connect() as db:
+                rows = await (
+                    await db.execute(
+                        f"SELECT {'*' if include_details else JOB_SUMMARY_COLUMNS} "
+                        f"FROM jobs {where} "
+                        "ORDER BY updated_at DESC, id ASC LIMIT ? OFFSET ?",
+                        (*params, page_size + 1, offset),
+                    )
+                ).fetchall()
+            has_more = len(rows) > page_size
+            page = [self._decode_row(row) for row in rows[:page_size]]
+            for index, item in enumerate(page):
+                snapshot = self._snapshots.get(str(item.get("id") or ""))
+                if snapshot is not None:
+                    page[index] = (
+                        dict(snapshot)
+                        if include_details
+                        else self._summary_source(snapshot)
+                    )
+            return [
+                self._public_payload(item, detail=include_details)
+                for item in page
+            ], (
+                self._encode_page_cursor(offset + page_size)
+                if has_more
+                else None
+            )
         async with self._connect() as db:
             rows = await (
-                await db.execute(f"SELECT * FROM jobs {where}", params)
+                await db.execute(
+                    f"SELECT {'*' if include_details else JOB_SUMMARY_COLUMNS} "
+                    f"FROM jobs {where}",
+                    params,
+                )
             ).fetchall()
         merged = {str(row["id"]): self._decode_row(row) for row in rows}
         for job_id, snapshot in self._snapshots.items():
@@ -1491,12 +1624,26 @@ class JobManager:
                 continue
             if scope == "finished" and status not in TERMINAL_STATUSES:
                 continue
-            merged[job_id] = dict(snapshot)
+            merged[job_id] = (
+                dict(snapshot)
+                if include_details
+                else self._summary_source(snapshot)
+            )
         items = list(merged.values())
         if scope == "active":
-            items.sort(key=lambda item: float(item.get("created_at") or 0))
+            items.sort(
+                key=lambda item: (
+                    float(item.get("created_at") or 0),
+                    str(item.get("id") or ""),
+                )
+            )
         elif scope == "finished":
-            items.sort(key=lambda item: float(item.get("updated_at") or 0), reverse=True)
+            items.sort(
+                key=lambda item: (
+                    -float(item.get("updated_at") or 0),
+                    str(item.get("id") or ""),
+                )
+            )
         else:
             items.sort(
                 key=lambda item: (
@@ -1504,9 +1651,34 @@ class JobManager:
                     float(item.get("created_at") or 0)
                     if item.get("status") in ACTIVE_STATUSES
                     else -float(item.get("updated_at") or 0),
+                    str(item.get("id") or ""),
                 )
             )
-        return [self._public_payload(item) for item in items]
+        end = len(items) if limit is None else min(len(items), offset + int(limit))
+        page = items[offset:end]
+        next_cursor = (
+            self._encode_page_cursor(end) if end < len(items) else None
+        )
+        return [
+            self._public_payload(item, detail=include_details)
+            for item in page
+        ], next_cursor
+
+    async def list(
+        self,
+        *,
+        scope: str = "active",
+        limit: int | None = None,
+        cursor: str | None = None,
+        include_details: bool = True,
+    ) -> list[dict[str, Any]]:
+        items, _next_cursor = await self.list_page(
+            scope=scope,
+            limit=limit,
+            cursor=cursor,
+            include_details=include_details,
+        )
+        return items
 
     async def clear_finished(self) -> int:
         async with self._connect() as db:

@@ -39,6 +39,10 @@ from .migration import (
     validate_livingmemory_db_file,
 )
 from ...performance import measure_phase
+from ...resource_limits import (
+    effective_runtime_capacity,
+    effective_runtime_idle_minutes,
+)
 from ...providers import (
     build_provider,
     build_rerank_provider,
@@ -111,8 +115,12 @@ class LivingMemoryV8Manager:
         self._runtime_lock = asyncio.Lock()
         self._runtime_condition = asyncio.Condition(self._runtime_lock)
         self._runtime_residency: dict[DatabaseRef, RuntimeResidencyState] = {}
+        self._runtime_load_finalizers: set[asyncio.Task[None]] = set()
         self._default_library_id = DEFAULT_LIBRARY_ID
         self._runtime_sweeper_task: asyncio.Task[None] | None = None
+        self._default_prewarm_task: asyncio.Task[None] | None = None
+        self._runtime_loading_suspended = False
+        self._runtime_loading_owner: asyncio.Task[Any] | None = None
         self._closing = False
         self.jobs: JobManager | None = None
         self.resumable_tasks = ResumableMemoryStoreTasks(self)
@@ -216,18 +224,46 @@ class LivingMemoryV8Manager:
                     )
             default_library_id = default_library.id
             self._default_library_id = default_library_id
-            runtime = await self.get_runtime(default_library_id)
-            await self._reconcile_binding(runtime)
-            await self._validate_runtime(runtime)
-            runtime.start_background_index_check()
-            if migration:
-                self._commit_migration_marker(migration)
+            # Control-plane startup may return before the expensive Provider
+            # and FAISS runtime is warm. File-level operations still need a
+            # stable library root as soon as initialize() returns.
+            default_ref = DatabaseRef(LIVINGMEMORY_V8_TYPE, default_library_id)
+            default_dir = self._library_dir(default_library_id)
+            default_dir.mkdir(parents=True, exist_ok=True)
+            # A brand-new control record has no SQLite file yet. Materialize
+            # only the standard v8 schema before launching background prewarm
+            # so an immediate lightweight detail request cannot race the
+            # runtime's first DDL transaction. Existing databases stay
+            # untouched on this control-plane fast path.
+            if not (default_dir / "livingmemory.db").exists():
+                cold_storage = self._offline_storages.setdefault(
+                    default_ref,
+                    Storage(
+                        default_dir,
+                        system_path=self.system_path,
+                        initialize_system=False,
+                    ),
+                )
+                await cold_storage.initialize()
             self._start_runtime_sweeper()
-            logger.info(
-                "LivingMemoryV8Manager 初始化完成：default_memory_store=%s",
-                default_library_id,
-            )
+            if migration:
+                runtime = await self.get_runtime(default_library_id)
+                await self._reconcile_binding(runtime)
+                await self._validate_runtime(runtime)
+                runtime.start_background_index_check()
+                self._commit_migration_marker(migration)
+            else:
+                self._default_prewarm_task = asyncio.create_task(
+                    self._prewarm_default_runtime(default_library_id),
+                    name=f"personalityrag-default-prewarm-{default_library_id}",
+                )
             self._initializing = False
+            logger.info(
+                "LivingMemoryV8Manager 控制面初始化完成：default_memory_store=%s "
+                "runtime_prewarm=%s",
+                default_library_id,
+                "completed" if migration else "background",
+            )
         except Exception:
             self._initializing = False
             logger.exception("LivingMemoryV8Manager 初始化失败，准备回滚可能的迁移")
@@ -263,6 +299,13 @@ class LivingMemoryV8Manager:
 
     async def close(self) -> None:
         self._closing = True
+        if self._default_prewarm_task is not None:
+            self._default_prewarm_task.cancel()
+            await asyncio.gather(
+                self._default_prewarm_task,
+                return_exceptions=True,
+            )
+            self._default_prewarm_task = None
         if self._runtime_sweeper_task is not None:
             self._runtime_sweeper_task.cancel()
             await asyncio.gather(self._runtime_sweeper_task, return_exceptions=True)
@@ -274,6 +317,12 @@ class LivingMemoryV8Manager:
             task.cancel()
         if load_tasks:
             await asyncio.gather(*load_tasks, return_exceptions=True)
+            await asyncio.sleep(0)
+        if self._runtime_load_finalizers:
+            await asyncio.gather(
+                *list(self._runtime_load_finalizers),
+                return_exceptions=True,
+            )
         self._runtime_loads.clear()
         flights = list(self._provider_health_flights.values())
         for task in flights:
@@ -288,6 +337,74 @@ class LivingMemoryV8Manager:
         self._runtime_residency.clear()
         self._offline_storages.clear()
         await self.control.close()
+
+    async def _prewarm_default_runtime(self, library_id: str) -> None:
+        ref = DatabaseRef(LIVINGMEMORY_V8_TYPE, library_id)
+        try:
+            runtime = await self.get_runtime(ref, touch=False)
+            await self._reconcile_binding(runtime)
+            await self._validate_runtime(runtime)
+            runtime.start_background_index_check()
+            logger.info(
+                "默认记忆库后台预热完成：memory_store_id=%s",
+                library_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "默认记忆库后台预热失败，将在首次访问时重试：memory_store_id=%s",
+                library_id,
+            )
+            await self.unload_runtime(
+                ref,
+                reason="default_prewarm_failed",
+            )
+
+    async def _materialize_library_runtime(self, library_id: str) -> None:
+        """Finish a cold load before a file-level rename or copy."""
+
+        prewarm = self._default_prewarm_task
+        if library_id == self._default_library_id and prewarm is not None:
+            if prewarm is not asyncio.current_task() and not prewarm.done():
+                await asyncio.shield(prewarm)
+        await self.get_runtime(library_id, touch=False)
+
+    async def suspend_runtime_loading(
+        self,
+        *,
+        owner: asyncio.Task[Any] | None = None,
+    ) -> None:
+        """Block new cold loads and drain background/in-flight loads."""
+
+        async with self._runtime_condition:
+            self._runtime_loading_suspended = True
+            self._runtime_loading_owner = owner or asyncio.current_task()
+            self._runtime_condition.notify_all()
+        if self._default_prewarm_task is not None:
+            self._default_prewarm_task.cancel()
+            await asyncio.gather(
+                self._default_prewarm_task,
+                return_exceptions=True,
+            )
+            self._default_prewarm_task = None
+        while True:
+            async with self._runtime_lock:
+                loads = list(self._runtime_loads.values())
+            if not loads:
+                break
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in loads),
+                return_exceptions=True,
+            )
+            # Allow load finalizers to adopt or close the completed runtime.
+            await asyncio.sleep(0)
+
+    async def resume_runtime_loading(self) -> None:
+        async with self._runtime_condition:
+            self._runtime_loading_suspended = False
+            self._runtime_loading_owner = None
+            self._runtime_condition.notify_all()
 
     async def provider_status(
         self,
@@ -683,10 +800,11 @@ class LivingMemoryV8Manager:
 
     async def _runtime_sweeper_loop(self) -> None:
         while not self._closing:
-            idle_seconds = max(
-                60.0,
-                float(self.config.runtime_residency.idle_minutes) * 60.0,
+            idle_minutes = effective_runtime_idle_minutes(
+                self.config.runtime_residency.idle_minutes,
+                self.config.performance_profile,
             )
+            idle_seconds = max(60.0, float(idle_minutes) * 60.0)
             interval = min(
                 RUNTIME_SWEEP_MAX_INTERVAL_SECONDS,
                 max(5.0, idle_seconds / 2.0),
@@ -699,20 +817,14 @@ class LivingMemoryV8Manager:
             except Exception:
                 logger.exception("记忆库 runtime 空闲回收巡检失败")
 
-    async def _runtime_has_active_jobs(self, ref: DatabaseRef) -> bool:
-        return await self.control.has_running_jobs(ref.id)
-
-    async def _close_runtime_locked(
+    async def _close_runtime(
         self,
         ref: DatabaseRef,
+        runtime: PersonalityRAGService,
         *,
         reason: str,
         suppress_errors: bool = True,
     ) -> bool:
-        runtime = self.runtimes.pop(ref, None)
-        self._runtime_residency.pop(ref, None)
-        if runtime is None:
-            return False
         try:
             await runtime.close()
         except Exception:
@@ -731,40 +843,30 @@ class LivingMemoryV8Manager:
             )
         return True
 
-    async def _evict_lru_until_locked(
-        self, max_non_default: int, *, reason: str
-    ) -> list[str]:
-        evicted: list[str] = []
-        target = max(0, int(max_non_default))
-        while True:
-            non_default = [
-                ref for ref in self.runtimes if ref != self._default_database_ref()
-            ]
-            if len(non_default) <= target:
-                break
-            candidates = sorted(
-                non_default,
-                key=lambda item: (
-                    self._runtime_residency.get(
-                        item,
-                        RuntimeResidencyState(0, 0.0),
-                    ).last_used_at
-                ),
+    async def _pinned_runtime_refs(
+        self,
+        refs: list[DatabaseRef],
+    ) -> set[DatabaseRef]:
+        if not refs:
+            return set()
+        adapter_map = await self.control.active_database_adapter_connections_map(
+            refs
+        )
+        pinned = {ref for ref in refs if adapter_map.get(ref.key)}
+        if self.jobs is not None:
+            jobs = await asyncio.gather(
+                *(
+                    self.jobs.active_database_job(
+                        ref,
+                        include_read_only=True,
+                    )
+                    for ref in refs
+                )
             )
-            selected: DatabaseRef | None = None
-            for ref in candidates:
-                state = self._runtime_residency.get(ref)
-                if state is not None and state.lease_count > 0:
-                    continue
-                if await self._runtime_has_active_jobs(ref):
-                    continue
-                selected = ref
-                break
-            if selected is None:
-                break
-            await self._close_runtime_locked(selected, reason=reason)
-            evicted.append(selected.id)
-        return evicted
+            pinned.update(
+                ref for ref, job in zip(refs, jobs, strict=True) if job
+            )
+        return pinned
 
     async def _build_runtime(self, ref: DatabaseRef) -> PersonalityRAGService:
         library_id = ref.id
@@ -851,11 +953,21 @@ class LivingMemoryV8Manager:
                 return current
             task = self._runtime_loads.get(ref)
             if task is None:
+                if (
+                    self._runtime_loading_suspended
+                    and asyncio.current_task() is not self._runtime_loading_owner
+                ):
+                    raise RuntimeError(
+                        "runtime loading is temporarily suspended for maintenance"
+                    )
+                if self._closing:
+                    raise RuntimeError("LivingMemoryV8Manager is closing")
                 task = asyncio.create_task(
                     self._build_runtime(ref),
                     name=f"personalityrag-runtime-load-{ref.key}",
                 )
                 self._runtime_loads[ref] = task
+                self._track_runtime_load(ref, task)
         try:
             built = await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -877,15 +989,6 @@ class LivingMemoryV8Manager:
                     close_built = True
                 else:
                     close_built = False
-                    if ref != self._default_database_ref():
-                        limit = max(
-                            1,
-                            int(self.config.runtime_residency.max_non_default_runtimes),
-                        )
-                        await self._evict_lru_until_locked(
-                            limit - 1,
-                            reason="capacity",
-                        )
                     current = built
                     self.runtimes[ref] = current
                     self._runtime_residency[ref] = RuntimeResidencyState(
@@ -915,7 +1018,66 @@ class LivingMemoryV8Manager:
             if current is None:
                 raise RuntimeError("LivingMemoryV8Manager is closing")
         assert current is not None
+        # The load-finalizer can insert ``built`` before this waiter resumes.
+        # Capacity convergence is therefore required after every completed
+        # non-default cold load, not only when this coroutine was the inserter.
+        if ref != self._default_database_ref():
+            await self.sweep_runtimes(
+                expire_idle=False,
+                protect={ref},
+            )
         return current
+
+    def _track_runtime_load(
+        self,
+        ref: DatabaseRef,
+        task: asyncio.Task[PersonalityRAGService],
+    ) -> None:
+        def done(completed: asyncio.Task[PersonalityRAGService]) -> None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            finalizer = loop.create_task(
+                self._finalize_runtime_load(ref, completed),
+                name=f"personalityrag-runtime-finalize-{ref.key}",
+            )
+            self._runtime_load_finalizers.add(finalizer)
+            finalizer.add_done_callback(self._runtime_load_finalizers.discard)
+
+        task.add_done_callback(done)
+
+    async def _finalize_runtime_load(
+        self,
+        ref: DatabaseRef,
+        task: asyncio.Task[PersonalityRAGService],
+    ) -> None:
+        try:
+            built = task.result()
+        except BaseException:
+            async with self._runtime_condition:
+                if self._runtime_loads.get(ref) is task:
+                    self._runtime_loads.pop(ref, None)
+                self._runtime_condition.notify_all()
+            return
+        close_built = False
+        async with self._runtime_condition:
+            current = self.runtimes.get(ref)
+            owns_flight = self._runtime_loads.get(ref) is task
+            if owns_flight:
+                self._runtime_loads.pop(ref, None)
+            if current is None and owns_flight and not self._closing:
+                self.runtimes[ref] = built
+                self._runtime_residency[ref] = RuntimeResidencyState(
+                    lease_count=0,
+                    last_used_at=time.monotonic(),
+                )
+                logger.info("记忆库 runtime 已加载：database=%s", ref.key)
+            elif current is not built:
+                close_built = True
+            self._runtime_condition.notify_all()
+        if close_built:
+            await built.close()
 
     @staticmethod
     def _livingmemory_ref(
@@ -947,12 +1109,13 @@ class LivingMemoryV8Manager:
         database: str | DatabaseRef,
         *,
         database_type: str | None = None,
+        touch: bool = True,
     ) -> PersonalityRAGService:
         ref = self._livingmemory_ref(database, database_type)
         return await self._runtime_or_load(
             ref,
             acquire=False,
-            touch=True,
+            touch=touch,
         )
 
     async def acquire_runtime(
@@ -988,9 +1151,9 @@ class LivingMemoryV8Manager:
             non_default_count = sum(
                 database != self._default_database_ref() for database in self.runtimes
             )
-            limit = max(
-                1,
-                int(self.config.runtime_residency.max_non_default_runtimes),
+            limit = effective_runtime_capacity(
+                self.config.runtime_residency.max_non_default_runtimes,
+                self.config.performance_profile,
             )
             should_converge = state.lease_count == 0 and non_default_count > limit
             self._runtime_condition.notify_all()
@@ -1012,11 +1175,17 @@ class LivingMemoryV8Manager:
                 state := self._runtime_residency.get(ref)
             ) is not None and state.lease_count > 0:
                 await self._runtime_condition.wait()
-            return await self._close_runtime_locked(
-                ref,
-                reason=reason,
-                suppress_errors=False,
-            )
+            runtime = self.runtimes.pop(ref, None)
+            self._runtime_residency.pop(ref, None)
+            self._runtime_condition.notify_all()
+        if runtime is None:
+            return False
+        return await self._close_runtime(
+            ref,
+            runtime,
+            reason=reason,
+            suppress_errors=False,
+        )
 
     def debug_revision_generation_manifests(
         self, database_id: str
@@ -1132,49 +1301,81 @@ class LivingMemoryV8Manager:
                     )
             raise
 
-    async def sweep_runtimes(self, *, expire_idle: bool = True) -> list[str]:
-        evicted: list[str] = []
-        async with self._runtime_lock:
-            if expire_idle:
-                now = time.monotonic()
-                idle_seconds = (
-                    max(1, int(self.config.runtime_residency.idle_minutes)) * 60.0
-                )
-                candidates = sorted(
-                    (
-                        ref
-                        for ref in self.runtimes
-                        if ref != self._default_database_ref()
-                    ),
-                    key=lambda item: (
-                        self._runtime_residency.get(
-                            item,
-                            RuntimeResidencyState(0, 0.0),
-                        ).last_used_at
-                    ),
-                )
-                for ref in candidates:
-                    state = self._runtime_residency.get(ref)
-                    if state is None or state.lease_count > 0:
-                        continue
-                    if now - state.last_used_at < idle_seconds:
-                        continue
-                    if await self._runtime_has_active_jobs(ref):
-                        continue
-                    if await self._close_runtime_locked(
-                        ref,
-                        reason="idle",
-                    ):
-                        evicted.append(ref.id)
-            evicted.extend(
-                await self._evict_lru_until_locked(
-                    max(
-                        1,
-                        int(self.config.runtime_residency.max_non_default_runtimes),
-                    ),
-                    reason="capacity",
-                )
+    async def sweep_runtimes(
+        self,
+        *,
+        expire_idle: bool = True,
+        protect: set[DatabaseRef] | None = None,
+    ) -> list[str]:
+        protect = set(protect or ())
+        now = time.monotonic()
+        idle_seconds = (
+            effective_runtime_idle_minutes(
+                self.config.runtime_residency.idle_minutes,
+                self.config.performance_profile,
             )
+            * 60.0
+        )
+        capacity = effective_runtime_capacity(
+            self.config.runtime_residency.max_non_default_runtimes,
+            self.config.performance_profile,
+        )
+        default_ref = self._default_database_ref()
+        async with self._runtime_lock:
+            candidates = sorted(
+                (
+                    ref
+                    for ref, state in self._runtime_residency.items()
+                    if ref != default_ref
+                    and ref not in protect
+                    and state.lease_count == 0
+                ),
+                key=lambda ref: self._runtime_residency[ref].last_used_at,
+            )
+            non_default_count = sum(
+                ref != default_ref for ref in self.runtimes
+            )
+            idle_candidates = {
+                ref
+                for ref in candidates
+                if expire_idle
+                and now - self._runtime_residency[ref].last_used_at
+                >= idle_seconds
+            }
+        pinned = await self._pinned_runtime_refs(candidates)
+        selected: list[tuple[DatabaseRef, str]] = []
+        remaining = non_default_count
+        for ref in candidates:
+            if ref in pinned:
+                continue
+            if ref in idle_candidates:
+                selected.append((ref, "idle"))
+                remaining -= 1
+        for ref in candidates:
+            if remaining <= capacity:
+                break
+            if ref in pinned or any(item[0] == ref for item in selected):
+                continue
+            selected.append((ref, "capacity"))
+            remaining -= 1
+
+        evicted: list[str] = []
+        for ref, reason in selected:
+            async with self._runtime_condition:
+                state = self._runtime_residency.get(ref)
+                if state is None or state.lease_count > 0 or ref in protect:
+                    continue
+                runtime = self.runtimes.pop(ref, None)
+                self._runtime_residency.pop(ref, None)
+                self._runtime_condition.notify_all()
+            if runtime is None:
+                continue
+            if await self._close_runtime(
+                ref,
+                runtime,
+                reason=reason,
+            ):
+                evicted.append(ref.id)
         return evicted
 
     async def apply_runtime_residency(self) -> list[str]:
@@ -1630,6 +1831,7 @@ class LivingMemoryV8Manager:
                 or any(library_root.glob(f".{next_library_id}.copying-*"))
             ):
                 raise ValueError(f"记忆库 ID 已存在：{next_library_id}")
+            await self._materialize_library_runtime(record.id)
         if reload_runtime:
             await self.unload_runtime(record.id, reason="library_settings_changed")
         if rename_requested:
@@ -1697,6 +1899,7 @@ class LivingMemoryV8Manager:
         source = await self.control.get_library(library_id)
         if not source:
             raise KeyError(library_id)
+        await self._materialize_library_runtime(source.id)
         source_dir = self._library_dir(source.id)
         if not source_dir.exists():
             raise ValueError(f"源记忆库目录不存在：{source_dir}")

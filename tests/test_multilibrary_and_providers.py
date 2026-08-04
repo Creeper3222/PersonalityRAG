@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,6 +35,7 @@ from personalityrag.providers import (
     VLLMEmbeddingProvider,
     provider_config_hash,
 )
+from personalityrag.resource_limits import configured_io_workers
 from personalityrag.storage import Storage
 from personalityrag.text import TextProcessor
 
@@ -1343,12 +1345,19 @@ async def test_library_listing_stays_lazy_and_rejected_default_delete_keeps_runt
     manager = LibraryManager(root, AppConfig(provider=provider_config))
     await manager.initialize()
     try:
-        assert set(manager.runtimes) == {DatabaseRef(LIVINGMEMORY_V8_TYPE, "Default")}
+        # Control-plane startup no longer waits for the default FAISS/Provider
+        # runtime. Listing stays lazy whether background prewarm has completed
+        # yet or not.
+        assert set(manager.runtimes).issubset(
+            {DatabaseRef(LIVINGMEMORY_V8_TYPE, "Default")}
+        )
         libraries = await manager.list_libraries()
         assert {item["id"] for item in libraries} == {"Default", "second"}
-        assert set(manager.runtimes) == {DatabaseRef(LIVINGMEMORY_V8_TYPE, "Default")}
+        assert set(manager.runtimes).issubset(
+            {DatabaseRef(LIVINGMEMORY_V8_TYPE, "Default")}
+        )
 
-        runtime = manager.runtimes[DatabaseRef(LIVINGMEMORY_V8_TYPE, "Default")]
+        runtime = await manager.get_runtime("Default")
         provider = runtime.provider
         await manager.update_library(
             "second", {"recall_settings": {"top_k": 3, "importance_weight": 2.5}}
@@ -1960,5 +1969,97 @@ async def test_runtime_hot_limit_and_idle_reload_preserve_recall_results(
             [item.final_score for item in before],
             abs=1e-12,
         )
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_twenty_load_unload_cycles_preserve_recall_and_threads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_fake_providers(monkeypatch)
+    provider = ProviderConfig(dimensions=8)
+    manager = LibraryManager(
+        tmp_path / "PersonalityRAG",
+        AppConfig(
+            provider=provider,
+            runtime_residency=RuntimeResidencyConfig(
+                idle_minutes=30,
+                max_non_default_runtimes=1,
+            ),
+        ),
+    )
+    await manager.initialize()
+    try:
+        if manager._default_prewarm_task is not None:
+            await asyncio.shield(manager._default_prewarm_task)
+        await manager.create_library(
+            {"id": "cycling", "name": "cycling", "provider_id": provider.id}
+        )
+        runtime = await manager.get_runtime("cycling")
+        await runtime.create_memory(
+            {
+                "content": "循环装卸后仍应召回相同的星空记忆",
+                "persona_id": "fixture",
+            }
+        )
+        expected = await runtime.retrieval.search("星空记忆", 5)
+        await manager.unload_runtime("cycling", reason="stress_baseline")
+        stable_samples = 0
+        previous_threads = -1
+        for _ in range(10):
+            warm_runtime = await manager.get_runtime("cycling")
+            await warm_runtime.retrieval.search("星空记忆", 5)
+            await manager.unload_runtime("cycling", reason="stress_warmup")
+            await asyncio.sleep(0.05)
+            current_threads = threading.active_count()
+            if current_threads == previous_threads:
+                stable_samples += 1
+            else:
+                stable_samples = 0
+            previous_threads = current_threads
+            if stable_samples >= 2:
+                break
+        assert stable_samples >= 2
+        baseline_runtime_threads = sum(
+            thread.name.startswith("SQLitePool-")
+            for thread in threading.enumerate()
+        )
+
+        for _ in range(20):
+            runtime = await manager.get_runtime("cycling")
+            actual = await runtime.retrieval.search("星空记忆", 5)
+            assert [item.doc_id for item in actual] == [
+                item.doc_id for item in expected
+            ]
+            assert [item.final_score for item in actual] == pytest.approx(
+                [item.final_score for item in expected], abs=1e-12
+            )
+            assert await manager.unload_runtime(
+                "cycling", reason="stress_cycle"
+            )
+            await asyncio.sleep(0.02)
+
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while asyncio.get_running_loop().time() < deadline:
+            active_threads = threading.enumerate()
+            runtime_threads = sum(
+                thread.name.startswith("SQLitePool-")
+                for thread in active_threads
+            )
+            if runtime_threads <= baseline_runtime_threads + 1:
+                break
+            await asyncio.sleep(0.05)
+        active_threads = threading.enumerate()
+        runtime_threads = sum(
+            thread.name.startswith("SQLitePool-") for thread in active_threads
+        )
+        executor_threads = sum(
+            thread.name.startswith("asyncio_") for thread in active_threads
+        )
+        assert runtime_threads <= baseline_runtime_threads + 1, ", ".join(
+            thread.name for thread in active_threads
+        )
+        assert executor_threads <= configured_io_workers()
     finally:
         await manager.close()

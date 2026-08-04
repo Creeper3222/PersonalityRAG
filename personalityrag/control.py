@@ -36,6 +36,7 @@ from .repositories import (
     SnapshotRepository,
 )
 from .sqlite_pool import SQLiteConnectionPool
+from .resource_limits import configured_sqlite_pool_size
 
 ADAPTER_CONNECTION_TTL_SECONDS = 180.0
 OBSOLETE_MEMORY_STORE_METADATA_KEYS = frozenset(
@@ -104,7 +105,10 @@ LibraryRecord = MemoryStoreRecord
 class ControlStore:
     def __init__(self, path: Path):
         self.path = path
-        self.pool = SQLiteConnectionPool(path, size=2)
+        self.pool = SQLiteConnectionPool(
+            path,
+            size=configured_sqlite_pool_size(),
+        )
         async def connect():
             return await self.connect()
 
@@ -664,7 +668,6 @@ class ControlStore:
     async def rename_database_identity(self, ref: DatabaseRef, next_id: str) -> DatabaseRef:
         next_ref = DatabaseRef(ref.database_type, next_id)
         driver = database_type_registry.require(ref.database_type)
-        current_key = driver.resource_key(ref.id)
         next_key = driver.resource_key(next_ref.id)
         now = time.time()
         db = await self.connect()
@@ -844,43 +847,85 @@ class ControlStore:
             created_at=float(row["created_at"]),
         )
 
-    async def provider_usage(self, provider_id: str) -> list[dict[str, Any]]:
+    async def provider_usage_map(
+        self,
+        provider_ids: set[str] | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        requested = (
+            {str(provider_id) for provider_id in provider_ids if str(provider_id)}
+            if provider_ids is not None
+            else None
+        )
+        if requested is not None and not requested:
+            return {}
         db = await self.connect()
         try:
-            latest_row = await (
+            latest_rows = await (
                 await db.execute(
-                    """SELECT pr.config_json FROM providers p JOIN provider_revisions pr
+                    """SELECT p.id AS provider_id,pr.config_json
+                    FROM providers p JOIN provider_revisions pr
                     ON pr.provider_id=p.id AND pr.revision=p.latest_revision
-                    WHERE p.id=? AND p.deleted_at IS NULL LIMIT 1""",
-                    (provider_id,),
-                )
-            ).fetchone()
-            latest_config = (
-                config_from_dict(json.loads(latest_row["config_json"]))
-                if latest_row
-                else None
-            )
-            embedding_rows = await (
-                await db.execute(
-                    """SELECT id,database_type,name,provider_revision FROM libraries
-                    WHERE provider_id=? AND deleted_at IS NULL ORDER BY name""",
-                    (provider_id,),
+                    WHERE p.deleted_at IS NULL"""
                 )
             ).fetchall()
-            embedding_usage = []
-            for row in embedding_rows:
+            revision_rows = await (
+                await db.execute(
+                    """SELECT provider_id,revision,config_json
+                    FROM provider_revisions"""
+                )
+            ).fetchall()
+            library_rows = await (
+                await db.execute(
+                    """SELECT id,database_type,name,provider_id,
+                    provider_revision,rerank_provider_id FROM libraries
+                    WHERE deleted_at IS NULL ORDER BY name,id"""
+                )
+            ).fetchall()
+        finally:
+            await db.close()
+
+        latest_configs = {
+            str(row["provider_id"]): config_from_dict(
+                json.loads(row["config_json"])
+            )
+            for row in latest_rows
+        }
+        revision_configs = {
+            (str(row["provider_id"]), int(row["revision"])): config_from_dict(
+                json.loads(row["config_json"])
+            )
+            for row in revision_rows
+        }
+        targets = (
+            requested
+            if requested is not None
+            else (
+                set(latest_configs)
+                | {
+                    str(row["provider_id"] or "")
+                    for row in library_rows
+                    if row["provider_id"]
+                }
+                | {
+                    str(row["rerank_provider_id"] or "")
+                    for row in library_rows
+                    if row["rerank_provider_id"]
+                }
+            )
+        )
+        embedding_usage: dict[str, list[dict[str, Any]]] = {
+            provider_id: [] for provider_id in targets
+        }
+        rerank_usage: dict[str, list[dict[str, Any]]] = {
+            provider_id: [] for provider_id in targets
+        }
+        for row in library_rows:
+            provider_id = str(row["provider_id"] or "")
+            if provider_id in embedding_usage:
                 provider_revision = int(row["provider_revision"])
-                bound_row = await (
-                    await db.execute(
-                        """SELECT config_json FROM provider_revisions
-                        WHERE provider_id=? AND revision=? LIMIT 1""",
-                        (provider_id, provider_revision),
-                    )
-                ).fetchone()
-                bound_config = (
-                    config_from_dict(json.loads(bound_row["config_json"]))
-                    if bound_row
-                    else None
+                latest_config = latest_configs.get(provider_id)
+                bound_config = revision_configs.get(
+                    (provider_id, provider_revision)
                 )
                 needs_rebuild = (
                     True
@@ -889,7 +934,7 @@ class ControlStore:
                         latest_config, bound_config
                     )
                 )
-                embedding_usage.append(
+                embedding_usage[provider_id].append(
                     {
                         **database_identity_fields(
                             DatabaseRef(
@@ -909,36 +954,36 @@ class ControlStore:
                         "needs_rebuild": needs_rebuild,
                     }
                 )
-            rerank_rows = await (
-                await db.execute(
-                    """SELECT id,database_type,name FROM libraries
-                    WHERE rerank_provider_id=? AND deleted_at IS NULL ORDER BY name""",
-                    (provider_id,),
-                )
-            ).fetchall()
-            return embedding_usage + [
-                {
-                    **database_identity_fields(
-                        DatabaseRef(
-                            str(
-                                row["database_type"]
-                                or LIVINGMEMORY_V8_TYPE
+            rerank_provider_id = str(row["rerank_provider_id"] or "")
+            if rerank_provider_id in rerank_usage:
+                rerank_usage[rerank_provider_id].append(
+                    {
+                        **database_identity_fields(
+                            DatabaseRef(
+                                str(
+                                    row["database_type"]
+                                    or LIVINGMEMORY_V8_TYPE
+                                ),
+                                str(row["id"]),
                             ),
-                            str(row["id"]),
+                            include_deprecated=True,
                         ),
-                        include_deprecated=True,
-                    ),
-                    "database_name": row["name"],
-                    # Deprecated compatibility alias for v0.1.1 clients.
-                    "library_name": row["name"],
-                    "provider_revision": None,
-                    "usage_kind": "rerank",
-                    "needs_rebuild": False,
-                }
-                for row in rerank_rows
-            ]
-        finally:
-            await db.close()
+                        "database_name": row["name"],
+                        # Deprecated compatibility alias for v0.1.1 clients.
+                        "library_name": row["name"],
+                        "provider_revision": None,
+                        "usage_kind": "rerank",
+                        "needs_rebuild": False,
+                    }
+                )
+        return {
+            provider_id: embedding_usage[provider_id]
+            + rerank_usage[provider_id]
+            for provider_id in targets
+        }
+
+    async def provider_usage(self, provider_id: str) -> list[dict[str, Any]]:
+        return (await self.provider_usage_map({provider_id})).get(provider_id, [])
 
     @staticmethod
     def _provider_functional_hash(config: ProviderConfig) -> str:
@@ -1718,8 +1763,12 @@ class ControlStore:
             if kind and provider_kind(record.config.type) != kind:
                 continue
             item = record.public()
-            item["used_by"] = await self.provider_usage(record.provider_id)
             result.append(item)
+        usage = await self.provider_usage_map(
+            {str(item.get("id") or "") for item in result}
+        )
+        for item in result:
+            item["used_by"] = usage.get(str(item.get("id") or ""), [])
         return result
 
     async def export_provider_snapshot(self) -> dict[str, Any]:

@@ -493,23 +493,24 @@ async def run(
             },
         )
         page_smoke = {}
-        for page_name in (
-            "libraries",
-            "providers",
-            "graph",
-            "memory",
-            "recall",
-            "system",
-            "files",
-            "settings",
-            "logs",
-        ):
+        page_routes = {
+            "libraries": '.nav[data-page="libraries"]',
+            "providers": '.nav[data-page="providers"]',
+            "graph": '.nav[data-route$=":graph"]',
+            "memory": '.nav[data-route$=":memories"]',
+            "recall": '.nav[data-route$=":recall"]',
+            "system": '.nav[data-page="system"]',
+            "files": '.nav[data-page="files"]',
+            "settings": '.nav[data-page="settings"]',
+            "logs": '.nav[data-page="logs"]',
+        }
+        for page_name, nav_selector in page_routes.items():
             await call(
                 "Runtime.evaluate",
                 {
                     "expression": (
                         "document.querySelector("
-                        + json.dumps(f'.nav[data-page="{page_name}"]')
+                        + json.dumps(nav_selector)
                         + ")?.click()"
                     )
                 },

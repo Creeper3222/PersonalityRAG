@@ -1,4 +1,4 @@
-# PersonalityRAG v0.1.1
+# PersonalityRAG v0.1.2
 
 PersonalityRAG 是一个脱离具体 Bot 框架独立运行的类型化 RAG 数据库服务。数据库分为“记忆库”和“知识库”两个大类；当前提供兼容 AstrBot LivingMemory 数据结构的 `LivingMemory v8` 记忆库，以及以文本检索为核心、可关联图片附件的 `text_media_v1` 知识库。
 

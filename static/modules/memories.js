@@ -1,5 +1,7 @@
 export function createMemoriesController({ $, state, t, toast, api, selectedDatabaseApi, escapeHtml, formatMemoryTime, displayStatus, memoryStatusPill, memoryImportanceBar, normalizeMemoryDetail, memoryMetaItem, memoryListSection, memoryTagsSection, renderMemoryMiniGraph, loadDatabases, debounce, confirmDialog, asyncGuard }) {
+let memoryLoadGeneration = 0;
 async function loadMemories() {
+  const generation = ++memoryLoadGeneration;
   if (state.memoryTransferDatabaseId && state.memoryTransferDatabaseId !== state.selectedDatabaseId) {
     resetTransferPreview();
   }
@@ -15,8 +17,10 @@ async function loadMemories() {
   });
   try {
     const data = await selectedDatabaseApi("/memories?" + params);
+    if (generation !== memoryLoadGeneration) return;
     state.memoryHasMore = data.has_more;
     state.memoryItems = Array.isArray(data.items) ? data.items : [];
+    state.selectedMemoryIds.clear();
     $("memory-rows").innerHTML =
       state.memoryItems
         .map(
@@ -26,6 +30,7 @@ async function loadMemories() {
             const updated = formatMemoryTime(metadata.updated_at ?? item.updated_at ?? metadata.create_time);
             const created = formatMemoryTime(metadata.create_time ?? item.created_at);
             return `<tr class="memory-row" data-id="${escapeHtml(item.id)}" tabindex="0">
+            <td class="memory-select-column"><input type="checkbox" class="memory-select" data-id="${escapeHtml(item.id)}" aria-label="${escapeHtml(t("selectMemory"))}"></td>
             <td class="memory-id">${escapeHtml(item.id)}</td>
             <td class="memory-summary-cell" title="${escapeHtml(personaSummary)}"><div class="memory-summary-text">${escapeHtml(personaSummary)}</div><div class="memory-summary-meta">${escapeHtml(t("updatedAt"))} ${escapeHtml(updated)}</div></td>
             <td>${memoryImportanceBar(metadata.importance ?? 0.5)}</td>
@@ -34,25 +39,115 @@ async function loadMemories() {
           </tr>`;
           },
         )
-        .join("") || `<tr><td colspan="5">${escapeHtml(t("tableEmpty"))}</td></tr>`;
+        .join("") || `<tr><td colspan="6">${escapeHtml(t("tableEmpty"))}</td></tr>`;
     $("memory-page-info").textContent = t("pageOfTotal", { page: state.memoryPage, total: data.total });
     $("memory-prev").disabled = state.memoryPage <= 1;
     $("memory-next").disabled = !data.has_more;
     document.querySelectorAll(".memory-row").forEach((row) => {
       const open = () => openMemoryDetail(Number(row.dataset.id));
-      row.onclick = open;
+      row.onclick = (event) => {
+        if (event.target.closest(".memory-select")) return;
+        open();
+      };
       row.onkeydown = (event) => {
+        if (event.target.closest(".memory-select")) return;
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault();
           open();
         }
       };
     });
+    document.querySelectorAll(".memory-select").forEach((checkbox) => {
+      checkbox.onchange = () => {
+        const id = Number(checkbox.dataset.id);
+        if (checkbox.checked) state.selectedMemoryIds.add(id);
+        else state.selectedMemoryIds.delete(id);
+        checkbox.closest("tr")?.classList.toggle("is-selected", checkbox.checked);
+        updateMemorySelectionControls();
+      };
+    });
+    updateMemorySelectionControls();
   } catch (error) {
+    if (generation !== memoryLoadGeneration) return;
     if (error?.name === "AbortError") return;
     toast(error.message, true);
   }
 }
+
+function updateMemorySelectionControls() {
+  const ids = state.memoryItems.map((item) => Number(item.id));
+  const selectedOnPage = ids.filter((id) => state.selectedMemoryIds.has(id)).length;
+  const selectPage = $("memory-select-page");
+  if (selectPage) {
+    selectPage.checked = ids.length > 0 && selectedOnPage === ids.length;
+    selectPage.indeterminate = selectedOnPage > 0 && selectedOnPage < ids.length;
+    selectPage.disabled = ids.length === 0;
+  }
+  $("memory-selected-count").textContent = t("selectedMemoryCount", { count: state.selectedMemoryIds.size });
+  for (const id of ["memory-batch-importance-apply", "memory-batch-archive", "memory-batch-restore", "memory-batch-delete"]) {
+    $(id).disabled = state.selectedMemoryIds.size === 0;
+  }
+}
+
+$("memory-select-page")?.addEventListener("change", (event) => {
+  for (const item of state.memoryItems) {
+    const id = Number(item.id);
+    if (event.target.checked) state.selectedMemoryIds.add(id);
+    else state.selectedMemoryIds.delete(id);
+  }
+  document.querySelectorAll(".memory-select").forEach((checkbox) => {
+    checkbox.checked = event.target.checked;
+    checkbox.closest("tr")?.classList.toggle("is-selected", event.target.checked);
+  });
+  updateMemorySelectionControls();
+});
+
+async function runSelectedMemoryAction(kind) {
+  const ids = [...state.selectedMemoryIds];
+  if (!ids.length) return;
+  const button = $(kind === "importance" ? "memory-batch-importance-apply" : `memory-batch-${kind}`);
+  await asyncGuard.run(`memory:batch:${kind}`, async () => {
+    if (kind === "importance") {
+      const importance = Number($("memory-batch-importance").value);
+      if (!Number.isFinite(importance) || importance < 0 || importance > 10) {
+        toast(t("importanceRangeError"), true);
+        return;
+      }
+      await selectedDatabaseApi("/memories/batch-update", {
+        method: "POST",
+        body: JSON.stringify({ memory_ids: ids, updates: { importance, value_scale: "display" } }),
+      });
+    } else {
+      const confirmed = await confirmDialog({
+        title: t(`${kind}Selected`),
+        message: t(`${kind}SelectedConfirm`, { count: ids.length }),
+        confirmText: t(`${kind}Selected`),
+      });
+      if (!confirmed) return;
+      if (kind === "delete") {
+        await selectedDatabaseApi("/memories/batch-delete", {
+          method: "POST",
+          body: JSON.stringify({ memory_ids: ids }),
+        });
+      } else {
+        for (const id of ids) {
+          await selectedDatabaseApi(`/memories/${id}/${kind}`, {
+            method: "POST",
+            body: JSON.stringify({}),
+          });
+        }
+      }
+    }
+    toast(t("batchMemoryUpdated", { count: ids.length }));
+    await loadMemories();
+    await loadDatabases(false);
+  }, { button, busyText: t("loading") });
+}
+
+$("memory-batch-importance-apply")?.addEventListener("click", () => runSelectedMemoryAction("importance"));
+$("memory-batch-archive")?.addEventListener("click", () => runSelectedMemoryAction("archive"));
+$("memory-batch-restore")?.addEventListener("click", () => runSelectedMemoryAction("restore"));
+$("memory-batch-delete")?.addEventListener("click", () => runSelectedMemoryAction("delete"));
 
 $("memory-refresh").onclick = async () => {
   state.memoryPage = 1;
@@ -218,6 +313,8 @@ async function openMemoryDetail(id, fallback = null) {
   $("memory-detail-body").innerHTML = `<div class="memory-detail-empty">${escapeHtml(t("loading"))}</div>`;
   $("memory-detail-overlay").classList.remove("hidden");
   $("memory-detail-panel").classList.add("visible");
+  $("memory-detail-panel").inert = false;
+  $("memory-detail-panel").setAttribute("aria-hidden", "false");
   try {
     const item = await selectedDatabaseApi("/memories/" + id);
     state.selectedMemoryDetail = item;
@@ -237,6 +334,10 @@ async function openMemoryDetail(id, fallback = null) {
 function closeMemoryDetail() {
   $("memory-detail-overlay")?.classList.add("hidden");
   $("memory-detail-panel")?.classList.remove("visible");
+  if ($("memory-detail-panel")) {
+    $("memory-detail-panel").inert = true;
+    $("memory-detail-panel").setAttribute("aria-hidden", "true");
+  }
   state.selectedMemoryId = null;
   state.selectedMemoryDetail = null;
 }
@@ -264,6 +365,10 @@ function renderMemoryDetailView(raw) {
           : `<button type="button" class="ghost" id="memory-detail-archive">${escapeHtml(t("archiveMemory"))}</button>`}
         <button type="button" class="ghost danger" id="memory-detail-delete">${escapeHtml(t("deleteMemory"))}</button>
       </div>
+    </div>
+    <div class="memory-detail-section">
+      <div class="memory-detail-section-title">${escapeHtml(t("retrievalContent"))}</div>
+      <div class="memory-detail-content">${escapeHtml(detail.text)}</div>
     </div>
     <div class="memory-detail-section">
       <div class="memory-detail-section-title">${escapeHtml(t("personaSummary"))}</div>

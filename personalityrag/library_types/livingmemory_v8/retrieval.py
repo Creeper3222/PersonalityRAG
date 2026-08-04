@@ -331,8 +331,8 @@ class RetrievalEngine:
             ):
                 results = copy.deepcopy(cached[1])
                 if self._track_access:
-                    asyncio.create_task(
-                        self.storage.touch_documents(item.doc_id for item in results)
+                    self._touch_documents_in_background(
+                        item.doc_id for item in results
                     )
                 return results
         else:
@@ -363,9 +363,7 @@ class RetrievalEngine:
             while len(self._cache) > self.config.search_cache_max_size:
                 self._cache.popitem(last=False)
         if self._track_access:
-            asyncio.create_task(
-                self.storage.touch_documents(item.doc_id for item in results)
-            )
+            self._touch_documents_in_background(item.doc_id for item in results)
         return results
 
     async def _document_route(
@@ -1122,3 +1120,14 @@ class RetrievalEngine:
                     best_index = index
             selected.append(candidates.pop(best_index))
         return selected
+
+    def _touch_documents_in_background(self, document_ids) -> None:
+        operation = self.storage.touch_documents(document_ids)
+        scheduler = getattr(self.storage, "create_background_task", None)
+        if callable(scheduler):
+            scheduler(operation)
+            return
+        # Compatibility for lightweight Storage implementations that predate
+        # lifecycle-aware task tracking. The built-in Storage always takes the
+        # tracked path above so shutdown can drain pending SQLite writes.
+        asyncio.create_task(operation)

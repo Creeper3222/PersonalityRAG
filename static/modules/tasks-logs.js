@@ -706,6 +706,7 @@ function resetTaskState({ render = true } = {}) {
   state.tasks.finished = [];
   state.tasks.optimistic = [];
   state.tasks.finishedExpanded = false;
+  state.tasks.finishedCursor = null;
   hideTrackedJobProgress();
   if (render) {
     renderTasks();
@@ -723,6 +724,13 @@ function renderTasks() {
     button.classList.toggle("active", button.dataset.taskScope === state.tasks.scope);
   });
   renderFinishedTaskClearButton();
+  const loadMore = $("tasks-load-more");
+  if (loadMore) {
+    loadMore.classList.toggle(
+      "hidden",
+      state.tasks.scope !== "finished" || !state.tasks.finishedCursor,
+    );
+  }
   if (!items.length) {
     list.innerHTML = `<div class="task-empty">${escapeHtml(t(state.tasks.scope === "finished" ? "noFinishedTasks" : "noActiveTasks"))}</div>`;
     applyTaskHistoryCollapseState();
@@ -849,6 +857,7 @@ async function clearFinishedTasks() {
     const payload = await api("/jobs/finished/clear", { method: "POST" });
     state.tasks.finished = [];
     state.tasks.finishedExpanded = false;
+    state.tasks.finishedCursor = null;
     renderTasks();
     toast(t("finishedTasksCleared", { count: payload.cleared || 0 }));
     if (state.page === "logs") {
@@ -867,14 +876,26 @@ $("tasks-finished-clear")?.addEventListener("click", () => {
   });
 });
 
-async function loadTasks(scope = state.tasks.scope) {
-  const data = await api(`/jobs?scope=${encodeURIComponent(scope)}`, {
+async function loadTasks(scope = state.tasks.scope, { append = false } = {}) {
+  const params = new URLSearchParams({
+    scope,
+    limit: "50",
+    include_details: "false",
+  });
+  if (scope === "finished" && append && state.tasks.finishedCursor) {
+    params.set("cursor", state.tasks.finishedCursor);
+  }
+  const data = await api(`/jobs?${params.toString()}`, {
     suppressOperationalError: true,
   });
   if (scope === "active") {
     state.tasks.active = mergeTaskList(data.items || [], "active");
   } else if (scope === "finished") {
-    state.tasks.finished = mergeTaskList(data.items || [], "finished");
+    state.tasks.finished = mergeTaskList(
+      append ? [...state.tasks.finished, ...(data.items || [])] : (data.items || []),
+      "finished",
+    );
+    state.tasks.finishedCursor = data.next_cursor || null;
   } else {
     const items = data.items || [];
     state.tasks.active = mergeTaskList(items.filter((job) => isActiveTask(job)), "active");
@@ -882,6 +903,18 @@ async function loadTasks(scope = state.tasks.scope) {
   }
   renderTasks();
 }
+
+$("tasks-load-more")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    await loadTasks("finished", { append: true });
+  } catch (error) {
+    toast(error.message || String(error), true);
+  } finally {
+    button.disabled = false;
+  }
+});
 
 function startTaskPolling() {
   if (state.tasks.polling) return;

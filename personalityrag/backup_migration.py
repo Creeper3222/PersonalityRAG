@@ -322,7 +322,7 @@ async def export_prag_package(
                 database_type = str(
                     library.get("database_type") or LIVINGMEMORY_V8_TYPE
                 )
-                driver = database_type_registry.require(database_type)
+                database_type_registry.require(database_type)
                 base = f"libraries/{index:04d}"
                 library_dir = database_type_registry.data_dir(
                     manager.data_dir,
@@ -1013,52 +1013,57 @@ async def import_prag_package(
                 manifest=manifest,
                 available_provider_ids=available_provider_ids,
             )
-        await _close_runtimes(manager)
         try:
-            await _backup_current_state(
-                config_path=config_path,
-                manager=manager,
-                rollback_dir=rollback_dir,
-            )
+            try:
+                await manager.suspend_runtime_activity()
+                await _close_runtimes(manager)
+                await _backup_current_state(
+                    config_path=config_path,
+                    manager=manager,
+                    rollback_dir=rollback_dir,
+                )
+                try:
+                    save_config(config_path, next_config)
+                    manager.config = next_config
+                    if provider_snapshot is not None:
+                        await manager.control.restore_provider_snapshot(
+                            provider_snapshot
+                        )
+                    if prepared_libraries is not None:
+                        await manager.control.restore_library_snapshot(
+                            {
+                                "libraries": [
+                                    item["library"]
+                                    for item in prepared_libraries["libraries"]
+                                    if item["library"]["database_type"]
+                                    == LIVINGMEMORY_V8_TYPE
+                                ]
+                            }
+                        )
+                        await _install_library_files(
+                            manager=manager, prepared=prepared_libraries
+                        )
+                    await manager.refresh_default_library(load=False)
+                    if rollback_dir.exists():
+                        await run_blocking(
+                            shutil.rmtree,
+                            rollback_dir,
+                            ignore_errors=True,
+                        )
+                except Exception:
+                    logger.exception("备份迁移配置包导入失败，正在回滚")
+                    await _close_runtimes(manager)
+                    await manager.control.pool.close()
+                    await _restore_rollback(
+                        config_path=config_path,
+                        manager=manager,
+                        rollback_dir=rollback_dir,
+                    )
+                    manager.config = config
+                    raise
+            finally:
+                await manager.resume_runtime_activity()
         except Exception:
-            await manager.refresh_default_library(load=True)
-            raise
-        try:
-            save_config(config_path, next_config)
-            manager.config = next_config
-            if provider_snapshot is not None:
-                await manager.control.restore_provider_snapshot(provider_snapshot)
-            if prepared_libraries is not None:
-                await manager.control.restore_library_snapshot(
-                    {
-                        "libraries": [
-                            item["library"]
-                            for item in prepared_libraries["libraries"]
-                            if item["library"]["database_type"]
-                            == LIVINGMEMORY_V8_TYPE
-                        ]
-                    }
-                )
-                await _install_library_files(
-                    manager=manager, prepared=prepared_libraries
-                )
-            await manager.refresh_default_library(load=False)
-            if rollback_dir.exists():
-                await run_blocking(
-                    shutil.rmtree,
-                    rollback_dir,
-                    ignore_errors=True,
-                )
-        except Exception:
-            logger.exception("备份迁移配置包导入失败，正在回滚")
-            await _close_runtimes(manager)
-            await manager.control.pool.close()
-            await _restore_rollback(
-                config_path=config_path,
-                manager=manager,
-                rollback_dir=rollback_dir,
-            )
-            manager.config = config
             await manager.refresh_default_library(load=True)
             raise
     result = {

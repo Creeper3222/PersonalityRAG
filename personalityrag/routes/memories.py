@@ -380,15 +380,20 @@ async def commit_memory_resummary(
         payload.expected_content_sha256.casefold(), current_hash
     ):
         raise HTTPException(409, "memory content changed after preview")
+    retrieval_content = (
+        payload.content.strip()
+        if payload.content
+        else payload.canonical_summary.strip()
+    )
     updates = {
-        "content": payload.canonical_summary.strip(),
+        "content": retrieval_content,
         "metadata": {
             **payload.metadata,
             "canonical_summary": payload.canonical_summary.strip(),
             "persona_summary": (
                 payload.persona_summary.strip()
                 if payload.persona_summary
-                else payload.canonical_summary.strip()
+                else retrieval_content
             ),
             "resummarized_from": memory_id,
         },

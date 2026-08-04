@@ -61,10 +61,20 @@
             <button id="memory-refresh" class="ghost" data-i18n="refresh">刷新</button>
             <button id="memory-create" class="primary" data-i18n="createMemory">新增记忆</button>
           </div>
-          <div class="table-wrap">
+          <div class="memory-selection-bar">
+            <label><input id="memory-select-page" type="checkbox"><span data-i18n="selectCurrentPage">选择当前页</span></label>
+            <span id="memory-selected-count" class="pill"></span>
+            <label class="memory-batch-importance"><span data-i18n="batchImportance">批量重要性</span><input id="memory-batch-importance" type="number" min="0" max="10" step="0.1" value="5.0"></label>
+            <button id="memory-batch-importance-apply" type="button" class="ghost" disabled data-i18n="applyBatchImportance">应用重要性</button>
+            <button id="memory-batch-archive" type="button" class="ghost" disabled data-i18n="archiveSelected">归档所选</button>
+            <button id="memory-batch-restore" type="button" class="ghost" disabled data-i18n="restoreSelected">恢复所选</button>
+            <button id="memory-batch-delete" type="button" class="ghost danger" disabled data-i18n="deleteSelectedMemories">删除所选</button>
+          </div>
+          <div class="table-wrap memory-table-wrap">
             <table>
               <thead>
                 <tr>
+                  <th class="memory-select-column"><span class="sr-only" data-i18n="selectMemory">选择记忆</span></th>
                   <th>ID</th>
                   <th data-i18n="memorySummary">摘要</th>
                   <th data-i18n="importance">重要性</th>
@@ -105,7 +115,7 @@
           <div id="memory-transfer-preview-result" class="memory-transfer-preview hidden" aria-live="polite"></div>
         </section>
         <div id="memory-detail-overlay" class="memory-detail-overlay hidden"></div>
-        <aside id="memory-detail-panel" class="memory-detail-panel" aria-live="polite">
+        <aside id="memory-detail-panel" class="memory-detail-panel" aria-live="polite" aria-hidden="true" inert>
           <button id="memory-detail-close" class="memory-detail-close" type="button" aria-label="关闭">×</button>
           <h3 id="memory-detail-title">记忆详情</h3>
           <div id="memory-detail-body" class="memory-detail-body"></div>

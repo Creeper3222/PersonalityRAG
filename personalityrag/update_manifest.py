@@ -68,6 +68,7 @@ SOURCE_ONLY_TOOL_FILES = frozenset(
         "tools/export_embedding_context_lengths.py",
         "tools/migrate_livingmemory.py",
         "tools/rebuild_text_media_benchmark.py",
+        "tools/soak_runtime.py",
     }
 )
 PROTECTED_TOP_LEVEL = frozenset(

@@ -219,8 +219,10 @@ def test_http_route_contract() -> None:
 def test_openapi_contract() -> None:
     openapi = app_module.app.openapi()
     assert _stable_hash(openapi) == (
-        "cf6b2cd308e21decba0039472770a00d7e0900b4a920d5701ca9e3a118165206"
+        "2f7507c8332d83268a07c00b35c7aeccac491a9318a9cb19fde6ca596f468562"
     )
+    assert "content" in openapi["components"]["schemas"]["MemoryResummaryCommit"]["properties"]
+    assert "content" in openapi["components"]["schemas"]["MemoryTransferSummary"]["properties"]
     assert (
         "memory_type"
         not in openapi["components"]["schemas"]["MemoryCreate"]["properties"]
@@ -436,6 +438,8 @@ async def test_health_and_settings_core_fields_remain_stable() -> None:
         "port_change_requires_restart",
         "access_port_change_requires_restart",
         "runtime_residency",
+        "performance_profile",
+        "effective_performance",
         "version",
     }
 

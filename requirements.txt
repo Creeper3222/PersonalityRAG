@@ -4,7 +4,7 @@ httpx>=0.27,<1
 pydantic>=2.10,<3
 python-multipart>=0.0.9,<1
 aiosqlite>=0.20,<1
-faiss-cpu>=1.12.0,!=1.14.2,<2
+faiss-cpu>=1.14.3,<2
 numpy>=2.0,<3
 jieba>=0.42.1,<1
 markdown-it-py>=4.2,<5

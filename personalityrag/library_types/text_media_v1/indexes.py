@@ -254,3 +254,47 @@ class TextMediaIndex:
                 int(self._media_index.d) if self._media_index is not None else 0
             ),
         }
+
+    @staticmethod
+    def disk_status(library_root: Path) -> dict[str, Any]:
+        """Read active-generation manifests without importing an index."""
+
+        index_root = Path(library_root) / "derived" / "indexes"
+
+        def generation_status(
+            root: Path,
+        ) -> tuple[str | None, dict[str, Any] | None]:
+            try:
+                generation = (root / "CURRENT").read_text(
+                    encoding="utf-8"
+                ).strip()
+            except OSError:
+                return None, None
+            if not generation:
+                return None, None
+            try:
+                manifest = json.loads(
+                    (root / generation / "manifest.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+            except (OSError, json.JSONDecodeError, TypeError):
+                manifest = None
+            return generation, manifest
+
+        generation, manifest = generation_status(index_root)
+        media_generation, media_manifest = generation_status(index_root / "media")
+        return {
+            "generation": generation,
+            "loaded": False,
+            "vector_count": int((manifest or {}).get("vector_count") or 0),
+            "dimensions": int((manifest or {}).get("dimensions") or 0),
+            "media_generation": media_generation,
+            "media_loaded": False,
+            "media_vector_count": int(
+                (media_manifest or {}).get("vector_count") or 0
+            ),
+            "media_dimensions": int(
+                (media_manifest or {}).get("dimensions") or 0
+            ),
+        }

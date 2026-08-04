@@ -233,9 +233,11 @@
             <p class="form-help" data-i18n="runtimeResidencyHint">默认库永久常驻；非默认库会在空闲后释放索引和模型连接，并按最近最少使用顺序控制常驻数量。</p>
           </div>
           <div class="settings-grid">
+            <label class="settings-wide"><span data-i18n="performanceProfile">性能档位</span><select id="settings-performance-profile"><option value="adaptive" data-i18n="performanceProfileAdaptive">自适应平衡</option><option value="latency" data-i18n="performanceProfileLatency">低延迟</option><option value="memory" data-i18n="performanceProfileMemory">低内存</option></select><small data-i18n="performanceProfileHint">仅调整线程、连接池与运行时驻留预算，不改变检索或任务语义。</small></label>
             <label><span data-i18n="runtimeIdleMinutes">非默认库空闲回收分钟数</span><input id="settings-runtime-idle-minutes" type="number" min="1" step="1"></label>
             <label><span data-i18n="runtimeMaxNonDefault">非默认库最大常驻数量</span><input id="settings-runtime-max-non-default" type="number" min="1" step="1"></label>
           </div>
+          <div id="settings-effective-performance" class="effective-performance-grid"></div>
         </section>
         <section class="panel settings-panel backup-migration-panel">
           <div>
@@ -334,6 +336,7 @@
             </button>
             <div id="task-history-primary" class="task-history-primary">
               <div id="task-list" class="task-list"></div>
+              <button id="tasks-load-more" class="ghost task-load-more hidden" type="button" data-i18n="taskLoadMore">加载更多</button>
             </div>
             <button id="task-history-toggle" class="library-expand-toggle task-history-toggle hidden" type="button" title="展开更多信息" aria-label="展开更多信息" aria-expanded="false">
               <svg viewBox="0 0 240 24" aria-hidden="true"><circle cx="24" cy="12" r="4.5"/><circle cx="120" cy="12" r="4.5"/><circle cx="216" cy="12" r="4.5"/></svg>

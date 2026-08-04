@@ -8,6 +8,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from .resource_limits import (
+    DEFAULT_PERFORMANCE_PROFILE,
+    normalize_performance_profile,
+)
+
 
 DEFAULT_ACCESS_BASE_URL = "http://127.0.0.1"
 DEFAULT_PUBLIC_ADAPTER_URL = ""
@@ -213,6 +218,7 @@ class AppConfig:
     public_adapter_url: str = DEFAULT_PUBLIC_ADAPTER_URL
     port: int = 8765
     access_port: int = 8766
+    performance_profile: str = DEFAULT_PERFORMANCE_PROFILE
     api_key: str = field(default_factory=lambda: f"prag_{secrets.token_urlsafe(32)}")
     session_secret: str = field(default_factory=lambda: secrets.token_urlsafe(48))
     library_psk_secret: str = field(default_factory=lambda: secrets.token_urlsafe(48))
@@ -265,6 +271,9 @@ def _merge_dataclass(cls, raw: dict[str, Any] | None):
 
 
 def _normalize_runtime_residency(config: AppConfig) -> None:
+    config.performance_profile = normalize_performance_profile(
+        config.performance_profile
+    )
     config.runtime_residency.idle_minutes = max(
         1,
         int(config.runtime_residency.idle_minutes),
@@ -292,6 +301,7 @@ def load_config(path: Path) -> AppConfig:
             "public_adapter_url",
             "port",
             "access_port",
+            "performance_profile",
             "api_key",
             "session_secret",
             "library_psk_secret",
@@ -354,6 +364,7 @@ def app_config_from_dict(
             "public_adapter_url",
             "port",
             "access_port",
+            "performance_profile",
             "api_key",
             "session_secret",
             "library_psk_secret",

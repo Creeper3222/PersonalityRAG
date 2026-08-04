@@ -35,6 +35,8 @@ def test_revision_debug_webui_is_password_gated_typed_and_never_renders_raw_json
     assert 'type="password" autocomplete="current-password"' in index
     assert '"revision-debug"' in app
     assert 'api("/debug/session"' in module
+    assert "suppressUnauthorizedHandler: true" in module
+    assert "[401, 404].includes" in module
     assert 'api("/debug/revisions/overview"' in module
     assert "/debug/databases/${encode(databaseType)}/${encode(databaseId)}" in module
     assert 'revision.config?.has_api_key' in module
@@ -1051,6 +1053,46 @@ def test_memory_persona_editor_is_separate_from_content_editor() -> None:
     assert "if (content !== detail.text) payload.content = content;" in content_editor
 
 
+def test_livingmemory_256_memory_list_has_safe_batch_controls_and_stale_guard() -> None:
+    source = (STATIC_ROOT / "modules" / "memories.js").read_text(
+        encoding="utf-8"
+    )
+    html = (
+        STATIC_ROOT / "database-types" / "livingmemory-v8.html"
+    ).read_text(encoding="utf-8")
+    styles = (STATIC_ROOT / "styles.css").read_text(encoding="utf-8")
+
+    assert 'id="memory-select-page"' in html
+    assert 'id="memory-batch-importance-apply"' in html
+    assert 'id="memory-batch-archive"' in html
+    assert 'id="memory-batch-restore"' in html
+    assert 'id="memory-batch-delete"' in html
+    assert "let memoryLoadGeneration = 0;" in source
+    assert "if (generation !== memoryLoadGeneration) return;" in source
+    assert '"/memories/batch-update"' in source
+    assert '"/memories/batch-delete"' in source
+    assert 'value_scale: "display"' in source
+    assert 'field: "memory_type"' not in source
+    assert ".memory-table-wrap{max-height:min(58vh,720px)" in styles
+
+
+def test_livingmemory_256_detail_separates_content_and_summary_channels() -> None:
+    source = (STATIC_ROOT / "modules" / "memories.js").read_text(
+        encoding="utf-8"
+    )
+    html = (
+        STATIC_ROOT / "database-types" / "livingmemory-v8.html"
+    ).read_text(encoding="utf-8")
+
+    assert 't("retrievalContent")' in source
+    assert 'escapeHtml(detail.text)' in source
+    assert 't("canonicalSummary")' in source
+    assert 't("personaSummary")' in source
+    assert 'aria-hidden="true" inert' in html
+    assert '$("memory-detail-panel").inert = false;' in source
+    assert '$("memory-detail-panel").inert = true;' in source
+
+
 def test_livingmemory_v8_webui_has_no_user_selectable_memory_type() -> None:
     source = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
     memories = (STATIC_ROOT / "modules" / "memories.js").read_text(
@@ -1178,9 +1220,11 @@ def test_desktop_shell_and_library_cards_use_fluid_container_layout() -> None:
     assert "grid-template-columns:var(--desktop-sidebar-width) minmax(0,1fr)" in styles
     assert "#page-libraries{width:100%;max-width:var(--library-page-max);margin-inline:auto}" in styles
     assert "#library-cards{container-name:library-grid;container-type:inline-size" in styles
-    assert "repeat(auto-fit,minmax(min(100%,var(--library-card-min)),1fr))" in styles
-    assert "#library-cards:has(>.library-card:nth-child(3):last-child)>.library-card" in styles
-    assert "max-width:620px;justify-self:start" in styles
+    assert "grid-template-columns:repeat(3,minmax(0,1fr))" in styles
+    assert "#library-cards>.library-card{width:100%;max-width:none;justify-self:stretch}" in styles
+    assert "@media(max-width:1280px){#library-cards{grid-template-columns:repeat(2,minmax(0,1fr))}}" in styles
+    assert "repeat(auto-fit,minmax(min(100%,var(--library-card-min)),1fr))" not in styles
+    assert "max-width:620px;justify-self:start" not in styles
     assert "#library-cards>.library-card:last-child:nth-child(3n + 1){grid-column:2}" not in styles
     assert "#library-cards>.library-card:last-child:nth-child(2n + 1){grid-column:1/-1;justify-self:center}" not in styles
     assert ".selected-library-badge{display:inline-flex" in styles

@@ -8,17 +8,13 @@ from pathlib import Path
 import time
 from typing import Any, Callable
 import uuid
-import weakref
 
 from .performance import measure_phase
-from .resource_limits import configured_io_workers
+from .resource_quotas import io_slot
 
 
 FILE_CHUNK_BYTES = 1024 * 1024
 CHECKPOINT_SLOT_NAMES = ("checkpoint.a.json", "checkpoint.b.json")
-_io_limiters: weakref.WeakKeyDictionary[
-    asyncio.AbstractEventLoop, asyncio.Semaphore
-] = weakref.WeakKeyDictionary()
 
 
 class UploadSizeLimitError(ValueError):
@@ -26,14 +22,8 @@ class UploadSizeLimitError(ValueError):
 
 
 async def run_blocking(function: Callable, /, *args, **kwargs):
-    loop = asyncio.get_running_loop()
-    limiter = _io_limiters.get(loop)
-    if limiter is None:
-        limiter = asyncio.Semaphore(configured_io_workers())
-        _io_limiters[loop] = limiter
-
     async def invoke():
-        async with limiter:
+        async with io_slot():
             return await asyncio.to_thread(function, *args, **kwargs)
 
     task = asyncio.create_task(invoke())
@@ -184,17 +174,34 @@ async def save_upload_file(
     target: Path,
     *,
     max_bytes: int | None = None,
+    hasher: Any | None = None,
 ) -> int:
     source = getattr(upload, "file", None)
     try:
         if source is not None and callable(getattr(source, "read", None)):
-            return await run_blocking(_copy_upload_stream, source, target, max_bytes)
-        return await _copy_async_upload_stream(upload, target, max_bytes=max_bytes)
+            return await run_blocking(
+                _copy_upload_stream,
+                source,
+                target,
+                max_bytes,
+                hasher,
+            )
+        return await _copy_async_upload_stream(
+            upload,
+            target,
+            max_bytes=max_bytes,
+            hasher=hasher,
+        )
     finally:
         await upload.close()
 
 
-def _copy_upload_stream(source: Any, target: Path, max_bytes: int | None) -> int:
+def _copy_upload_stream(
+    source: Any,
+    target: Path,
+    max_bytes: int | None,
+    hasher: Any | None = None,
+) -> int:
     target.parent.mkdir(parents=True, exist_ok=True)
     total = 0
     try:
@@ -203,6 +210,8 @@ def _copy_upload_stream(source: Any, target: Path, max_bytes: int | None) -> int
                 total += len(chunk)
                 if max_bytes is not None and total > max_bytes:
                     raise UploadSizeLimitError("uploaded file exceeds size limit")
+                if hasher is not None:
+                    hasher.update(chunk)
                 handle.write(chunk)
             handle.flush()
         return total
@@ -216,6 +225,7 @@ async def _copy_async_upload_stream(
     target: Path,
     *,
     max_bytes: int | None,
+    hasher: Any | None = None,
 ) -> int:
     await run_blocking(target.parent.mkdir, parents=True, exist_ok=True)
     handle = await run_blocking(target.open, "wb")
@@ -225,6 +235,8 @@ async def _copy_async_upload_stream(
             total += len(chunk)
             if max_bytes is not None and total > max_bytes:
                 raise UploadSizeLimitError("uploaded file exceeds size limit")
+            if hasher is not None:
+                hasher.update(chunk)
             await run_blocking(handle.write, chunk)
         await run_blocking(handle.flush)
         return total
@@ -235,3 +247,11 @@ async def _copy_async_upload_stream(
     finally:
         if not handle.closed:
             await run_blocking(handle.close)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while chunk := handle.read(FILE_CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.hexdigest()

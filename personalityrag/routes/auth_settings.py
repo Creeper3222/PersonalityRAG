@@ -41,6 +41,12 @@ from ..http_shared import (
 )
 from ..io_utils import UploadSizeLimitError, run_blocking, save_upload_file
 from ..logger import logger
+from ..http_pool import http_pool_status
+from ..resource_limits import (
+    effective_performance_summary,
+    effective_runtime_capacity,
+    effective_runtime_idle_minutes,
+)
 from ..schemas import (
     BackupMigrationExportRequest,
     LoginRequest,
@@ -148,6 +154,26 @@ def _settings_payload() -> dict[str, Any]:
         config,
         access_port=actual_access_port,
     )
+    residency_status = manager.runtime_residency_status()
+    effective_performance = effective_performance_summary(
+        config.performance_profile
+    )
+    effective_performance.update(
+        {
+            "runtime_idle_minutes": effective_runtime_idle_minutes(
+                config.runtime_residency.idle_minutes,
+                config.performance_profile,
+            ),
+            "runtime_max_non_default": effective_runtime_capacity(
+                config.runtime_residency.max_non_default_runtimes,
+                config.performance_profile,
+            ),
+            "loaded_runtime_count": int(
+                residency_status.get("loaded_count") or 0
+            ),
+        }
+    )
+    effective_performance.update(http_pool_status())
     return {
         "host": config.host,
         "access_base_url": config.access_base_url,
@@ -170,6 +196,8 @@ def _settings_payload() -> dict[str, Any]:
         "port_change_requires_restart": True,
         "access_port_change_requires_restart": True,
         "version": __version__,
+        "performance_profile": config.performance_profile,
+        "effective_performance": effective_performance,
         "runtime_residency": {
             "idle_minutes": config.runtime_residency.idle_minutes,
             "max_non_default_runtimes": (
@@ -229,6 +257,13 @@ async def update_settings(payload: SettingsUpdate, response: Response):
         changed.append("password_set")
     residency_changed = False
     if (
+        payload.performance_profile is not None
+        and payload.performance_profile != config.performance_profile
+    ):
+        config.performance_profile = payload.performance_profile
+        changed.append("performance_profile")
+        residency_changed = True
+    if (
         payload.runtime_idle_minutes is not None
         and payload.runtime_idle_minutes != config.runtime_residency.idle_minutes
     ):
@@ -250,6 +285,14 @@ async def update_settings(payload: SettingsUpdate, response: Response):
     if changed:
         context = current_context()
         save_config(context.config_path, context.config)
+        if "performance_profile" in changed:
+            from ..faiss_runtime import configure_loaded_faiss_threads
+            from ..resource_quotas import reset_resource_quotas
+
+            reset_resource_quotas()
+            configure_loaded_faiss_threads(
+                config.performance_profile
+            )
         logger.warning(
             "基础设置已更新：fields=%s restart_required=%s",
             changed,

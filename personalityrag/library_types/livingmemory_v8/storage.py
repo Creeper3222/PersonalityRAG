@@ -15,7 +15,13 @@ import aiosqlite
 from .atoms import compute_atom_ttl
 from .migration import sha256_file
 from .source import serialize_source_messages
-from ...sqlite_pool import SQLiteConnectionPool
+from ...sqlite_pool import (
+    SQLiteConnectionPool,
+    close_aiosqlite_connection,
+    register_standalone_connection,
+)
+from ...resource_limits import configured_sqlite_pool_size
+from ...logger import logger
 from ...version import VERSION
 
 
@@ -52,9 +58,14 @@ class Storage:
         self.conversations_path = data_dir / "conversations.db"
         self.system_path = system_path or (data_dir / "personalityrag_system.db")
         self._write_lock = asyncio.Lock()
-        self._main_pool = SQLiteConnectionPool(self.db_path, size=2) if pooled else None
+        pool_size = configured_sqlite_pool_size()
+        self._main_pool = (
+            SQLiteConnectionPool(self.db_path, size=pool_size) if pooled else None
+        )
         self._conversations_pool = (
-            SQLiteConnectionPool(self.conversations_path, size=2) if pooled else None
+            SQLiteConnectionPool(self.conversations_path, size=pool_size)
+            if pooled
+            else None
         )
         self._system_pool = system_pool
         self._initialize_system = bool(initialize_system and system_pool is None)
@@ -66,6 +77,25 @@ class Storage:
             tuple[str, tuple[Any, ...]], asyncio.Task[dict[str, Any]]
         ] = {}
         self._statistics_lock = asyncio.Lock()
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+
+    def create_background_task(self, coroutine) -> asyncio.Task[Any]:
+        """Track a best-effort storage mutation through shutdown."""
+
+        task = asyncio.create_task(coroutine)
+        self._background_tasks.add(task)
+
+        def completed(item: asyncio.Task[Any]) -> None:
+            self._background_tasks.discard(item)
+            if item.cancelled():
+                return
+            try:
+                item.result()
+            except Exception:
+                logger.exception("LivingMemory 后台存储操作失败")
+
+        task.add_done_callback(completed)
+        return task
 
     def _invalidate_statistics(self) -> None:
         self._mutation_revision += 1
@@ -89,16 +119,30 @@ class Storage:
         mode: str,
         loader,
         *,
-        ttl_seconds: float = 2.0,
+        ttl_seconds: float | None = None,
     ) -> dict[str, Any]:
         now = time.monotonic()
         signature = self._statistics_signature()
         cached = self._statistics_cache.get(mode)
-        if cached and cached[0] == signature and now - cached[1] <= ttl_seconds:
+        if (
+            cached
+            and cached[0] == signature
+            and (
+                ttl_seconds is None
+                or now - cached[1] <= ttl_seconds
+            )
+        ):
             return copy.deepcopy(cached[2])
         async with self._statistics_lock:
             cached = self._statistics_cache.get(mode)
-            if cached and cached[0] == signature and now - cached[1] <= ttl_seconds:
+            if (
+                cached
+                and cached[0] == signature
+                and (
+                    ttl_seconds is None
+                    or now - cached[1] <= ttl_seconds
+                )
+            ):
                 return copy.deepcopy(cached[2])
             flight_key = (mode, signature)
             task = self._statistics_flights.get(flight_key)
@@ -134,17 +178,14 @@ class Storage:
                     self._invalidate_statistics()
                 await lease.close()
             return
-        db = await aiosqlite.connect(path)
-        db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA busy_timeout=10000")
-        await db.execute("PRAGMA foreign_keys=ON")
+        db = await self._open_sqlite(path, foreign_keys=True)
         total_changes = db.total_changes
         try:
             yield db
         finally:
             if not system and db.total_changes != total_changes:
                 self._invalidate_statistics()
-            await db.close()
+            await self._close_sqlite(db)
 
     @asynccontextmanager
     async def conversation_connect(self):
@@ -158,18 +199,52 @@ class Storage:
                     self._invalidate_statistics()
                 await lease.close()
             return
-        db = await aiosqlite.connect(self.conversations_path)
-        db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA busy_timeout=10000")
+        db = await self._open_sqlite(self.conversations_path, foreign_keys=False)
         total_changes = db.total_changes
         try:
             yield db
         finally:
             if db.total_changes != total_changes:
                 self._invalidate_statistics()
-            await db.close()
+            await self._close_sqlite(db)
+
+    @staticmethod
+    async def _open_sqlite(
+        path: Path,
+        *,
+        foreign_keys: bool,
+    ) -> aiosqlite.Connection:
+        pending_connection = aiosqlite.connect(path)
+        worker = getattr(pending_connection, "_thread", None)
+        if worker is not None:
+            worker.name = f"SQLiteDirect-{Path(path).name}"
+        opening = asyncio.ensure_future(pending_connection)
+        db: aiosqlite.Connection | None = None
+        try:
+            db = await asyncio.shield(opening)
+            register_standalone_connection(db)
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA busy_timeout=10000")
+            if foreign_keys:
+                await db.execute("PRAGMA foreign_keys=ON")
+            return db
+        except BaseException:
+            if db is None:
+                await asyncio.gather(opening, return_exceptions=True)
+                if not opening.cancelled() and opening.exception() is None:
+                    db = opening.result()
+            if db is not None:
+                await Storage._close_sqlite(db)
+            raise
+
+    @staticmethod
+    async def _close_sqlite(db: aiosqlite.Connection) -> None:
+        await close_aiosqlite_connection(db)
 
     async def close(self) -> None:
+        pending = tuple(self._background_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         pools = [
             pool
             for pool in (self._main_pool, self._conversations_pool)
@@ -982,7 +1057,10 @@ class Storage:
                 placeholders = ",".join("?" for _ in atom_columns)
                 await db.executemany(
                     f"INSERT INTO memory_atoms({quoted}) VALUES({placeholders})",
-                    [tuple(row[column] for column in atom_columns) for row in atom_rows],
+                    [
+                        tuple(row[column] for column in atom_columns)
+                        for row in atom_rows
+                    ],
                 )
                 await db.executemany(
                     "INSERT INTO memory_atoms_fts(atom_id,content) VALUES(?,?)",
@@ -1297,8 +1375,10 @@ class Storage:
     @staticmethod
     def _document_row(row: aiosqlite.Row) -> dict[str, Any]:
         metadata = normalize_document_metadata(row["metadata"])
-        has_source = bool(row["has_source"]) if "has_source" in row.keys() else bool(
-            metadata.get("has_source", False)
+        has_source = (
+            bool(row["has_source"])
+            if "has_source" in row.keys()
+            else bool(metadata.get("has_source", False))
         )
         return {
             "id": int(row["id"]),
@@ -1331,7 +1411,9 @@ class Storage:
         async with self._write_lock, self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             exists = await (
-                await db.execute("SELECT 1 FROM documents WHERE id=?", (int(memory_id),))
+                await db.execute(
+                    "SELECT 1 FROM documents WHERE id=?", (int(memory_id),)
+                )
             ).fetchone()
             if not exists:
                 await db.rollback()
@@ -1345,7 +1427,9 @@ class Storage:
                 (int(memory_id), json.dumps(source, ensure_ascii=False), now, now),
             )
             row = await (
-                await db.execute("SELECT metadata FROM documents WHERE id=?", (int(memory_id),))
+                await db.execute(
+                    "SELECT metadata FROM documents WHERE id=?", (int(memory_id),)
+                )
             ).fetchone()
             metadata = normalize_document_metadata(row["metadata"])
             metadata["has_source"] = True
@@ -1367,7 +1451,9 @@ class Storage:
                 "DELETE FROM memory_sources WHERE memory_id=?", (int(memory_id),)
             )
             row = await (
-                await db.execute("SELECT metadata FROM documents WHERE id=?", (int(memory_id),))
+                await db.execute(
+                    "SELECT metadata FROM documents WHERE id=?", (int(memory_id),)
+                )
             ).fetchone()
             if row:
                 metadata = normalize_document_metadata(row["metadata"])
@@ -1421,6 +1507,15 @@ class Storage:
                 {
                     "original_id": int(row["id"]),
                     "content": str(row["text"] or ""),
+                    "canonical_summary": str(
+                        metadata.get("canonical_summary") or row["text"] or ""
+                    ),
+                    "persona_summary": str(
+                        metadata.get("persona_summary")
+                        or metadata.get("canonical_summary")
+                        or row["text"]
+                        or ""
+                    ),
                     "importance": float(metadata.get("importance", 0.5) or 0.5),
                     "session_id": metadata.get("session_id"),
                     "persona_id": metadata.get("persona_id"),
@@ -1614,9 +1709,7 @@ class Storage:
             )
         return result
 
-    async def iter_graph_memories(
-        self, batch_size: int = 500, *, after_id: int = 0
-    ):
+    async def iter_graph_memories(self, batch_size: int = 500, *, after_id: int = 0):
         last_id = max(0, int(after_id))
         while True:
             ids = [
@@ -1691,6 +1784,204 @@ class Storage:
             }
             for row in rows
         ]
+
+    async def candidate_atom_evidence(
+        self,
+        candidate_ids: list[int],
+        tokens: list[str],
+        *,
+        max_atoms_per_candidate: int = 4,
+        now: float | None = None,
+    ) -> dict[int, dict[str, Any]]:
+        """Return live atomic facts for an already-selected recall candidate set.
+
+        This helper deliberately cannot discover new memories.  It is used only
+        after recall so expired/forgotten atoms and atoms owned by a memory outside
+        ``candidate_ids`` can never expand the rerank pool.
+        """
+
+        normalized_ids = [
+            int(item) for item in dict.fromkeys(candidate_ids) if int(item) > 0
+        ]
+        if not normalized_ids:
+            return {}
+        token_values = [
+            str(token).strip().casefold()
+            for token in dict.fromkeys(tokens)
+            if str(token).strip()
+        ]
+        placeholders = ",".join("?" for _ in normalized_ids)
+        atom_limit = max(1, min(8, int(max_atoms_per_candidate)))
+        captured_at = time.time() if now is None else float(now)
+        evidence: dict[int, dict[str, Any]] = {
+            memory_id: {
+                "keyword_score": 0.0,
+                "entity_score": 0.0,
+                "quality_score": 0.0,
+                "entries": [],
+                "_atom_ids": set(),
+            }
+            for memory_id in normalized_ids
+        }
+
+        def entity_values(value: Any) -> list[str]:
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except (TypeError, json.JSONDecodeError):
+                    value = [value]
+            if isinstance(value, dict):
+                items = [*value.keys(), *value.values()]
+            elif isinstance(value, (list, tuple, set)):
+                items = list(value)
+            elif value:
+                items = [value]
+            else:
+                items = []
+            return [str(item).strip() for item in items if str(item).strip()]
+
+        def overlap_score(values: list[str]) -> float:
+            if not token_values or not values:
+                return 0.0
+            searchable = "\n".join(values).casefold()
+            matched = sum(1 for token in token_values if token in searchable)
+            return max(0.0, min(1.0, matched / len(token_values)))
+
+        def bounded(value: Any, default: float) -> float:
+            try:
+                return max(0.0, min(1.0, float(value)))
+            except (TypeError, ValueError):
+                return default
+
+        def add_atom(
+            row: dict[str, Any],
+            *,
+            fts_score: float = 0.0,
+            source: str,
+        ) -> None:
+            memory_id = int(row["parent_memory_id"])
+            bucket = evidence.get(memory_id)
+            if bucket is None:
+                return
+            atom_id = int(row["id"])
+            if atom_id in bucket["_atom_ids"]:
+                return
+            content = str(row.get("content") or "").strip()
+            entities = entity_values(row.get("entities"))
+            literal_score = overlap_score([content])
+            entity_score = overlap_score(entities)
+            keyword_score = max(
+                max(0.0, min(1.0, float(fts_score))),
+                literal_score,
+            )
+            importance = bounded(row.get("importance"), 0.5)
+            confidence = bounded(row.get("confidence"), 0.7)
+            quality_score = (importance + confidence) / 2.0
+            match_score = max(keyword_score, entity_score)
+            bucket["_atom_ids"].add(atom_id)
+            bucket["keyword_score"] = max(
+                float(bucket.get("keyword_score") or 0.0), keyword_score
+            )
+            bucket["entity_score"] = max(
+                float(bucket.get("entity_score") or 0.0), entity_score
+            )
+            if match_score > 0:
+                bucket["quality_score"] = max(
+                    float(bucket.get("quality_score") or 0.0), quality_score
+                )
+            bucket["entries"].append(
+                {
+                    "atom_id": atom_id,
+                    "atom_type": str(row.get("atom_type") or "unknown"),
+                    "content": content,
+                    "entities": entities,
+                    "importance": importance,
+                    "confidence": confidence,
+                    "event_time": row.get("event_time"),
+                    "ttl_days": row.get("ttl_days"),
+                    "expires_at": row.get("expires_at"),
+                    "match_score": match_score,
+                    "source": source if match_score > 0 else "rerank_atom_fallback",
+                }
+            )
+
+        async with self.connect() as db:
+            if token_values:
+                fts = " OR ".join(
+                    f'"{token.replace(chr(34), chr(34) * 2)}"' for token in token_values
+                )
+                try:
+                    rows = await (
+                        await db.execute(
+                            f"""SELECT a.*,bm25(memory_atoms_fts) AS fts_rank
+                            FROM memory_atoms_fts af
+                            JOIN memory_atoms a ON a.id=af.atom_id
+                            WHERE memory_atoms_fts MATCH ?
+                            AND a.parent_memory_id IN ({placeholders})
+                            AND a.status='active'
+                            AND (a.expires_at IS NULL OR a.expires_at>?)
+                            ORDER BY fts_rank ASC,a.id DESC
+                            LIMIT ?""",
+                            (
+                                fts,
+                                *normalized_ids,
+                                captured_at,
+                                max(len(normalized_ids) * atom_limit * 2, atom_limit),
+                            ),
+                        )
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    rows = []
+                if rows:
+                    ranks = [float(row["fts_rank"]) for row in rows]
+                    high, low = max(ranks), min(ranks)
+                    span = high - low
+                    for row in rows:
+                        score = (
+                            1.0 if span == 0 else (high - float(row["fts_rank"])) / span
+                        )
+                        add_atom(dict(row), fts_score=score, source="rerank_atom_fts")
+
+            fallback_rows = await (
+                await db.execute(
+                    f"""SELECT * FROM memory_atoms
+                    WHERE parent_memory_id IN ({placeholders})
+                    AND status='active'
+                    AND (expires_at IS NULL OR expires_at>?)
+                    ORDER BY parent_memory_id ASC,
+                    (importance * confidence) DESC,
+                    COALESCE(last_reinforced_at,last_accessed_at,created_at) DESC,
+                    id DESC""",
+                    (*normalized_ids, captured_at),
+                )
+            ).fetchall()
+            for row in fallback_rows:
+                add_atom(dict(row), source="rerank_atom_literal")
+
+        result: dict[int, dict[str, Any]] = {}
+        for memory_id, payload in evidence.items():
+            entries = sorted(
+                payload["entries"],
+                key=lambda item: (
+                    float(item.get("match_score") or 0.0),
+                    (
+                        float(item.get("importance") or 0.0)
+                        + float(item.get("confidence") or 0.0)
+                    )
+                    / 2.0,
+                    int(item.get("atom_id") or 0),
+                ),
+                reverse=True,
+            )[:atom_limit]
+            if not entries:
+                continue
+            result[memory_id] = {
+                "keyword_score": float(payload.get("keyword_score") or 0.0),
+                "entity_score": float(payload.get("entity_score") or 0.0),
+                "quality_score": float(payload.get("quality_score") or 0.0),
+                "entries": entries,
+            }
+        return result
 
     async def candidate_graph_evidence(
         self,
@@ -1940,7 +2231,17 @@ class Storage:
                     f"""SELECT id,source_memory_id,content,metadata,entry_type,relation_type
                     FROM graph_entries
                     WHERE source_memory_id IN ({placeholders})
-                    ORDER BY source_memory_id ASC, id DESC""",
+                    ORDER BY source_memory_id ASC,
+                    CASE
+                        WHEN entry_type='fact' THEN 0
+                        WHEN relation_type='describes' THEN 1
+                        WHEN relation_type='mentioned_in' THEN 2
+                        WHEN entry_type='topic' THEN 3
+                        WHEN entry_type='participant' THEN 4
+                        WHEN relation_type='co_occurs_with' THEN 5
+                        ELSE 6
+                    END ASC,
+                    id DESC""",
                     (*normalized_ids,),
                 )
             ).fetchall()
@@ -2022,9 +2323,7 @@ class Storage:
         if source_messages:
             metadata["has_source"] = True
             metadata["source_message_count"] = len(source_messages)
-        source_time_strategy = str(
-            payload.get("source_time_strategy") or "preserve"
-        )
+        source_time_strategy = str(payload.get("source_time_strategy") or "preserve")
         metadata["source_time_strategy"] = source_time_strategy
         if source_time_strategy != "none" and isinstance(
             payload.get("source_time_tags"), dict
@@ -2302,7 +2601,11 @@ class Storage:
                 metadata[key] = updates[key]
         metadata.pop("memory_type", None)
         metadata["updated_at"] = time.time()
-        if "content" in updates:
+        if (
+            "content" in updates
+            and "canonical_summary"
+            not in normalize_document_metadata(updates.get("metadata"))
+        ):
             metadata["canonical_summary"] = text
         async with self._write_lock, self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
@@ -2434,7 +2737,9 @@ class Storage:
                     ).fetchall()
                 )
             row_map = {int(row["id"]): row for row in rows}
-            existing_ids = [memory_id for memory_id in requested if memory_id in row_map]
+            existing_ids = [
+                memory_id for memory_id in requested if memory_id in row_map
+            ]
             document_updates: list[tuple[str, int]] = []
             metadata_by_id: dict[int, dict[str, Any]] = {}
             nested_updates = normalize_document_metadata(updates.get("metadata"))
@@ -2483,7 +2788,9 @@ class Storage:
                     ).fetchall()
                     for graph_row in graph_rows:
                         graph_metadata = normalize_metadata(graph_row["metadata"])
-                        source_metadata = metadata_by_id[int(graph_row["source_memory_id"])]
+                        source_metadata = metadata_by_id[
+                            int(graph_row["source_memory_id"])
+                        ]
                         graph_metadata.update(
                             {key: source_metadata.get(key) for key in graph_keys}
                         )
@@ -2500,9 +2807,7 @@ class Storage:
                         graph_updates,
                     )
 
-            scope_keys = [
-                key for key in ("session_id", "persona_id") if key in updates
-            ]
+            scope_keys = [key for key in ("session_id", "persona_id") if key in updates]
             if scope_keys:
                 for chunk in self._id_chunks(existing_ids):
                     placeholders = ",".join("?" for _ in chunk)
@@ -2643,9 +2948,7 @@ class Storage:
             await self._insert_graph(
                 db, graph_builder(int(memory_id), text, metadata), tokenize
             )
-            await self._insert_atoms(
-                db, int(memory_id), atoms or [], metadata
-            )
+            await self._insert_atoms(db, int(memory_id), atoms or [], metadata)
             await db.commit()
         return True
 
@@ -2807,13 +3110,8 @@ class Storage:
                 orphan_edge_ids.append(edge_id)
                 continue
 
-            metadata_rows = [
-                normalize_metadata(row["metadata"])
-                for row in remaining
-            ]
-            confidence = float(
-                metadata_rows[0].get("graph_confidence", 0.8) or 0.8
-            )
+            metadata_rows = [normalize_metadata(row["metadata"]) for row in remaining]
+            confidence = float(metadata_rows[0].get("graph_confidence", 0.8) or 0.8)
             for metadata in metadata_rows[1:]:
                 confidence = (
                     confidence * 0.7

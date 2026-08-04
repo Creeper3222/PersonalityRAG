@@ -22,6 +22,7 @@ from .providers import config_from_dict, masked_config, provider_kind
 from .task_types import ACTIVE_JOB_STATUSES
 from . import library_types as _registered_database_types  # noqa: F401
 from .storage_layout import DatabaseLayout
+from .logger import logger
 
 
 class DatabaseManager:
@@ -57,6 +58,8 @@ class DatabaseManager:
         self._forced_adapter_connections: dict[
             tuple[DatabaseRef, str], dict[str, Any]
         ] = {}
+        self._online_prewarm_task: asyncio.Task[None] | None = None
+        self._summary_list_task: asyncio.Task[list[dict[str, Any]]] | None = None
 
     def _database_ref(self, database: str | DatabaseRef) -> DatabaseRef:
         if isinstance(database, DatabaseRef):
@@ -121,10 +124,89 @@ class DatabaseManager:
             ): item
             for item in await self.control.forced_adapter_connections()
         }
+        identities = await self.control.list_database_identities()
+        refs = [
+            DatabaseRef(str(item["database_type"]), str(item["id"]))
+            for item in identities
+            if str(item.get("database_type") or "") in self._managers
+        ]
+        if refs:
+            active_map = await self.control.active_database_adapter_connections_map(
+                refs
+            )
+            online_refs = [ref for ref in refs if active_map.get(ref.key)]
+            if online_refs:
+                self._online_prewarm_task = asyncio.create_task(
+                    self._prewarm_online_runtimes(online_refs),
+                    name="personalityrag-online-runtime-prewarm",
+                )
         if self.services.jobs is not None:
             await self.services.jobs.recover_for_startup()
 
+    async def _prewarm_online_runtimes(
+        self,
+        refs: list[DatabaseRef],
+    ) -> None:
+        limiter = asyncio.Semaphore(2)
+
+        async def warm(ref: DatabaseRef) -> None:
+            async with limiter:
+                try:
+                    await self._managers[ref.database_type].get_runtime(
+                        ref,
+                        touch=False,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "在线适配器数据库后台预热失败：database=%s",
+                        ref.key,
+                    )
+
+        await asyncio.gather(*(warm(ref) for ref in refs))
+
+    async def suspend_runtime_activity(self) -> None:
+        """Drain cold-load activity before replacing database directories."""
+
+        owner = asyncio.current_task()
+        if self._online_prewarm_task is not None:
+            self._online_prewarm_task.cancel()
+            await asyncio.gather(
+                self._online_prewarm_task,
+                return_exceptions=True,
+            )
+            self._online_prewarm_task = None
+        await asyncio.gather(
+            *(
+                manager.suspend_runtime_loading(owner=owner)
+                for manager in self._managers.values()
+            )
+        )
+
+    async def resume_runtime_activity(self) -> None:
+        await asyncio.gather(
+            *(
+                manager.resume_runtime_loading()
+                for manager in self._managers.values()
+            )
+        )
+
     async def close(self) -> None:
+        if self._summary_list_task is not None:
+            self._summary_list_task.cancel()
+            await asyncio.gather(
+                self._summary_list_task,
+                return_exceptions=True,
+            )
+            self._summary_list_task = None
+        if self._online_prewarm_task is not None:
+            self._online_prewarm_task.cancel()
+            await asyncio.gather(
+                self._online_prewarm_task,
+                return_exceptions=True,
+            )
+            self._online_prewarm_task = None
         waiters = [
             future
             for group in self._adapter_disconnect_waiters.values()
@@ -137,6 +219,16 @@ class DatabaseManager:
                 future.cancel()
         for manager in reversed(list(self._managers.values())):
             await manager.close()
+        # Offline summaries and short-lived inspection helpers own pools that
+        # are intentionally not attached to a resident runtime. Close the
+        # process-wide registry as the final SQLite safety net so no aiosqlite
+        # worker can keep the interpreter alive after a graceful restart.
+        from .sqlite_pool import SQLiteConnectionPool
+
+        await SQLiteConnectionPool.close_open_pools()
+        from .http_pool import close_http_pools
+
+        await close_http_pools()
         self.storage_layout.close()
 
     def subscribe_adapter_disconnect(
@@ -215,10 +307,16 @@ class DatabaseManager:
             (self._database_ref(database), adapter_id), None
         )
 
-    async def list_libraries(self, *args, **kwargs) -> list[dict[str, Any]]:
-        items: list[dict[str, Any]] = []
-        for manager in self._managers.values():
-            items.extend(await manager.list_libraries(*args, **kwargs))
+    async def _list_libraries_uncached(
+        self, *args, **kwargs
+    ) -> list[dict[str, Any]]:
+        grouped = await asyncio.gather(
+            *(
+                manager.list_libraries(*args, **kwargs)
+                for manager in self._managers.values()
+            )
+        )
+        items = [item for group in grouped for item in group]
         return sorted(
             items,
             key=lambda item: (
@@ -228,6 +326,56 @@ class DatabaseManager:
                 str(item.get("id") or ""),
             ),
         )
+
+    async def list_libraries(self, *args, **kwargs) -> list[dict[str, Any]]:
+        if kwargs.get("stats_mode") != "summary":
+            return await self._list_libraries_uncached(*args, **kwargs)
+
+        # Coalesce only overlapping requests.  The completed result is never
+        # retained, so invalidation and freshness semantics remain unchanged.
+        task = self._summary_list_task
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._list_libraries_uncached(*args, **kwargs),
+                name="database-summary-snapshot",
+            )
+            self._summary_list_task = task
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if task.done() and self._summary_list_task is task:
+                self._summary_list_task = None
+
+    async def apply_runtime_residency(self) -> dict[str, list[str]]:
+        results: dict[str, list[str]] = {}
+        for database_type, manager in self._managers.items():
+            apply = getattr(manager, "apply_runtime_residency", None)
+            if callable(apply):
+                results[database_type] = list(await apply())
+        return results
+
+    def runtime_residency_status(self) -> dict[str, Any]:
+        by_type: dict[str, dict[str, Any]] = {}
+        loaded_databases: list[dict[str, str]] = []
+        for database_type, manager in self._managers.items():
+            status_factory = getattr(manager, "runtime_residency_status", None)
+            if callable(status_factory):
+                status = dict(status_factory())
+            else:
+                status = {
+                    "loaded_databases": [
+                        ref.public() for ref in manager.runtimes
+                    ]
+                }
+            by_type[database_type] = status
+            loaded_databases.extend(status.get("loaded_databases") or [])
+        primary = dict(by_type.get(LIVINGMEMORY_V8_TYPE) or {})
+        return {
+            **primary,
+            "loaded_databases": loaded_databases,
+            "loaded_count": len(loaded_databases),
+            "by_type": by_type,
+        }
 
     def _enrich_provider_usage(self, item: dict[str, Any]) -> dict[str, Any]:
         result = dict(item)
@@ -249,6 +397,23 @@ class DatabaseManager:
             )
         )
         return result
+
+    @staticmethod
+    def _provider_usage_sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
+        category_order = {"memory": 0, "knowledge": 1}
+        return (
+            category_order.get(str(item.get("database_category") or ""), 9),
+            str(
+                item.get("database_name")
+                or item.get("library_name")
+                or item.get("database_id")
+                or ""
+            ),
+            str(item.get("type_display_name") or ""),
+            str(item.get("database_type") or ""),
+            str(item.get("database_id") or ""),
+            str(item.get("usage_kind") or ""),
+        )
 
     async def provider_usage(
         self,
@@ -287,30 +452,64 @@ class DatabaseManager:
                     continue
                 seen.add(key)
                 usage.append(enriched)
-        category_order = {"memory": 0, "knowledge": 1}
-        return sorted(
-            usage,
-            key=lambda item: (
-                category_order.get(str(item.get("database_category") or ""), 9),
-                str(
-                    item.get("database_name")
-                    or item.get("library_name")
-                    or item.get("database_id")
-                    or ""
-                ),
-                str(item.get("type_display_name") or ""),
-                str(item.get("database_type") or ""),
-                str(item.get("database_id") or ""),
-                str(item.get("usage_kind") or ""),
-            ),
-        )
+        return sorted(usage, key=self._provider_usage_sort_key)
 
     async def list_providers(self, kind: str | None = None) -> list[dict[str, Any]]:
         items = await self.control.list_providers(kind)
+        provider_ids = {
+            str(item.get("id") or "") for item in items if item.get("id")
+        }
+        usage_by_provider = {
+            provider_id: [
+                self._enrich_provider_usage(entry)
+                for entry in list(item.get("used_by") or [])
+            ]
+            for provider_id, item in (
+                (str(item.get("id") or ""), item) for item in items
+            )
+            if provider_id
+        }
+        seen_by_provider = {
+            provider_id: {
+                (
+                    entry.get("database_type"),
+                    entry.get("database_id"),
+                    entry.get("usage_kind") or "embedding",
+                )
+                for entry in usage
+            }
+            for provider_id, usage in usage_by_provider.items()
+        }
+        for manager in self._managers.values():
+            usage_map_factory = getattr(manager, "provider_usage_map", None)
+            if callable(usage_map_factory):
+                manager_usage = await usage_map_factory(provider_ids)
+            else:
+                usage_factory = getattr(manager, "provider_usage", None)
+                if not callable(usage_factory):
+                    continue
+                values = await asyncio.gather(
+                    *(usage_factory(provider_id) for provider_id in provider_ids)
+                )
+                manager_usage = dict(zip(provider_ids, values, strict=True))
+            for provider_id, entries in manager_usage.items():
+                usage = usage_by_provider.setdefault(provider_id, [])
+                seen = seen_by_provider.setdefault(provider_id, set())
+                for entry in entries:
+                    enriched = self._enrich_provider_usage(entry)
+                    key = (
+                        enriched.get("database_type"),
+                        enriched.get("database_id"),
+                        enriched.get("usage_kind") or "embedding",
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    usage.append(enriched)
         for item in items:
-            item["used_by"] = await self.provider_usage(
-                str(item.get("id") or ""),
-                base_usage=list(item.get("used_by") or []),
+            item["used_by"] = sorted(
+                usage_by_provider.get(str(item.get("id") or ""), []),
+                key=self._provider_usage_sort_key,
             )
         return items
 

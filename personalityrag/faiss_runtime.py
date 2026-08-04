@@ -138,4 +138,19 @@ def load_faiss():
             "dependency_load_failed",
             "FAISS passed its subprocess probe but failed to import in-process.",
         ) from exc
+    from .resource_limits import configured_faiss_threads
+
+    faiss.omp_set_num_threads(configured_faiss_threads())
     return faiss
+
+
+def configure_loaded_faiss_threads(profile: str | None = None) -> bool:
+    """Apply a profile change without forcing the native runtime to import."""
+
+    faiss = sys.modules.get("faiss")
+    if faiss is None:
+        return False
+    from .resource_limits import configured_faiss_threads
+
+    faiss.omp_set_num_threads(configured_faiss_threads(profile))
+    return True

@@ -23,7 +23,6 @@ MAX_TRANSFER_RECORDS = 10_000
 PREVIEW_TTL_SECONDS = 30 * 60
 _FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r", "\n")
 _CONTENT_KEYS = (
-    "canonical_summary",
     "content",
     "text",
     "summary",
@@ -220,7 +219,15 @@ def normalize_transfer_record(raw: Any, row_number: int) -> dict[str, Any]:
     normalized_persona_id = (
         str(persona_id).strip() if persona_id not in (None, "") else None
     )
-    content = _normalize_space(_first_value(raw, _CONTENT_KEYS))
+    canonical_summary = _normalize_space(
+        raw.get("canonical_summary")
+        or metadata.get("canonical_summary")
+    )
+    content = _normalize_space(
+        _first_value(raw, _CONTENT_KEYS) or canonical_summary
+    )
+    if not canonical_summary:
+        canonical_summary = content
     source_messages = _source_value(raw, normalized_session_id)
     if not source_messages:
         user_text = _first_value(raw, ("user", "human", "query", "input"))
@@ -283,7 +290,7 @@ def normalize_transfer_record(raw: Any, row_number: int) -> dict[str, Any]:
         "preview_item_id": item_id,
         "row_number": row_number,
         "content": content,
-        "canonical_summary": content,
+        "canonical_summary": canonical_summary,
         "persona_summary": persona_summary,
         "session_id": normalized_session_id,
         "persona_id": normalized_persona_id,
@@ -412,6 +419,35 @@ def parse_transfer_bytes(data: bytes, filename: str = "transfer.json") -> list[A
         raise MemoryTransferError("only JSON and CSV transfer files are supported")
     try:
         return _raw_records(json.loads(text))
+    except json.JSONDecodeError as exc:
+        raise MemoryTransferError("JSON transfer is malformed") from exc
+
+
+def parse_transfer_file(path: Path, filename: str | None = None) -> list[Any]:
+    """Parse a bounded transfer without creating a second full-file byte copy."""
+
+    path = Path(path)
+    if path.stat().st_size > MAX_TRANSFER_BYTES:
+        raise MemoryTransferError("transfer file exceeds 50 MiB")
+    suffix = Path(filename or path.name).suffix.lower()
+    if suffix == ".csv":
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                rows = [_unescape_csv_row(row) for row in csv.DictReader(handle)]
+        except UnicodeDecodeError as exc:
+            raise MemoryTransferError("transfer file must use UTF-8") from exc
+        except csv.Error as exc:
+            raise MemoryTransferError("CSV transfer is malformed") from exc
+        if not rows:
+            raise MemoryTransferError("CSV transfer contains no records")
+        return rows
+    if suffix not in {".json", ""}:
+        raise MemoryTransferError("only JSON and CSV transfer files are supported")
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            return _raw_records(json.load(handle))
+    except UnicodeDecodeError as exc:
+        raise MemoryTransferError("transfer file must use UTF-8") from exc
     except json.JSONDecodeError as exc:
         raise MemoryTransferError("JSON transfer is malformed") from exc
 
@@ -554,8 +590,10 @@ def apply_transfer_summaries(
         item = dict(source)
         if item.get("needs_summary"):
             summary = by_id.get(str(item.get("preview_item_id") or "")) or {}
-            canonical = _normalize_space(summary.get("canonical_summary"))
-            if not canonical:
+            content = _normalize_space(
+                summary.get("content") or summary.get("canonical_summary")
+            )
+            if not content:
                 errors.append(
                     {
                         "preview_item_id": item.get("preview_item_id"),
@@ -564,10 +602,13 @@ def apply_transfer_summaries(
                     }
                 )
                 continue
-            item["content"] = canonical
+            canonical = _normalize_space(
+                summary.get("canonical_summary") or content
+            )
+            item["content"] = content
             item["canonical_summary"] = canonical
             item["persona_summary"] = _normalize_space(
-                summary.get("persona_summary") or canonical
+                summary.get("persona_summary") or content
             )
             item["key_facts"] = _list_value(
                 summary.get("key_facts") or item.get("key_facts")
@@ -588,7 +629,7 @@ def apply_transfer_summaries(
             )
             item["needs_summary"] = False
             item["dedupe_key"] = transfer_dedupe_key(
-                canonical, item.get("session_id"), item.get("persona_id")
+                content, item.get("session_id"), item.get("persona_id")
             )
         ready.append(item)
     return ready, errors
@@ -617,6 +658,7 @@ def export_transfer_json(records: Iterable[dict[str, Any]]) -> bytes:
 def export_transfer_csv(records: Iterable[dict[str, Any]]) -> bytes:
     fields = (
         "content",
+        "canonical_summary",
         "persona_summary",
         "importance",
         "status",
@@ -644,3 +686,67 @@ def export_transfer_csv(records: Iterable[dict[str, Any]]) -> bytes:
             }
         )
     return ("\ufeff" + output.getvalue()).encode("utf-8")
+
+
+def iter_export_transfer_json(
+    records: Iterable[dict[str, Any]],
+    *,
+    created_at: float | None = None,
+) -> Iterable[bytes]:
+    """Yield the native JSON format one record at a time."""
+
+    timestamp = time.time() if created_at is None else float(created_at)
+    yield (
+        "{\n"
+        f'  "format": {json.dumps(TRANSFER_FORMAT)},\n'
+        f'  "version": {TRANSFER_VERSION},\n'
+        f'  "created_at": {json.dumps(timestamp)},\n'
+        '  "memories": ['
+    ).encode("utf-8")
+    emitted = False
+    for record in records:
+        encoded = json.dumps(record, ensure_ascii=False, indent=2)
+        indented = "\n".join(f"    {line}" for line in encoded.splitlines())
+        yield ((",\n" if emitted else "\n") + indented).encode("utf-8")
+        emitted = True
+    yield ("\n  ]\n}" if emitted else "]\n}").encode("utf-8")
+
+
+def iter_export_transfer_csv(
+    records: Iterable[dict[str, Any]],
+) -> Iterable[bytes]:
+    """Yield the native CSV format without building one large string."""
+
+    fields = (
+        "content",
+        "canonical_summary",
+        "persona_summary",
+        "importance",
+        "status",
+        "session_id",
+        "persona_id",
+        "topics",
+        "participants",
+        "key_facts",
+        "source_messages",
+        "metadata",
+    )
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=fields, lineterminator="\n")
+    writer.writeheader()
+    yield ("\ufeff" + output.getvalue()).encode("utf-8")
+    for record in records:
+        output.seek(0)
+        output.truncate(0)
+        metadata = dict(record.get("metadata") or {})
+        writer.writerow(
+            {
+                field: _csv_cell(
+                    record.get(field)
+                    if field not in {"persona_summary", "status"}
+                    else metadata.get(field, record.get(field))
+                )
+                for field in fields
+            }
+        )
+        yield output.getvalue().encode("utf-8")

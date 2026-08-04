@@ -165,6 +165,7 @@ function settingsDraft() {
     access_port: Number($("settings-access-port")?.value || 0),
     new_password: $("settings-password")?.value || "",
     clear_password: Boolean($("settings-clear-password")?.checked),
+    performance_profile: $("settings-performance-profile")?.value || "adaptive",
     runtime_idle_minutes: Number($("settings-runtime-idle-minutes")?.value || 0),
     max_non_default_runtimes: Number($("settings-runtime-max-non-default")?.value || 0),
   };
@@ -178,11 +179,33 @@ function hasUnsavedSettingsChanges() {
     draft.public_adapter_url !== (state.settings.public_adapter_url || "") ||
     draft.port !== Number(state.settings.configured_port || 8765) ||
     draft.access_port !== Number(state.settings.configured_access_port || 8766) ||
+    draft.performance_profile !== (state.settings.performance_profile || "adaptive") ||
     draft.runtime_idle_minutes !== Number(state.settings.runtime_residency?.idle_minutes || 30) ||
     draft.max_non_default_runtimes !== Number(state.settings.runtime_residency?.max_non_default_runtimes || 4) ||
     Boolean(draft.new_password) ||
     draft.clear_password
   );
+}
+
+function formatEffectiveBytes(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "—";
+  const gib = bytes / (1024 ** 3);
+  return gib >= 1 ? `${gib.toFixed(gib >= 10 ? 0 : 1)} GiB` : `${Math.round(bytes / (1024 ** 2))} MiB`;
+}
+
+function renderEffectivePerformance(payload = {}) {
+  const target = $("settings-effective-performance");
+  if (!target) return;
+  const items = [
+    [t("effectiveCpu"), payload.effective_cpu_count ?? "—"],
+    [t("effectiveMemory"), formatEffectiveBytes(payload.effective_memory_limit_bytes)],
+    [t("effectiveRuntimeBudget"), formatEffectiveBytes(payload.runtime_memory_budget_bytes)],
+    [t("effectiveRuntimeCount"), `${payload.loaded_runtime_count ?? 0} / ${payload.runtime_max_non_default ?? "—"}`],
+    [t("effectiveThreads"), `${payload.faiss_threads ?? "—"} / ${payload.io_workers ?? "—"}`],
+    [t("effectiveHttpPools"), `${payload.transport_pool_count ?? 0} / ${payload.transport_lease_count ?? 0}`],
+  ];
+  target.innerHTML = items.map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(String(value))}</strong></div>`).join("");
 }
 
 function clearRestartTimer() {
@@ -387,8 +410,10 @@ async function loadSettings() {
       data.login_password_enabled ? t("loginModePassword") : t("loginModeApiKey");
     $("settings-password").value = "";
     $("settings-clear-password").checked = false;
+    $("settings-performance-profile").value = data.performance_profile || "adaptive";
     $("settings-runtime-idle-minutes").value = data.runtime_residency?.idle_minutes || 30;
     $("settings-runtime-max-non-default").value = data.runtime_residency?.max_non_default_runtimes || 4;
+    renderEffectivePerformance(data.effective_performance || {});
     $("settings-note").textContent = t("settingsPortRestartHint");
     await loadUpdateStatus();
   } catch (error) {

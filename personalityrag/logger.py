@@ -176,7 +176,7 @@ class WebLogBuffer:
 
 class WebLogHandler(logging.Handler):
     def __init__(self, buffer: WebLogBuffer):
-        super().__init__(level=logging.DEBUG)
+        super().__init__()
         self.buffer = buffer
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -268,9 +268,10 @@ def configure_logging(
     )
 
     app_logger = logging.getLogger(LOGGER_NAME)
-    # Keep DEBUG records available to the WebUI buffer while file and console
-    # handlers continue to honor the configured persistent logging level.
-    app_logger.setLevel(logging.DEBUG)
+    # Avoid constructing and redacting records that every configured sink
+    # would discard. DEBUG remains available when the configured level is
+    # explicitly DEBUG.
+    app_logger.setLevel(level)
     app_logger.propagate = False
     for handler in list(app_logger.handlers):
         app_logger.removeHandler(handler)
@@ -289,7 +290,7 @@ def configure_logging(
     file_handler.setFormatter(formatter)
 
     web_handler = WebLogHandler(_buffer)
-    web_handler.setLevel(logging.DEBUG)
+    web_handler.setLevel(level)
 
     stream_handler = logging.StreamHandler()
     stream_handler.setLevel(level)

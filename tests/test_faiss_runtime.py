@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -74,3 +75,18 @@ def test_unrelated_import_error_does_not_try_generic(monkeypatch):
 
     assert raised.value.code == "dependency_load_failed"
     assert calls == [False]
+
+
+def test_profile_change_only_reconfigures_an_already_loaded_faiss(monkeypatch):
+    monkeypatch.delitem(faiss_runtime.sys.modules, "faiss", raising=False)
+    assert faiss_runtime.configure_loaded_faiss_threads("memory") is False
+
+    calls: list[int] = []
+    fake = SimpleNamespace(omp_set_num_threads=calls.append)
+    monkeypatch.setitem(faiss_runtime.sys.modules, "faiss", fake)
+    monkeypatch.setattr(
+        "personalityrag.resource_limits.configured_faiss_threads",
+        lambda profile=None: 3 if profile == "latency" else 1,
+    )
+    assert faiss_runtime.configure_loaded_faiss_threads("latency") is True
+    assert calls == [3]

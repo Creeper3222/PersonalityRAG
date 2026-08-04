@@ -103,9 +103,14 @@ export function createRevisionDebugController({
 
   async function refreshSessionStatus({ redirectIfLocked = false } = {}) {
     try {
-      session = await api("/debug/session", { pageScoped: false });
+      session = await api("/debug/session", {
+        pageScoped: false,
+        suppressUnauthorizedHandler: true,
+        suppressOperationalError: true,
+      });
     } catch (error) {
       handleLocked({ redirect: redirectIfLocked });
+      if ([401, 404].includes(Number(error?.status || 0))) return session;
       throw error;
     }
     if (!session.unlocked || remainingSeconds() <= 0) {

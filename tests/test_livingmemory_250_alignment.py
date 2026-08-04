@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import json
@@ -323,6 +324,8 @@ async def test_memory_source_is_lazy_and_cascades_on_delete(tmp_path: Path) -> N
 
     records = await storage.memory_transfer_records([memory_id])
     assert records[0]["source_messages"] == source
+    assert records[0]["content"] == "用户计划周五发布新版本"
+    assert records[0]["canonical_summary"] == "用户计划周五发布新版本"
     assert await storage.delete_memories([memory_id]) == 1
     assert await storage.get_memory_source(memory_id) == []
     await storage.close()
@@ -366,6 +369,48 @@ async def test_recall_marks_only_memories_that_have_retained_source(
     assert result[0]["metadata"]["has_source"] is True
     assert result[1]["has_source"] is False
     await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_storage_close_drains_retrieval_access_tracking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = Storage(tmp_path)
+    await storage.initialize()
+    text = TextProcessor()
+    memory_id = await storage.create_memory(
+        {"content": "tracked release note"},
+        text.tokenize,
+        GraphBuilder().build,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_touch(document_ids) -> None:
+        tuple(document_ids)
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(storage, "touch_documents", delayed_touch)
+    engine = RetrievalEngine(
+        storage,
+        _StubIndexes([(memory_id, 0.9)]),  # type: ignore[arg-type]
+        text,
+        RecallConfig(
+            graph_memory_enabled=False,
+            recent_memory_count=0,
+            search_cache_enabled=False,
+        ),
+    )
+
+    assert await engine.search("release note", 1)
+    await started.wait()
+    closing = asyncio.create_task(storage.close())
+    await asyncio.sleep(0)
+    assert not closing.done()
+    release.set()
+    await closing
 
 
 @pytest.mark.asyncio
@@ -428,6 +473,7 @@ async def test_transfer_preview_supports_external_json_source_only_and_dedupe(
         [
             {
                 "preview_item_id": "2",
+                "content": "I remember tea. | The user prefers tea.",
                 "canonical_summary": "The user prefers tea.",
                 "persona_summary": "I remember that you prefer tea.",
                 "importance": 0.8,
@@ -435,6 +481,7 @@ async def test_transfer_preview_supports_external_json_source_only_and_dedupe(
         ],
     )
     assert errors == []
+    assert ready[1]["content"] == "I remember tea. | The user prefers tea."
     assert ready[1]["canonical_summary"] == "The user prefers tea."
     assert len(ready[1]["source_messages"]) == 2
     await storage.close()
@@ -445,6 +492,7 @@ def test_transfer_csv_export_escapes_formula_cells() -> None:
         [
             {
                 "content": "=HYPERLINK(\"https://example.invalid\")",
+                "canonical_summary": "=canonical",
                 "metadata": {"persona_summary": "+formula", "status": "active"},
                 "source_messages": [],
             }
@@ -452,6 +500,7 @@ def test_transfer_csv_export_escapes_formula_cells() -> None:
     ).decode("utf-8-sig")
     row = next(csv.DictReader(io.StringIO(exported)))
     assert row["content"].startswith("'=")
+    assert row["canonical_summary"].startswith("'=")
     assert row["persona_summary"].startswith("'+")
 
 
@@ -500,6 +549,58 @@ def test_transfer_accepts_250_external_collections_and_csv_round_trip() -> None:
     round_trip = inspect_transfer_records(imported, set())
     assert round_trip["items"][0]["content"] == "=formula-like memory"
     assert round_trip["items"][0]["persona_summary"] == "+persona"
+
+
+def test_transfer_256_keeps_content_and_optional_canonical_separate() -> None:
+    payload = {
+        "memories": [
+            {
+                "content": "第一人称摘要 | 客观事实一；客观事实二",
+                "canonical_summary": "客观事实一和客观事实二",
+                "persona_summary": "第一人称摘要",
+            },
+            {"canonical_summary": "旧版仅 canonical 的兼容记录"},
+        ]
+    }
+    records = parse_transfer_bytes(json.dumps(payload).encode(), "native.json")
+    inspection = inspect_transfer_records(records, set())
+    first, legacy = inspection["items"]
+    assert first["content"] == "第一人称摘要 | 客观事实一；客观事实二"
+    assert first["canonical_summary"] == "客观事实一和客观事实二"
+    assert legacy["content"] == "旧版仅 canonical 的兼容记录"
+    assert legacy["canonical_summary"] == "旧版仅 canonical 的兼容记录"
+
+
+@pytest.mark.asyncio
+async def test_256_resummary_update_keeps_retrieval_and_canonical_channels(
+    tmp_path: Path,
+) -> None:
+    storage = Storage(tmp_path)
+    await storage.initialize()
+    text = TextProcessor()
+    graph = GraphBuilder()
+    memory_id = await storage.create_memory(
+        {"content": "旧检索正文", "canonical_summary": "旧客观摘要"},
+        text.tokenize,
+        graph.build,
+    )
+    assert await storage.update_memory(
+        memory_id,
+        {
+            "content": "第一人称摘要 | 新事实一；新事实二",
+            "metadata": {
+                "canonical_summary": "新事实一和新事实二",
+                "persona_summary": "第一人称摘要",
+            },
+        },
+        text.tokenize,
+        graph.build,
+    )
+    detail = await storage.get_document(memory_id)
+    assert detail["text"] == "第一人称摘要 | 新事实一；新事实二"
+    assert detail["metadata"]["canonical_summary"] == "新事实一和新事实二"
+    assert detail["metadata"]["persona_summary"] == "第一人称摘要"
+    await storage.close()
 
 
 @pytest.mark.asyncio

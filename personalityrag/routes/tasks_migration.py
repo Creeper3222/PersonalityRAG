@@ -16,7 +16,6 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import StreamingResponse
-from fastapi.responses import Response
 
 from ..application_context import current_context, manager
 from ..http_shared import (
@@ -29,7 +28,7 @@ from ..http_shared import (
 )
 from ..logger import logger
 from ..jobs import JobStateConflict
-from ..io_utils import run_blocking, save_upload_file
+from ..io_utils import run_blocking, save_upload_file, sha256_file
 from ..io_utils import UploadSizeLimitError, atomic_write_json
 from ..library_types.livingmemory_v8.transfer import (
     MAX_TRANSFER_BYTES,
@@ -38,11 +37,11 @@ from ..library_types.livingmemory_v8.transfer import (
     consume_transfer_preview,
     create_transfer_preview,
     existing_transfer_keys,
-    export_transfer_csv,
-    export_transfer_json,
     inspect_transfer_records,
     load_transfer_preview,
-    parse_transfer_bytes,
+    parse_transfer_file,
+    iter_export_transfer_csv,
+    iter_export_transfer_json,
     transfer_dedupe_key,
 )
 from ..migration import validate_conversations_db_file, validate_livingmemory_db_file
@@ -115,8 +114,37 @@ async def rebuild_indexes(
     return {"job_id": job_id}
 
 @router.get("/api/v1/jobs", dependencies=[Depends(require_auth)])
-async def list_jobs(scope: str = Query("active", pattern="^(active|finished|all)$")):
-    return {"items": await jobs().list(scope=scope)}
+async def list_jobs(
+    request: Request,
+    scope: str = Query("active", pattern="^(active|finished|all)$"),
+    limit: int | None = Query(default=None, ge=1, le=200),
+    cursor: str | None = Query(default=None, max_length=128),
+    include_details: bool = Query(default=False),
+):
+    # A request using only the legacy ``scope`` parameter keeps the original
+    # full-payload contract. The WebUI and new callers opt into the lightweight
+    # paged path with ``limit`` and ``include_details=false``.
+    legacy_request = (
+        limit is None
+        and cursor is None
+        and "include_details" not in request.query_params
+    )
+    effective_include_details = (
+        True if legacy_request else bool(include_details)
+    )
+    try:
+        items, next_cursor = await jobs().list_page(
+            scope=scope,
+            limit=limit,
+            cursor=cursor,
+            include_details=effective_include_details,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    result = {"items": items}
+    if limit is not None or cursor is not None or "include_details" in request.query_params:
+        result["next_cursor"] = next_cursor
+    return result
 
 @router.get("/api/v1/jobs/{job_id}", dependencies=[Depends(require_auth)])
 async def job_status(job_id: str):
@@ -310,7 +338,7 @@ async def migrate_livingmemory(
     ref = await require_existing_database_ref(
         database_type, memory_store_id, capability="livingmemory_import"
     )
-    target = await runtime(ref)
+    await runtime(ref)
     source = Path(payload.source_path)
     logger.warning(
         "提交 LivingMemory 迁移任务：memory_store_id=%s source=%s mode=%s",
@@ -349,12 +377,12 @@ async def export_memory_transfer(
     records = await target.storage.memory_transfer_records()
     filename = f"{memory_store_id}-memories-{int(time.time())}.{format}"
     if format == "csv":
-        body = await run_blocking(export_transfer_csv, records)
+        body = iter_export_transfer_csv(records)
         media_type = "text/csv; charset=utf-8"
     else:
-        body = await run_blocking(export_transfer_json, records)
+        body = iter_export_transfer_json(records)
         media_type = "application/json; charset=utf-8"
-    return Response(
+    return StreamingResponse(
         content=body,
         media_type=media_type,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
@@ -386,9 +414,14 @@ async def preview_memory_transfer(
         / f"{token}{Path(filename).suffix.lower()}"
     )
     try:
-        await save_upload_file(file, upload_path, max_bytes=MAX_TRANSFER_BYTES)
-        data = await run_blocking(upload_path.read_bytes)
-        raw_records = await run_blocking(parse_transfer_bytes, data, filename)
+        digest_state = hashlib.sha256()
+        await save_upload_file(
+            file,
+            upload_path,
+            max_bytes=MAX_TRANSFER_BYTES,
+            hasher=digest_state,
+        )
+        raw_records = await run_blocking(parse_transfer_file, upload_path, filename)
         target = await runtime(ref)
         existing = await target.storage.memory_transfer_records()
         inspection = await run_blocking(
@@ -396,7 +429,7 @@ async def preview_memory_transfer(
             raw_records,
             existing_transfer_keys(existing),
         )
-        digest = hashlib.sha256(data).hexdigest()
+        digest = digest_state.hexdigest()
         preview_id = await run_blocking(
             create_transfer_preview,
             state_root=current_context().state_root,
@@ -495,7 +528,7 @@ async def commit_memory_transfer(
         "created_at": time.time(),
     }
     await run_blocking(atomic_write_json, commit_path, manifest)
-    manifest_sha256 = hashlib.sha256(commit_path.read_bytes()).hexdigest()
+    manifest_sha256 = await run_blocking(sha256_file, commit_path)
     try:
         job_id = await jobs().start_resumable(
             "memory_transfer_import",

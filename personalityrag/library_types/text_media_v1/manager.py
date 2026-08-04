@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import shutil
 import tempfile
 import time
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +22,12 @@ from ...database_types import (
     database_type_registry,
 )
 from ...identifiers import validate_identifier
+from ...io_utils import run_blocking
 from ...logger import logger
+from ...resource_limits import (
+    effective_runtime_capacity,
+    effective_runtime_idle_minutes,
+)
 from ...providers import build_provider, build_rerank_provider, provider_kind
 from .indexes import TextMediaIndex
 from .package import export_tmkb, install_tmkb
@@ -44,6 +48,12 @@ from .visual_intent_policy import migrate_legacy_visual_intent_policy
 from .resumable_tasks import ResumableTextMediaTasks
 
 
+@dataclass(slots=True)
+class TextMediaRuntimeResidencyState:
+    lease_count: int
+    last_used_at: float
+
+
 class TextMediaV1Manager:
     def __init__(self, services: DatabaseDriverContext):
         self.services = services
@@ -55,6 +65,23 @@ class TextMediaV1Manager:
         self.runtimes: dict[DatabaseRef, TextMediaService] = {}
         self._loads: dict[DatabaseRef, asyncio.Task[TextMediaService]] = {}
         self._lock = asyncio.Lock()
+        self._condition = asyncio.Condition(self._lock)
+        self._residency: dict[
+            DatabaseRef, TextMediaRuntimeResidencyState
+        ] = {}
+        self._load_finalizers: set[asyncio.Task[None]] = set()
+        self._sweeper_task: asyncio.Task[None] | None = None
+        self._runtime_loading_suspended = False
+        self._runtime_loading_owner: asyncio.Task[Any] | None = None
+        self._closing = False
+        self._summary_cache: dict[
+            DatabaseRef,
+            tuple[
+                tuple[tuple[int, int] | None, ...],
+                dict[str, Any],
+                dict[str, Any],
+            ],
+        ] = {}
         self.resumable_tasks = ResumableTextMediaTasks(self)
 
     def _type_root(self) -> Path:
@@ -68,6 +95,70 @@ class TextMediaV1Manager:
     @property
     def jobs(self):
         return self.services.jobs
+
+    @staticmethod
+    def _offline_summary(
+        directory: Path,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        return (
+            TextMediaStorage.summary_snapshot_from_disk(directory),
+            TextMediaIndex.disk_status(directory),
+        )
+
+    @staticmethod
+    def _summary_signature(
+        directory: Path,
+    ) -> tuple[tuple[int, int] | None, ...]:
+        index_root = directory / "derived" / "indexes"
+        paths = (
+            directory / "textmediaknowledge.db",
+            Path(str(directory / "textmediaknowledge.db") + "-wal"),
+            index_root / "CURRENT",
+            index_root / "media" / "CURRENT",
+        )
+        signature: list[tuple[int, int] | None] = []
+        for path in paths:
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                signature.append(None)
+            else:
+                # Overlay filesystems may advance ctime while SQLite opens a
+                # WAL snapshot for reading. Size plus nanosecond mtime still
+                # changes for every database/WAL write without turning a
+                # read-only summary into a false cache invalidation.
+                signature.append((int(stat.st_size), int(stat.st_mtime_ns)))
+        return tuple(signature)
+
+    @staticmethod
+    def _copy_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "metadata": dict(snapshot["metadata"]),
+            "stats": dict(snapshot["stats"]),
+            "needs_recalibration": bool(snapshot["needs_recalibration"]),
+        }
+
+    async def _summary_from_disk(
+        self,
+        ref: DatabaseRef,
+        directory: Path,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        signature = self._summary_signature(directory)
+        cached = self._summary_cache.get(ref)
+        if cached is not None and cached[0] == signature:
+            return self._copy_summary(cached[1]), dict(cached[2])
+        snapshot, indexes = await run_blocking(
+            self._offline_summary,
+            directory,
+        )
+        completed_signature = self._summary_signature(directory)
+        if completed_signature == signature:
+            self._summary_cache[ref] = (
+                signature,
+                self._copy_summary(snapshot),
+                dict(indexes),
+            )
+        return snapshot, indexes
 
     async def initialize(self) -> None:
         if self.jobs is not None:
@@ -119,11 +210,35 @@ class TextMediaV1Manager:
                 await migrate_legacy_visual_intent_policy(storage, directory)
             finally:
                 await storage.close()
+        self._start_runtime_sweeper()
 
     async def close(self) -> None:
-        services = list(self.runtimes.values())
-        self.runtimes.clear()
-        await asyncio.gather(*(service.close() for service in services), return_exceptions=True)
+        self._closing = True
+        if self._sweeper_task is not None:
+            self._sweeper_task.cancel()
+            await asyncio.gather(self._sweeper_task, return_exceptions=True)
+            self._sweeper_task = None
+        async with self._condition:
+            load_tasks = list(self._loads.values())
+            self._loads.clear()
+            services = list(self.runtimes.values())
+            self.runtimes.clear()
+            self._residency.clear()
+            self._condition.notify_all()
+        for task in load_tasks:
+            task.cancel()
+        if load_tasks:
+            await asyncio.gather(*load_tasks, return_exceptions=True)
+            await asyncio.sleep(0)
+        if self._load_finalizers:
+            await asyncio.gather(
+                *list(self._load_finalizers),
+                return_exceptions=True,
+            )
+        await asyncio.gather(
+            *(service.close() for service in services),
+            return_exceptions=True,
+        )
 
     async def _build_service(self, ref: DatabaseRef) -> TextMediaService:
         directory = database_type_registry.data_dir(
@@ -140,89 +255,444 @@ class TextMediaV1Manager:
         except Exception:
             await storage.close()
             raise
-        revision = await self.control.get_provider(
-            str(meta["provider_id"]), int(meta["provider_revision"])
-        ) if meta["provider_id"] else None
         provider = None
-        if (
-            revision is not None
-            and revision.config_sha256 == str(meta["provider_fingerprint"])
-            and revision.config.enabled
-            and provider_kind(revision.config.type) == "embedding"
-        ):
-            provider = build_provider(revision.config)
-        elif meta["status"] == "ready":
-            await storage.update_metadata({"status": "provider_binding_required"})
-        rerank_revision = (
-            await self.control.get_provider(
-                str(meta["rerank_provider_id"]),
-                int(meta["rerank_provider_revision"]),
-            )
-            if meta.get("rerank_provider_id")
-            else None
-        )
         reranker = None
-        rerank_info: dict[str, Any] = {}
-        if (
-            rerank_revision is not None
-            and rerank_revision.config_sha256
-            == str(meta.get("rerank_provider_fingerprint") or "")
-            and rerank_revision.config.enabled
-            and provider_kind(rerank_revision.config.type) == "rerank"
-        ):
-            reranker = build_rerank_provider(rerank_revision.config)
-            rerank_info = {
-                "id": rerank_revision.provider_id,
-                "revision": rerank_revision.revision,
-                "fingerprint": rerank_revision.config_sha256,
-            }
-        indexes = TextMediaIndex(directory)
-        await indexes.load()
-        if not indexes.status()["generation"]:
-            await indexes.rebuild(storage)
-        return TextMediaService(
-            directory,
-            storage,
-            indexes,
-            provider,
-            reranker,
-            rerank_info,
-            visual_intent_policy,
-        )
+        try:
+            revision = await self.control.get_provider(
+                str(meta["provider_id"]), int(meta["provider_revision"])
+            ) if meta["provider_id"] else None
+            if (
+                revision is not None
+                and revision.config_sha256 == str(meta["provider_fingerprint"])
+                and revision.config.enabled
+                and provider_kind(revision.config.type) == "embedding"
+            ):
+                provider = build_provider(revision.config)
+            elif meta["status"] == "ready":
+                await storage.update_metadata({"status": "provider_binding_required"})
+            rerank_revision = (
+                await self.control.get_provider(
+                    str(meta["rerank_provider_id"]),
+                    int(meta["rerank_provider_revision"]),
+                )
+                if meta.get("rerank_provider_id")
+                else None
+            )
+            rerank_info: dict[str, Any] = {}
+            if (
+                rerank_revision is not None
+                and rerank_revision.config_sha256
+                == str(meta.get("rerank_provider_fingerprint") or "")
+                and rerank_revision.config.enabled
+                and provider_kind(rerank_revision.config.type) == "rerank"
+            ):
+                reranker = build_rerank_provider(rerank_revision.config)
+                rerank_info = {
+                    "id": rerank_revision.provider_id,
+                    "revision": rerank_revision.revision,
+                    "fingerprint": rerank_revision.config_sha256,
+                }
+            indexes = TextMediaIndex(directory)
+            await indexes.load()
+            if not indexes.status()["generation"]:
+                await indexes.rebuild(storage)
+            return TextMediaService(
+                directory,
+                storage,
+                indexes,
+                provider,
+                reranker,
+                rerank_info,
+                visual_intent_policy,
+            )
+        except BaseException:
+            if provider is not None:
+                await provider.close()
+            if reranker is not None:
+                await reranker.close()
+            await storage.close()
+            raise
 
-    async def get_runtime(self, database: str | DatabaseRef, *_, **__) -> TextMediaService:
-        ref = database if isinstance(database, DatabaseRef) else DatabaseRef(TEXT_MEDIA_V1_TYPE, database)
+    async def suspend_runtime_loading(
+        self,
+        *,
+        owner: asyncio.Task[Any] | None = None,
+    ) -> None:
+        """Block new cold loads and drain any in-flight single-flight load."""
+
+        async with self._condition:
+            self._runtime_loading_suspended = True
+            self._runtime_loading_owner = owner or asyncio.current_task()
+            self._condition.notify_all()
+        while True:
+            async with self._lock:
+                loads = list(self._loads.values())
+            if not loads:
+                break
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in loads),
+                return_exceptions=True,
+            )
+            await asyncio.sleep(0)
+
+    async def resume_runtime_loading(self) -> None:
+        async with self._condition:
+            self._runtime_loading_suspended = False
+            self._runtime_loading_owner = None
+            self._condition.notify_all()
+
+    def _track_runtime_load(
+        self,
+        ref: DatabaseRef,
+        task: asyncio.Task[TextMediaService],
+    ) -> None:
+        def done(completed: asyncio.Task[TextMediaService]) -> None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            finalizer = loop.create_task(
+                self._finalize_runtime_load(ref, completed),
+                name=f"text-media-runtime-finalize-{ref.key}",
+            )
+            self._load_finalizers.add(finalizer)
+            finalizer.add_done_callback(self._load_finalizers.discard)
+
+        task.add_done_callback(done)
+
+    async def _finalize_runtime_load(
+        self,
+        ref: DatabaseRef,
+        task: asyncio.Task[TextMediaService],
+    ) -> None:
+        try:
+            built = task.result()
+        except BaseException:
+            async with self._condition:
+                if self._loads.get(ref) is task:
+                    self._loads.pop(ref, None)
+                self._condition.notify_all()
+            return
+        close_built = False
+        async with self._condition:
+            current = self.runtimes.get(ref)
+            owns_flight = self._loads.get(ref) is task
+            if owns_flight:
+                self._loads.pop(ref, None)
+            if current is None and owns_flight and not self._closing:
+                self.runtimes[ref] = built
+                self._residency[ref] = TextMediaRuntimeResidencyState(
+                    lease_count=0,
+                    last_used_at=time.monotonic(),
+                )
+                logger.info("text_media_v1 runtime loaded: database=%s", ref.key)
+            elif current is not built:
+                close_built = True
+            self._condition.notify_all()
+        if close_built:
+            await built.close()
+
+    @staticmethod
+    def _text_media_ref(database: str | DatabaseRef) -> DatabaseRef:
+        ref = (
+            database
+            if isinstance(database, DatabaseRef)
+            else DatabaseRef(TEXT_MEDIA_V1_TYPE, database)
+        )
         if ref.database_type != TEXT_MEDIA_V1_TYPE:
             raise KeyError(ref.key)
-        current = self.runtimes.get(ref)
-        if current is not None:
-            return current
+        return ref
+
+    async def _runtime_or_load(
+        self,
+        ref: DatabaseRef,
+        *,
+        acquire: bool,
+        touch: bool,
+    ) -> TextMediaService:
         async with self._lock:
             current = self.runtimes.get(ref)
             if current is not None:
+                state = self._residency[ref]
+                if acquire:
+                    state.lease_count += 1
+                if touch:
+                    state.last_used_at = time.monotonic()
                 return current
             task = self._loads.get(ref)
             if task is None:
-                task = asyncio.create_task(self._build_service(ref))
+                if (
+                    self._runtime_loading_suspended
+                    and asyncio.current_task() is not self._runtime_loading_owner
+                ):
+                    raise RuntimeError(
+                        "runtime loading is temporarily suspended for maintenance"
+                    )
+                if self._closing:
+                    raise RuntimeError("TextMediaV1Manager is closing")
+                task = asyncio.create_task(
+                    self._build_service(ref),
+                    name=f"text-media-runtime-load-{ref.key}",
+                )
                 self._loads[ref] = task
+                self._track_runtime_load(ref, task)
         try:
-            service = await task
-            self.runtimes[ref] = service
-            return service
-        finally:
-            self._loads.pop(ref, None)
+            built = await asyncio.shield(task)
+        except BaseException:
+            async with self._condition:
+                if self._loads.get(ref) is task:
+                    self._loads.pop(ref, None)
+                self._condition.notify_all()
+            raise
 
-    async def acquire_runtime(self, database: str | DatabaseRef, *_, **__) -> TextMediaService:
-        return await self.get_runtime(database)
+        close_built = False
+        async with self._condition:
+            current = self.runtimes.get(ref)
+            if current is None:
+                if self._closing:
+                    close_built = True
+                else:
+                    current = built
+                    self.runtimes[ref] = built
+                    self._residency[ref] = TextMediaRuntimeResidencyState(
+                        lease_count=0,
+                        last_used_at=time.monotonic(),
+                    )
+                    logger.info(
+                        "text_media_v1 runtime loaded: database=%s",
+                        ref.key,
+                    )
+            elif current is not built:
+                close_built = True
+            if self._loads.get(ref) is task:
+                self._loads.pop(ref, None)
+            if current is not None:
+                state = self._residency[ref]
+                if acquire:
+                    state.lease_count += 1
+                if touch:
+                    state.last_used_at = time.monotonic()
+            self._condition.notify_all()
+        if close_built:
+            await built.close()
+        if current is None:
+            raise RuntimeError("TextMediaV1Manager is closing")
+        await self.sweep_runtimes(expire_idle=False, protect={ref})
+        return current
 
-    async def release_runtime(self, database: str | DatabaseRef, *_, **__) -> None:
-        return None
+    async def get_runtime(
+        self,
+        database: str | DatabaseRef,
+        *_,
+        touch: bool = True,
+        **__,
+    ) -> TextMediaService:
+        return await self._runtime_or_load(
+            self._text_media_ref(database),
+            acquire=False,
+            touch=touch,
+        )
 
-    async def unload_runtime(self, database: str | DatabaseRef, *_, **__) -> None:
-        ref = database if isinstance(database, DatabaseRef) else DatabaseRef(TEXT_MEDIA_V1_TYPE, database)
-        service = self.runtimes.pop(ref, None)
-        if service is not None:
-            await service.close()
+    async def acquire_runtime(
+        self,
+        database: str | DatabaseRef,
+        *_,
+        touch: bool = True,
+        **__,
+    ) -> TextMediaService:
+        return await self._runtime_or_load(
+            self._text_media_ref(database),
+            acquire=True,
+            touch=touch,
+        )
+
+    async def release_runtime(
+        self,
+        database: str | DatabaseRef,
+        *_,
+        touch: bool = True,
+        **__,
+    ) -> None:
+        ref = self._text_media_ref(database)
+        async with self._condition:
+            state = self._residency.get(ref)
+            if state is None:
+                return
+            state.lease_count = max(0, state.lease_count - 1)
+            if touch:
+                state.last_used_at = time.monotonic()
+            self._condition.notify_all()
+
+    async def unload_runtime(
+        self,
+        database: str | DatabaseRef,
+        *_,
+        reason: str = "manual",
+        **__,
+    ) -> bool:
+        ref = self._text_media_ref(database)
+        async with self._condition:
+            while (
+                state := self._residency.get(ref)
+            ) is not None and state.lease_count > 0:
+                await self._condition.wait()
+            service = self.runtimes.pop(ref, None)
+            self._residency.pop(ref, None)
+            self._condition.notify_all()
+        if service is None:
+            return False
+        await service.close()
+        logger.info(
+            "text_media_v1 runtime released: database=%s reason=%s",
+            ref.key,
+            reason,
+        )
+        return True
+
+    def _start_runtime_sweeper(self) -> None:
+        if self._sweeper_task is None or self._sweeper_task.done():
+            self._sweeper_task = asyncio.create_task(
+                self._runtime_sweeper_loop(),
+                name="text-media-runtime-residency",
+            )
+
+    async def _runtime_sweeper_loop(self) -> None:
+        while not self._closing:
+            idle_minutes = effective_runtime_idle_minutes(
+                self.config.runtime_residency.idle_minutes,
+                self.config.performance_profile,
+            )
+            interval = min(60.0, max(5.0, idle_minutes * 30.0))
+            try:
+                await asyncio.sleep(interval)
+                await self.sweep_runtimes()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("text_media_v1 runtime sweep failed")
+
+    async def _pinned_runtime_refs(
+        self,
+        refs: list[DatabaseRef],
+    ) -> set[DatabaseRef]:
+        if not refs:
+            return set()
+        adapter_map = await self.control.active_database_adapter_connections_map(
+            refs
+        )
+        pinned = {ref for ref in refs if adapter_map.get(ref.key)}
+        if self.jobs is not None:
+            jobs = await asyncio.gather(
+                *(
+                    self.jobs.active_database_job(
+                        ref,
+                        include_read_only=True,
+                    )
+                    for ref in refs
+                )
+            )
+            pinned.update(
+                ref for ref, job in zip(refs, jobs, strict=True) if job
+            )
+        return pinned
+
+    async def sweep_runtimes(
+        self,
+        *,
+        expire_idle: bool = True,
+        protect: set[DatabaseRef] | None = None,
+    ) -> list[str]:
+        protect = set(protect or ())
+        now = time.monotonic()
+        idle_seconds = (
+            effective_runtime_idle_minutes(
+                self.config.runtime_residency.idle_minutes,
+                self.config.performance_profile,
+            )
+            * 60.0
+        )
+        capacity = effective_runtime_capacity(
+            self.config.runtime_residency.max_non_default_runtimes,
+            self.config.performance_profile,
+        )
+        async with self._lock:
+            candidates = sorted(
+                (
+                    ref
+                    for ref, state in self._residency.items()
+                    if state.lease_count == 0 and ref not in protect
+                ),
+                key=lambda ref: self._residency[ref].last_used_at,
+            )
+            loaded_count = len(self.runtimes)
+            idle_candidates = {
+                ref
+                for ref in candidates
+                if expire_idle
+                and now - self._residency[ref].last_used_at >= idle_seconds
+            }
+        pinned = await self._pinned_runtime_refs(candidates)
+        selected: list[tuple[DatabaseRef, str]] = []
+        remaining = loaded_count
+        for ref in candidates:
+            if ref in pinned:
+                continue
+            if ref in idle_candidates:
+                selected.append((ref, "idle"))
+                remaining -= 1
+        for ref in candidates:
+            if remaining <= capacity:
+                break
+            if ref in pinned or any(item[0] == ref for item in selected):
+                continue
+            selected.append((ref, "capacity"))
+            remaining -= 1
+
+        evicted: list[str] = []
+        for ref, reason in selected:
+            async with self._condition:
+                state = self._residency.get(ref)
+                if state is None or state.lease_count > 0 or ref in protect:
+                    continue
+                service = self.runtimes.pop(ref, None)
+                self._residency.pop(ref, None)
+                self._condition.notify_all()
+            if service is None:
+                continue
+            try:
+                await service.close()
+            except Exception:
+                logger.exception(
+                    "text_media_v1 runtime release failed: database=%s reason=%s",
+                    ref.key,
+                    reason,
+                )
+            else:
+                evicted.append(ref.id)
+                logger.info(
+                    "text_media_v1 runtime released: database=%s reason=%s",
+                    ref.key,
+                    reason,
+                )
+        return evicted
+
+    async def apply_runtime_residency(self) -> list[str]:
+        return await self.sweep_runtimes()
+
+    def runtime_residency_status(self) -> dict[str, Any]:
+        return {
+            "loaded_library_ids": [ref.id for ref in self.runtimes],
+            "loaded_databases": [ref.public() for ref in self.runtimes],
+            "runtimes": {
+                ref.key: {
+                    "database_type": ref.database_type,
+                    "database_id": ref.id,
+                    "lease_count": state.lease_count,
+                    "last_used_at": state.last_used_at,
+                }
+                for ref, state in self._residency.items()
+            },
+        }
 
     async def prepare_embedding_context_for_long_task(
         self,
@@ -368,7 +838,11 @@ class TextMediaV1Manager:
 
     @asynccontextmanager
     async def runtime_lease(self, database: str | DatabaseRef, *args, **kwargs):
-        yield await self.get_runtime(database)
+        service = await self.acquire_runtime(database, *args, **kwargs)
+        try:
+            yield service
+        finally:
+            await self.release_runtime(database, *args, **kwargs)
 
     async def create_library(self, payload: dict[str, Any]) -> dict[str, Any]:
         database_id = validate_identifier(str(payload.get("id") or ""), field="知识库 ID")
@@ -578,12 +1052,19 @@ class TextMediaV1Manager:
                     "database_id": knowledge_base_id,
                 }
             }
-        service = await self.get_runtime(ref)
-        meta, stats = await asyncio.gather(
-            service.storage.metadata(),
-            service.storage.statistics(),
-        )
-        indexes = service.indexes.status()
+        service = self.runtimes.get(ref)
+        if service is not None:
+            snapshot = await service.storage.summary_snapshot()
+            indexes = service.indexes.status()
+        else:
+            storage = TextMediaStorage(directory)
+            try:
+                snapshot = await storage.summary_snapshot()
+            finally:
+                await storage.close()
+            indexes = await run_blocking(TextMediaIndex.disk_status, directory)
+        meta = snapshot["metadata"]
+        stats = snapshot["stats"]
         return {
             "database": {
                 "exists": True,
@@ -620,23 +1101,223 @@ class TextMediaV1Manager:
         }
 
     async def list_libraries(self, *, stats_mode: str = "full") -> list[dict[str, Any]]:
-        identities = await self.control.list_database_identities()
-        results = []
-        for item in identities:
-            if item["database_type"] != TEXT_MEDIA_V1_TYPE:
-                continue
-            try:
-                results.append(await self.library_detail(str(item["id"])))
-            except (FileNotFoundError, KeyError):
-                continue
+        if stats_mode not in {"full", "summary"}:
+            raise ValueError("invalid library stats mode")
+        identities = [
+            item
+            for item in await self.control.list_database_identities()
+            if item["database_type"] == TEXT_MEDIA_V1_TYPE
+        ]
+        if stats_mode == "full":
+            details = await asyncio.gather(
+                *(
+                    self.library_detail(str(item["id"]))
+                    for item in identities
+                ),
+                return_exceptions=True,
+            )
+            return [
+                item
+                for item in details
+                if isinstance(item, dict)
+            ]
+
+        descriptor = database_type_registry.require(
+            TEXT_MEDIA_V1_TYPE
+        ).descriptor
+        refs = [
+            DatabaseRef(TEXT_MEDIA_V1_TYPE, str(item["id"]))
+            for item in identities
+        ]
+        summary_limit = asyncio.Semaphore(4)
+
+        async def read_snapshot(
+            ref: DatabaseRef,
+        ) -> tuple[DatabaseRef, dict[str, Any], dict[str, Any]] | None:
+            directory = database_type_registry.data_dir(self.data_dir, ref)
+            if not (directory / "textmediaknowledge.db").is_file():
+                return None
+            async with summary_limit:
+                service = self.runtimes.get(ref)
+                snapshot, disk_indexes = await self._summary_from_disk(
+                    ref,
+                    directory,
+                )
+                indexes = (
+                    service.indexes.status()
+                    if service is not None
+                    else disk_indexes
+                )
+            return ref, snapshot, indexes
+
+        snapshots = [
+            item
+            for item in await asyncio.gather(
+                *(read_snapshot(ref) for ref in refs)
+            )
+            if item is not None
+        ]
+        provider_bindings: set[tuple[str, int | None]] = set()
+        resource_keys: list[str] = []
+        for ref, snapshot, _indexes in snapshots:
+            meta = snapshot["metadata"]
+            if meta.get("provider_id"):
+                provider_bindings.add(
+                    (
+                        str(meta["provider_id"]),
+                        int(meta.get("provider_revision") or 0),
+                    )
+                )
+            if meta.get("rerank_provider_id"):
+                provider_bindings.add(
+                    (
+                        str(meta["rerank_provider_id"]),
+                        int(meta.get("rerank_provider_revision") or 0),
+                    )
+                )
+            resource_keys.append(
+                database_type_registry.require(
+                    TEXT_MEDIA_V1_TYPE
+                ).resource_key(ref.id)
+            )
+        provider_map, adapter_map, busy_map = await asyncio.gather(
+            self.control.get_providers_bulk(provider_bindings),
+            self.control.active_database_adapter_connections_map(
+                [item[0] for item in snapshots]
+            ),
+            (
+                self.jobs.active_long_jobs_map(resource_keys)
+                if self.jobs is not None
+                else self.control.active_long_jobs_map(resource_keys)
+            ),
+        )
+
+        results: list[dict[str, Any]] = []
+        for ref, snapshot, indexes in snapshots:
+            meta = snapshot["metadata"]
+            provider = provider_map.get(
+                (
+                    str(meta.get("provider_id") or ""),
+                    int(meta.get("provider_revision") or 0),
+                )
+            )
+            rerank_provider = provider_map.get(
+                (
+                    str(meta.get("rerank_provider_id") or ""),
+                    int(meta.get("rerank_provider_revision") or 0),
+                )
+            )
+            rerank_fingerprint = str(
+                meta.get("rerank_provider_fingerprint") or ""
+            )
+            rerank_available = bool(
+                rerank_provider is not None
+                and rerank_provider.config.enabled
+                and provider_kind(rerank_provider.config.type) == "rerank"
+                and rerank_provider.config_sha256 == rerank_fingerprint
+            )
+            retrieval_settings = normalize_retrieval_config(
+                meta.get("retrieval_config_json")
+            )
+            visual_policy = normalize_visual_intent_policy(
+                retrieval_settings.get("visual_intent_policy")
+            )
+            retrieval_settings["visual_intent_policy"] = visual_policy
+            resource_key = database_type_registry.require(
+                TEXT_MEDIA_V1_TYPE
+            ).resource_key(ref.id)
+            active_job = busy_map.get(resource_key)
+            results.append(
+                {
+                    "id": ref.id,
+                    **database_identity_fields(ref),
+                    "database_category": DATABASE_CATEGORY_KNOWLEDGE,
+                    "name": meta["name"],
+                    "description": meta["description"],
+                    "is_default": False,
+                    "status": meta["status"],
+                    "provider_id": meta["provider_id"],
+                    "provider_revision": meta["provider_revision"],
+                    "provider": provider.public() if provider else None,
+                    "rerank_provider_id": str(
+                        meta.get("rerank_provider_id") or ""
+                    ),
+                    "rerank_provider_revision": int(
+                        meta.get("rerank_provider_revision") or 0
+                    ),
+                    "rerank_provider": (
+                        rerank_provider.public() if rerank_provider else None
+                    ),
+                    "rerank_binding": {
+                        "bound": bool(meta.get("rerank_provider_id")),
+                        "available": rerank_available,
+                        "fingerprint": rerank_fingerprint,
+                        "needs_recalibration": bool(
+                            snapshot["needs_recalibration"]
+                        ),
+                    },
+                    "capabilities": list(descriptor.capabilities),
+                    "type_metadata": descriptor.public(),
+                    "stats": snapshot["stats"],
+                    "indexes": indexes,
+                    "adapter_connections": adapter_map.get(ref.key, []),
+                    "adapter_busy": {
+                        "busy": active_job is not None,
+                        "job": active_job,
+                    },
+                    "ingest_defaults": {
+                        "chunk_target": int(meta["chunk_target"]),
+                        "chunk_overlap": int(meta["chunk_overlap"]),
+                    },
+                    "uniform_media_strength": float(
+                        meta["uniform_media_strength"]
+                    ),
+                    "retrieval_settings": retrieval_settings,
+                    "visual_intent_policy": visual_policy,
+                    "visual_intent_policy_type_defaults": (
+                        normalize_visual_intent_policy(
+                            DEFAULT_VISUAL_INTENT_POLICY
+                        )
+                    ),
+                    "visual_intent_policy_is_default": (
+                        visual_policy
+                        == normalize_visual_intent_policy(
+                            DEFAULT_VISUAL_INTENT_POLICY
+                        )
+                    ),
+                    "visual_intent_policy_fingerprint": (
+                        visual_intent_policy_fingerprint(visual_policy)
+                    ),
+                    "visual_intent_detector_version": (
+                        VISUAL_INTENT_DETECTOR_VERSION
+                    ),
+                    "protected_visual_blocker_terms": list(
+                        PROTECTED_VISUAL_BLOCKER_TERMS
+                    ),
+                    "created_at": meta["created_at"],
+                    "updated_at": meta["updated_at"],
+                }
+            )
         return results
 
-    async def provider_usage(self, provider_id: str) -> list[dict[str, Any]]:
+    async def provider_usage_map(
+        self,
+        provider_ids: set[str],
+    ) -> dict[str, list[dict[str, Any]]]:
+        targets = {
+            str(provider_id) for provider_id in provider_ids if str(provider_id)
+        }
+        results: dict[str, list[dict[str, Any]]] = {
+            provider_id: [] for provider_id in targets
+        }
+        if not targets:
+            return results
         identities = await self.control.list_database_identities()
         driver = database_type_registry.require(TEXT_MEDIA_V1_TYPE)
         descriptor = driver.descriptor
-        latest_provider = await self.control.get_provider(provider_id)
-        results: list[dict[str, Any]] = []
+        latest_providers = await self.control.get_providers_bulk(
+            {(provider_id, None) for provider_id in targets}
+        )
         for item in identities:
             if item["database_type"] != TEXT_MEDIA_V1_TYPE:
                 continue
@@ -656,31 +1337,38 @@ class TextMediaV1Manager:
             finally:
                 await storage.close()
             common = {
-                    "library_id": database_id,
-                    "database_type": TEXT_MEDIA_V1_TYPE,
-                    "database_id": database_id,
-                    "database_category": DATABASE_CATEGORY_KNOWLEDGE,
-                    "library_name": str(meta.get("name") or database_id),
-                    "type_display_name": descriptor.display_name,
+                "library_id": database_id,
+                "database_type": TEXT_MEDIA_V1_TYPE,
+                "database_id": database_id,
+                "database_category": DATABASE_CATEGORY_KNOWLEDGE,
+                "library_name": str(meta.get("name") or database_id),
+                "type_display_name": descriptor.display_name,
             }
-            if str(meta.get("provider_id") or "") == provider_id:
+            provider_id = str(meta.get("provider_id") or "")
+            if provider_id in results:
+                latest_provider = latest_providers.get((provider_id, None))
                 provider_revision = int(meta.get("provider_revision") or 0)
                 provider_fingerprint = str(
                     meta.get("provider_fingerprint") or ""
                 )
-                results.append(
+                results[provider_id].append(
                     {
-                    **common,
-                    "provider_revision": provider_revision,
-                    "usage_kind": "embedding",
-                    "needs_rebuild": (
-                        True
-                        if latest_provider is None
-                        else provider_fingerprint != latest_provider.config_sha256
-                    ),
+                        **common,
+                        "provider_revision": provider_revision,
+                        "usage_kind": "embedding",
+                        "needs_rebuild": (
+                            True
+                            if latest_provider is None
+                            else provider_fingerprint
+                            != latest_provider.config_sha256
+                        ),
                     }
                 )
-            if str(meta.get("rerank_provider_id") or "") == provider_id:
+            rerank_provider_id = str(meta.get("rerank_provider_id") or "")
+            if rerank_provider_id in results:
+                latest_provider = latest_providers.get(
+                    (rerank_provider_id, None)
+                )
                 rerank_revision = int(
                     meta.get("rerank_provider_revision") or 0
                 )
@@ -692,7 +1380,7 @@ class TextMediaV1Manager:
                         meta.get("retrieval_config_json")
                     )
                 )
-                results.append(
+                results[rerank_provider_id].append(
                     {
                         **common,
                         "provider_revision": rerank_revision,
@@ -746,7 +1434,8 @@ class TextMediaV1Manager:
                     str(active["id"]), internal=True
                 )
                 operation = dict((internal or {}).get("operation") or {})
-                if str(operation.get("provider_id") or "") != provider_id:
+                provider_id = str(operation.get("provider_id") or "")
+                if provider_id not in results:
                     continue
                 database_id = str(
                     active.get("database_id")
@@ -760,10 +1449,10 @@ class TextMediaV1Manager:
                         str(item.get("usage_kind") or ""),
                     )
                     == key
-                    for item in results
+                    for item in results[provider_id]
                 ):
                     continue
-                results.append(
+                results[provider_id].append(
                     {
                         "library_id": database_id,
                         "database_type": TEXT_MEDIA_V1_TYPE,
@@ -780,6 +1469,9 @@ class TextMediaV1Manager:
                     }
                 )
         return results
+
+    async def provider_usage(self, provider_id: str) -> list[dict[str, Any]]:
+        return (await self.provider_usage_map({provider_id})).get(provider_id, [])
 
     async def debug_revision_bindings(self) -> list[dict[str, Any]]:
         identities = await self.control.list_database_identities()

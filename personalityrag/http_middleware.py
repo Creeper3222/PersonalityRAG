@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 import uuid
 import re
+import asyncio
+import weakref
 from typing import Any
 
 from fastapi import Request
@@ -36,6 +38,7 @@ from .listener_surface import (
     is_adapter_access_request_allowed,
     request_surface,
 )
+from .resource_limits import configured_surface_limits
 
 
 SLOW_REQUEST_SECONDS = 1.0
@@ -45,6 +48,24 @@ class RequestContextMiddleware:
     def __init__(self, app: Any, *, context: ApplicationContext):
         self.app = app
         self.context = context
+        self._surface_slots: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop,
+            tuple[str, asyncio.Semaphore, asyncio.Semaphore],
+        ] = weakref.WeakKeyDictionary()
+
+    def _request_slot(self, *, heartbeat: bool) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        profile = self.context.config.performance_profile
+        current = self._surface_slots.get(loop)
+        if current is None or current[0] != profile:
+            foreground_limit, heartbeat_limit = configured_surface_limits(profile)
+            current = (
+                profile,
+                asyncio.Semaphore(foreground_limit),
+                asyncio.Semaphore(heartbeat_limit),
+            )
+            self._surface_slots[loop] = current
+        return current[2] if heartbeat else current[1]
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         token = activate_context(self.context)
@@ -62,35 +83,77 @@ class RequestContextMiddleware:
         scope.setdefault("state", {})["request_id"] = request_id
         started = time.perf_counter()
         status_code = 500
+        method = str(scope.get("method") or "").upper()
+        path = str(scope.get("path") or "").rstrip("/")
+        expected_long_poll = (
+            method == "POST"
+            and re.fullmatch(
+                r"/api/v1/(?:memory-libraries/livingmemory_v8|knowledge-libraries/text_media_v1)/[^/]+/adapters/heartbeat",
+                path,
+            )
+            is not None
+        )
+        request_slot = self._request_slot(heartbeat=expected_long_poll)
+        await request_slot.acquire()
         lease_token = activate_runtime_lease_scope(self.context.manager)
 
         async def send_with_request_id(message: dict[str, Any]) -> None:
             nonlocal status_code
             if message.get("type") == "http.response.start":
                 status_code = int(message.get("status") or 500)
-                MutableHeaders(scope=message)["X-Request-ID"] = request_id
+                headers = MutableHeaders(scope=message)
+                headers["X-Request-ID"] = request_id
+                path = str(scope.get("path") or "")
+                if path == "/":
+                    headers["Cache-Control"] = "no-store, max-age=0"
+                    headers["Pragma"] = "no-cache"
+                    headers["Expires"] = "0"
+                elif path.startswith("/static/"):
+                    headers["Cache-Control"] = (
+                        "public, max-age=0, must-revalidate"
+                    )
+                    if "Pragma" in headers:
+                        del headers["Pragma"]
+                    if "Expires" in headers:
+                        del headers["Expires"]
             await send(message)
 
+        failed = False
         try:
-            await self.app(scope, receive, send_with_request_id)
+            request = Request(scope, receive=receive)
+            response = None
+            if request_surface(request) == ADAPTER_ACCESS_SURFACE and not (
+                is_adapter_access_request_allowed(
+                    request.method,
+                    request.url.path,
+                )
+            ):
+                response = JSONResponse(
+                    status_code=404,
+                    content={"detail": "Not Found"},
+                )
+            if response is None:
+                response = await _adapter_busy_response(request)
+            if response is None:
+                await self.app(scope, receive, send_with_request_id)
+            else:
+                await response(scope, receive, send_with_request_id)
+        except BaseException:
+            failed = True
+            raise
         finally:
             elapsed = time.perf_counter() - started
-            method = str(scope.get("method") or "").upper()
-            path = str(scope.get("path") or "").rstrip("/")
-            expected_long_poll = (
-                method == "POST"
-                and re.fullmatch(
-                    r"/api/v1/(?:memory-libraries/livingmemory_v8|knowledge-libraries/text_media_v1)/[^/]+/adapters/heartbeat",
-                    path,
-                )
-                is not None
-            )
             if path not in {"/api/v1/logs", "/api/v1/jobs"}:
-                log = (
-                    logger.debug
-                    if expected_long_poll or elapsed < SLOW_REQUEST_SECONDS
-                    else logger.warning
-                )
+                if failed or status_code >= 500:
+                    log = logger.error
+                elif status_code >= 400 or elapsed >= SLOW_REQUEST_SECONDS:
+                    log = (
+                        logger.debug
+                        if expected_long_poll and status_code < 400
+                        else logger.warning
+                    )
+                else:
+                    log = logger.debug
                 log(
                     "HTTP 请求完成：request_id=%s method=%s path=%s status=%s elapsed_ms=%.2f",
                     request_id,
@@ -108,6 +171,7 @@ class RequestContextMiddleware:
                     scope.get("path") or "",
                 )
             finally:
+                request_slot.release()
                 reset_context(token)
 
 
@@ -135,13 +199,20 @@ async def adapter_access_surface_guard(request: Request, call_next):
 
 
 async def adapter_busy_guard(request: Request, call_next):
+    response = await _adapter_busy_response(request)
+    if response is not None:
+        return response
+    return await call_next(request)
+
+
+async def _adapter_busy_response(request: Request) -> JSONResponse | None:
     if not _adapter_header(request, ADAPTER_ID_HEADER):
-        return await call_next(request)
+        return None
     database_ref = _adapter_database_ref_from_path(request.url.path)
     if not database_ref:
-        return await call_next(request)
+        return None
     if not _adapter_request_authenticated(request, database_ref):
-        return await call_next(request)
+        return None
     database_id = database_ref.id
     context = current_context()
     adapter_id = _adapter_header(request, ADAPTER_ID_HEADER)
@@ -179,7 +250,7 @@ async def adapter_busy_guard(request: Request, call_next):
             content={"detail": _adapter_forced_offline_detail(connection)},
         )
     if _adapter_status_request_allowed(request, database_ref):
-        return await call_next(request)
+        return None
     try:
         resource_key = database_type_registry.require(
             database_ref.database_type
@@ -201,9 +272,9 @@ async def adapter_busy_guard(request: Request, call_next):
             database_id,
             request.url.path,
         )
-        return await call_next(request)
+        return None
     if not job:
-        return await call_next(request)
+        return None
     identity_label = (
         "memory_store_id"
         if descriptor.category == DATABASE_CATEGORY_MEMORY

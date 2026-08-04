@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from personalityrag.logger import (
     LOGGER_NAME,
@@ -66,7 +67,7 @@ def test_configure_logging_writes_rotated_file_and_web_buffer(tmp_path):
     assert get_log_buffer().summary()["entry_count"] <= 20
 
 
-def test_web_buffer_keeps_debug_when_file_level_is_info(tmp_path):
+def test_web_buffer_honors_configured_level(tmp_path):
     log_file = tmp_path / "logs" / "personalityrag.log"
     configure_logging(
         log_file,
@@ -81,7 +82,7 @@ def test_web_buffer_keeps_debug_when_file_level_is_info(tmp_path):
     flush_logging()
 
     entries = get_log_buffer().get_entries()
-    assert any(
+    assert not any(
         item["level"] == "DEBUG" and item["message"] == "web-only-debug-record"
         for item in entries
     )
@@ -134,3 +135,12 @@ def test_configured_logging_redacts_all_persistent_and_web_sinks(tmp_path):
         assert "pkb-abcdefghijklmnopqrstuvwxyz012345" not in output
         assert "aGVsbG8=" not in output
         assert "[redacted]" in output
+
+
+def test_launcher_never_prints_the_api_key_value():
+    source = (Path(__file__).resolve().parents[1] / "run.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "+ config.api_key\n" not in source
+    assert "+ config.api_key_fingerprint\n" in source

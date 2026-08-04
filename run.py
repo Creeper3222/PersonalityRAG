@@ -73,6 +73,9 @@ async def serve_dual_ports(host: str, webui_port: int, access_port: int) -> None
             log_level="info",
             access_log=False,
             server_header=False,
+            timeout_keep_alive=15,
+            timeout_graceful_shutdown=60,
+            backlog=128,
         )
     )
     access_server = uvicorn.Server(
@@ -85,6 +88,9 @@ async def serve_dual_ports(host: str, webui_port: int, access_port: int) -> None
             access_log=False,
             lifespan="off",
             server_header=False,
+            timeout_keep_alive=15,
+            timeout_graceful_shutdown=60,
+            backlog=128,
         )
     )
     def request_shutdown() -> None:
@@ -116,6 +122,7 @@ async def serve_dual_ports(host: str, webui_port: int, access_port: int) -> None
 
 if __name__ == "__main__":
     lock = InstanceLock(ROOT / "data" / "logs" / "personalityrag.instance.lock")
+    clean_shutdown = False
     try:
         lock.acquire()
     except SingleInstanceError as exc:
@@ -153,12 +160,21 @@ if __name__ == "__main__":
             print("[PersonalityRAG] API key：仍可作为 Bearer Token 用于脚本/API 访问。")
         else:
             print(
-                "[PersonalityRAG] API key: "
-                + config.api_key
-                + "（首次登录使用；请妥善保存）"
+                "[PersonalityRAG] API key fingerprint: "
+                + config.api_key_fingerprint
+                + "（首次登录密钥保存在 config/config.json；请妥善保管）"
             )
         if os.environ.get("PERSONALITYRAG_SUPPRESS_BROWSER") != "1":
             webbrowser.open(url)
         asyncio.run(serve_dual_ports(config.host, actual_port, actual_access_port))
+        clean_shutdown = True
     finally:
         lock.release()
+    if clean_shutdown:
+        # The ASGI lifespan has already drained jobs, runtimes, SQLite pools and
+        # HTTP transports, and the single-instance lock is released above.  A
+        # third-party/native worker that survives Python interpreter finalizers
+        # must not leave a portless zombie behind or accumulate on each WebUI
+        # restart.  Exit only after the full graceful path has completed; real
+        # startup or runtime exceptions still propagate normally.
+        os._exit(0)

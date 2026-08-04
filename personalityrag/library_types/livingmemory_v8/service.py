@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
-import math
 import os
 import shutil
 import tempfile
@@ -27,9 +26,14 @@ from ...task_control import JobControlSignal, JobInterrupted
 from .text import TextProcessor
 
 
+RERANK_EVIDENCE_VERSION = "livingmemory_v8_2_5_3"
+RERANK_ATOM_MAX_EVIDENCE = 4
 RERANK_GRAPH_MAX_EVIDENCE = 3
+RERANK_ATOM_ENTRY_CHAR_LIMIT = 260
 RERANK_GRAPH_ENTRY_CHAR_LIMIT = 240
 RERANK_GRAPH_DOCUMENT_CHAR_LIMIT = 1200
+RERANK_PERSONA_CHAR_LIMIT = 700
+RERANK_DOCUMENT_TOTAL_CHAR_LIMIT = 4800
 
 
 async def _finish_mutation_step(
@@ -84,9 +88,7 @@ def _graph_k_core_node_ids(
                 degrees[source] += 1
                 degrees[target] += 1
         removed = {
-            node_id
-            for node_id, degree in degrees.items()
-            if degree < minimum_degree
+            node_id for node_id, degree in degrees.items() if degree < minimum_degree
         }
         if not removed:
             break
@@ -234,13 +236,9 @@ class PersonalityRAGService:
     def _payload_for_write(self, payload: dict[str, Any]) -> dict[str, Any]:
         prepared = copy.deepcopy(payload)
         prepared.pop("memory_type", None)
-        prepared["metadata"] = normalize_document_metadata(
-            prepared.get("metadata")
-        )
+        prepared["metadata"] = normalize_document_metadata(prepared.get("metadata"))
         requested_persona_id = str(prepared.get("persona_id") or "").strip()
-        fallback_persona_id = str(
-            getattr(self, "default_persona_id", "") or ""
-        ).strip()
+        fallback_persona_id = str(getattr(self, "default_persona_id", "") or "").strip()
         prepared["persona_id"] = requested_persona_id or fallback_persona_id or None
         if not self.config.maintenance.atom_enabled:
             prepared["atoms"] = []
@@ -437,9 +435,7 @@ class PersonalityRAGService:
         if int(manifest.get("dimension") or 0) != int(dimension):
             return "provider_dimension_changed"
         current_functional = provider_functional_sha256(self.provider)
-        recorded_functional = str(
-            manifest.get("provider_functional_sha256") or ""
-        )
+        recorded_functional = str(manifest.get("provider_functional_sha256") or "")
         if not recorded_functional:
             await self.indexes.adopt_provider_functional_sha256(current_functional)
         elif recorded_functional != current_functional:
@@ -543,9 +539,7 @@ class PersonalityRAGService:
         logger.info("关闭记忆库 runtime：memory_store_id=%s", self.memory_store_id)
         if self._maintenance_task:
             self._maintenance_task.cancel()
-            await asyncio.gather(
-                self._maintenance_task, return_exceptions=True
-            )
+            await asyncio.gather(self._maintenance_task, return_exceptions=True)
         if self._index_maintenance_task:
             self._index_maintenance_task.cancel()
             await asyncio.gather(
@@ -610,38 +604,40 @@ class PersonalityRAGService:
             }
         provider_id = self.rerank_provider_revision.provider_id
         provider_type = self.rerank_provider_revision.config.type
-        if not self.config.recall.graph_memory_enabled:
+        if not (
+            self.config.recall.graph_memory_enabled
+            or self.config.maintenance.atom_enabled
+        ):
             return await self._apply_plain_rerank(
                 query, candidates, k, provider_id, provider_type
             )
         try:
-            graph_signals = await self._rerank_graph_signals(query, candidates)
+            evidence_signals = await self._rerank_evidence_signals(query, candidates)
         except Exception as exc:
             logger.warning(
-                "Rerank 图增强失败，回退纯文本重排：memory_store_id=%s err=%s",
+                "Rerank 结构化证据增强失败，回退纯文本重排：memory_store_id=%s err=%s",
                 self.memory_store_id,
                 exc,
             )
             return await self._apply_plain_rerank(
                 query, candidates, k, provider_id, provider_type
             )
-        graph_candidate_count = sum(
+        evidence_candidate_count = sum(
             1
-            for signal in graph_signals.values()
-            if float(signal.get("graph_score") or 0.0) > 0.0
+            for signal in evidence_signals.values()
+            if self._rerank_signal_has_evidence(signal)
         )
-        if graph_candidate_count <= 0:
+        if evidence_candidate_count <= 0:
             return await self._apply_plain_rerank(
                 query, candidates, k, provider_id, provider_type
             )
-        return await self._apply_graph_enhanced_rerank(
+        return await self._apply_evidence_enhanced_rerank(
             query,
             candidates,
             k,
             provider_id,
             provider_type,
-            graph_signals,
-            graph_candidate_count,
+            evidence_signals,
         )
 
     async def _apply_plain_rerank(
@@ -660,7 +656,11 @@ class PersonalityRAGService:
         ordered: list[SearchResult] = []
         used_indexes: set[int] = set()
         for row in rerank_rows:
-            if row.index < 0 or row.index >= len(candidates) or row.index in used_indexes:
+            if (
+                row.index < 0
+                or row.index >= len(candidates)
+                or row.index in used_indexes
+            ):
                 continue
             used_indexes.add(row.index)
             item = copy.deepcopy(candidates[row.index])
@@ -700,24 +700,29 @@ class PersonalityRAGService:
             "candidate_count": len(candidates),
             "returned": len(ordered[:k]),
             "provider_returned": len(rerank_rows),
+            "evidence_enhanced": False,
+            "evidence_version": RERANK_EVIDENCE_VERSION,
+            "evidence_candidate_count": 0,
+            "atom_candidate_count": 0,
+            "atom_signal_candidate_count": 0,
             "graph_enhanced": False,
+            "graph_evidence_candidate_count": 0,
             "graph_candidate_count": 0,
         }
 
-    async def _apply_graph_enhanced_rerank(
+    async def _apply_evidence_enhanced_rerank(
         self,
         query: str,
         candidates: list[SearchResult],
         k: int,
         provider_id: str,
         provider_type: str,
-        graph_signals: dict[int, dict[str, Any]],
-        graph_candidate_count: int,
+        evidence_signals: dict[int, dict[str, Any]],
     ) -> tuple[list[SearchResult], dict[str, Any]]:
         enhanced_documents = [
-            self._rerank_document_with_graph_evidence(
-                item.content,
-                graph_signals.get(item.doc_id, {}),
+            self._rerank_document_with_evidence(
+                item,
+                evidence_signals.get(item.doc_id, {}),
             )
             for item in candidates
         ]
@@ -729,24 +734,56 @@ class PersonalityRAGService:
         valid_rows = []
         used_indexes: set[int] = set()
         for row in rerank_rows:
-            if row.index < 0 or row.index >= len(candidates) or row.index in used_indexes:
+            if (
+                row.index < 0
+                or row.index >= len(candidates)
+                or row.index in used_indexes
+            ):
                 continue
             used_indexes.add(row.index)
             valid_rows.append(row)
-        raw_by_index = {
-            row.index: float(row.relevance_score)
-            for row in valid_rows
-        }
-        rank_by_index = {
-            row.index: rank
-            for rank, row in enumerate(valid_rows)
-        }
+        raw_by_index = {row.index: float(row.relevance_score) for row in valid_rows}
+        rank_by_index = {row.index: rank for rank, row in enumerate(valid_rows)}
         raw_values = list(raw_by_index.values())
         raw_low = min(raw_values) if raw_values else 0.0
         raw_high = max(raw_values) if raw_values else 0.0
         raw_span = raw_high - raw_low
         doc_weight, graph_weight, intent = self._rerank_route_weights(query)
-        scored: list[tuple[float, float, float, int, SearchResult]] = []
+        if not self.config.recall.graph_memory_enabled:
+            doc_weight, graph_weight = 1.0, 0.0
+        graph_signal_candidate_count = sum(
+            1
+            for signal in evidence_signals.values()
+            if float(signal.get("graph_score") or 0.0) > 0.0
+        )
+        graph_evidence_candidate_count = sum(
+            1
+            for signal in evidence_signals.values()
+            if list(signal.get("graph_entries") or signal.get("entries") or [])
+        )
+        atom_signal_candidate_count = sum(
+            1
+            for signal in evidence_signals.values()
+            if float(signal.get("atom_score") or 0.0) > 0.0
+        )
+        atom_candidate_count = sum(
+            1
+            for signal in evidence_signals.values()
+            if list(signal.get("atom_entries") or [])
+        )
+        structured_metadata_candidate_count = sum(
+            1
+            for signal in evidence_signals.values()
+            if signal.get("persona_summary")
+            or signal.get("topics")
+            or signal.get("participants")
+        )
+        evidence_candidate_count = sum(
+            1
+            for signal in evidence_signals.values()
+            if self._rerank_signal_has_evidence(signal)
+        )
+        scored: list[tuple[float, float, float, float, int, SearchResult]] = []
         returned_count = max(1, len(valid_rows))
         for index, candidate in enumerate(candidates):
             item = copy.deepcopy(candidate)
@@ -757,7 +794,9 @@ class PersonalityRAGService:
                 rank_score = 0.0
             else:
                 raw_score = float(raw)
-                normalized_raw = 1.0 if raw_span == 0 else (raw_score - raw_low) / raw_span
+                normalized_raw = (
+                    1.0 if raw_span == 0 else (raw_score - raw_low) / raw_span
+                )
                 rank = rank_by_index.get(index, returned_count - 1)
                 rank_score = (
                     1.0
@@ -765,39 +804,100 @@ class PersonalityRAGService:
                     else 1.0 - (rank / max(1, returned_count - 1))
                 )
             text_score = max(0.0, min(1.0, 0.7 * normalized_raw + 0.3 * rank_score))
-            signal = graph_signals.get(candidate.doc_id, {})
+            signal = evidence_signals.get(candidate.doc_id, {})
+            atom_score = max(0.0, min(1.0, float(signal.get("atom_score") or 0.0)))
+            metadata_score = max(
+                0.0, min(1.0, float(signal.get("metadata_score") or 0.0))
+            )
+            memory_evidence_score = max(atom_score, metadata_score)
+            memory_score = (
+                0.75 * text_score + 0.25 * memory_evidence_score
+                if memory_evidence_score > 0.0
+                else text_score
+            )
             graph_score = max(0.0, min(1.0, float(signal.get("graph_score") or 0.0)))
             overlap_bonus = (
                 self.config.recall.cross_route_bonus
-                if text_score > 0.0 and graph_score > 0.0
+                if memory_score > 0.0 and graph_score > 0.0
                 else 0.0
             )
-            final = max(
+            if graph_score > 0.0 and graph_weight > 0.0:
+                final = max(
+                    0.0,
+                    min(
+                        1.0,
+                        doc_weight * memory_score
+                        + graph_weight * graph_score
+                        + overlap_bonus,
+                    ),
+                )
+            else:
+                final = memory_score
+            evidence_score = max(
                 0.0,
                 min(
                     1.0,
-                    doc_weight * text_score
-                    + graph_weight * graph_score
-                    + overlap_bonus,
+                    doc_weight * memory_evidence_score + graph_weight * graph_score,
                 ),
+            )
+            graph_keyword_score = float(
+                signal.get("graph_keyword_score", signal.get("keyword_score", 0.0))
+                or 0.0
+            )
+            graph_vector_score = float(
+                signal.get("graph_vector_score", signal.get("vector_score", 0.0)) or 0.0
+            )
+            graph_node_score = float(
+                signal.get("graph_node_score", signal.get("node_score", 0.0)) or 0.0
+            )
+            graph_entries = list(
+                signal.get("graph_entries") or signal.get("entries") or []
+            )
+            atom_entries = list(signal.get("atom_entries") or [])
+            atom_types = sorted(
+                {str(entry.get("atom_type") or "unknown") for entry in atom_entries}
             )
             item.score_breakdown = {
                 **item.score_breakdown,
+                "rerank_evidence_version": RERANK_EVIDENCE_VERSION,
                 "rerank_raw_score": round(raw_score, 6),
                 "rerank_text_score": round(text_score, 6),
+                "rerank_memory_score": round(memory_score, 6),
+                "rerank_memory_evidence_score": round(memory_evidence_score, 6),
+                "rerank_evidence_score": round(evidence_score, 6),
+                "rerank_atom_score": round(atom_score, 6),
+                "rerank_atom_keyword_score": round(
+                    float(signal.get("atom_keyword_score") or 0.0), 6
+                ),
+                "rerank_atom_entity_score": round(
+                    float(signal.get("atom_entity_score") or 0.0), 6
+                ),
+                "rerank_atom_quality_score": round(
+                    float(signal.get("atom_quality_score") or 0.0), 6
+                ),
+                "rerank_atom_type_score": round(
+                    float(signal.get("atom_type_score") or 0.0), 6
+                ),
+                "rerank_atom_evidence_count": len(atom_entries),
+                "rerank_atom_types": atom_types,
+                "rerank_metadata_score": round(metadata_score, 6),
+                "rerank_topic_score": round(float(signal.get("topic_score") or 0.0), 6),
+                "rerank_participant_score": round(
+                    float(signal.get("participant_score") or 0.0), 6
+                ),
                 "rerank_graph_score": round(graph_score, 6),
-                "rerank_graph_keyword_score": round(
-                    float(signal.get("keyword_score") or 0.0), 6
+                "rerank_graph_keyword_score": round(graph_keyword_score, 6),
+                "rerank_graph_vector_score": round(graph_vector_score, 6),
+                "rerank_graph_vector_source": str(
+                    signal.get("graph_vector_source") or "none"
                 ),
-                "rerank_graph_vector_score": round(
-                    float(signal.get("vector_score") or 0.0), 6
+                "rerank_graph_vector_granularity": str(
+                    signal.get("graph_vector_granularity") or "unknown"
                 ),
-                "rerank_graph_node_score": round(
-                    float(signal.get("node_score") or 0.0), 6
-                ),
-                "rerank_graph_evidence_count": int(
-                    signal.get("evidence_count") or 0
-                ),
+                "rerank_graph_node_score": round(graph_node_score, 6),
+                "rerank_graph_evidence_count": len(graph_entries),
+                "evidence_enhanced_final_score": round(final, 6),
+                # Kept for API clients that already consume the old diagnostic.
                 "graph_enhanced_final_score": round(final, 6),
                 "original_rank": index + 1,
                 "original_score": round(float(candidate.final_score), 6),
@@ -809,8 +909,20 @@ class PersonalityRAGService:
             if raw is None:
                 item.score_breakdown["rerank_missing"] = True
             item.final_score = final
-            scored.append((final, text_score, graph_score, -index, item))
-        scored.sort(key=lambda row: (row[0], row[1], row[2], row[3]), reverse=True)
+            scored.append(
+                (
+                    final,
+                    evidence_score,
+                    graph_score,
+                    text_score,
+                    -index,
+                    item,
+                )
+            )
+        scored.sort(
+            key=lambda row: (row[0], row[1], row[2], row[3], row[4]),
+            reverse=True,
+        )
         ordered = [item for *_scores, item in scored[:k]]
         return ordered, {
             "requested": True,
@@ -820,8 +932,18 @@ class PersonalityRAGService:
             "candidate_count": len(candidates),
             "returned": len(ordered),
             "provider_returned": len(rerank_rows),
-            "graph_enhanced": True,
-            "graph_candidate_count": graph_candidate_count,
+            "evidence_enhanced": True,
+            "evidence_version": RERANK_EVIDENCE_VERSION,
+            "evidence_candidate_count": evidence_candidate_count,
+            "structured_metadata_candidate_count": structured_metadata_candidate_count,
+            "atom_candidate_count": atom_candidate_count,
+            "atom_signal_candidate_count": atom_signal_candidate_count,
+            "graph_enhanced": (
+                graph_evidence_candidate_count > 0
+                or graph_signal_candidate_count > 0
+            ),
+            "graph_evidence_candidate_count": graph_evidence_candidate_count,
+            "graph_candidate_count": graph_signal_candidate_count,
             "document_route_weight": round(doc_weight, 6),
             "graph_route_weight": round(graph_weight, 6),
         }
@@ -835,128 +957,385 @@ class PersonalityRAGService:
         total = document + graph or 1.0
         return document / total, graph / total, "fixed"
 
+    async def _rerank_evidence_signals(
+        self,
+        query: str,
+        candidates: list[SearchResult],
+    ) -> dict[int, dict[str, Any]]:
+        atom_enabled = bool(self.config.maintenance.atom_enabled)
+        graph_enabled = bool(self.config.recall.graph_memory_enabled)
+        if atom_enabled and graph_enabled:
+            atom_signals, graph_signals = await asyncio.gather(
+                self._rerank_atom_signals(query, candidates),
+                self._rerank_graph_signals(query, candidates),
+            )
+        elif atom_enabled:
+            atom_signals = await self._rerank_atom_signals(query, candidates)
+            graph_signals = {}
+        elif graph_enabled:
+            atom_signals = {}
+            graph_signals = await self._rerank_graph_signals(query, candidates)
+        else:
+            return {}
+
+        tokens = self.text.tokenize(query)
+        signals: dict[int, dict[str, Any]] = {}
+        for candidate in candidates:
+            metadata = (
+                candidate.metadata if isinstance(candidate.metadata, dict) else {}
+            )
+            persona_summary = str(metadata.get("persona_summary") or "").strip()
+            canonical = " ".join(str(candidate.content or "").split()).casefold()
+            if " ".join(persona_summary.split()).casefold() == canonical:
+                persona_summary = ""
+            topics = self._rerank_text_values(metadata.get("topics"))[:6]
+            participant_labels, participant_values = self._rerank_participant_labels(
+                metadata
+            )
+            topic_score = self._rerank_token_overlap(tokens, topics)
+            participant_score = self._rerank_token_overlap(tokens, participant_values)
+            signal = {
+                **graph_signals.get(candidate.doc_id, {}),
+                **atom_signals.get(candidate.doc_id, {}),
+                "persona_summary": persona_summary,
+                "topics": topics,
+                "participants": participant_labels,
+                "topic_score": topic_score,
+                "participant_score": participant_score,
+                "metadata_score": max(topic_score, participant_score),
+            }
+            if self._rerank_signal_has_evidence(signal):
+                signals[candidate.doc_id] = signal
+        return signals
+
+    async def _rerank_atom_signals(
+        self,
+        query: str,
+        candidates: list[SearchResult],
+    ) -> dict[int, dict[str, Any]]:
+        candidate_ids = [item.doc_id for item in candidates]
+        raw = await self.storage.candidate_atom_evidence(
+            candidate_ids,
+            self.text.tokenize(query),
+            max_atoms_per_candidate=RERANK_ATOM_MAX_EVIDENCE,
+        )
+        if not raw:
+            return {}
+        _document_weight, _graph_weight, intent = self._rerank_route_weights(query)
+        candidate_id_set = set(candidate_ids)
+        signals: dict[int, dict[str, Any]] = {}
+        for memory_id, payload in raw.items():
+            normalized_id = int(memory_id)
+            if normalized_id not in candidate_id_set:
+                continue
+            entries = list(payload.get("entries") or [])[:RERANK_ATOM_MAX_EVIDENCE]
+            keyword_score = self._bounded_rerank_score(payload.get("keyword_score"))
+            entity_score = self._bounded_rerank_score(payload.get("entity_score"))
+            quality_score = self._bounded_rerank_score(payload.get("quality_score"))
+            matched_entries = [
+                entry
+                for entry in entries
+                if float(entry.get("match_score") or 0.0) > 0.0
+            ]
+            type_score = max(
+                (
+                    self._rerank_atom_type_score(
+                        intent, str(entry.get("atom_type") or "unknown")
+                    )
+                    for entry in matched_entries
+                ),
+                default=0.0,
+            )
+            atom_score = 0.0
+            if max(keyword_score, entity_score) > 0.0:
+                atom_score = min(
+                    1.0,
+                    0.45 * keyword_score
+                    + 0.15 * entity_score
+                    + 0.25 * quality_score
+                    + 0.15 * type_score,
+                )
+            signals[normalized_id] = {
+                "atom_score": atom_score,
+                "atom_keyword_score": keyword_score,
+                "atom_entity_score": entity_score,
+                "atom_quality_score": quality_score,
+                "atom_type_score": type_score,
+                "atom_entries": entries,
+            }
+        return signals
+
+    @staticmethod
+    def _bounded_rerank_score(value: Any) -> float:
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _rerank_atom_type_score(intent: str, atom_type: str) -> float:
+        normalized_intent = str(intent or "").casefold()
+        normalized_type = str(atom_type or "unknown").casefold()
+        if "relationship" in normalized_intent:
+            return {
+                "relational": 1.0,
+                "preference": 0.75,
+                "factual": 0.6,
+                "episodic": 0.55,
+            }.get(normalized_type, 0.45)
+        if "temporal" in normalized_intent:
+            return {
+                "planned": 1.0,
+                "episodic": 0.9,
+                "factual": 0.65,
+                "relational": 0.5,
+            }.get(normalized_type, 0.45)
+        if "factual" in normalized_intent:
+            return {
+                "factual": 1.0,
+                "preference": 0.65,
+                "relational": 0.6,
+                "episodic": 0.55,
+            }.get(normalized_type, 0.5)
+        return {
+            "factual": 0.8,
+            "relational": 0.8,
+            "preference": 0.8,
+            "planned": 0.75,
+            "episodic": 0.7,
+        }.get(normalized_type, 0.55)
+
+    @staticmethod
+    def _rerank_text_values(value: Any) -> list[str]:
+        if isinstance(value, dict):
+            items = [*value.keys(), *value.values()]
+        elif isinstance(value, (list, tuple, set)):
+            items = list(value)
+        elif value:
+            items = [value]
+        else:
+            items = []
+        result: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            text = str(item).strip()
+            key = text.casefold()
+            if not text or key in seen:
+                continue
+            seen.add(key)
+            result.append(text)
+        return result
+
+    @classmethod
+    def _rerank_participant_labels(
+        cls, metadata: dict[str, Any]
+    ) -> tuple[list[str], list[str]]:
+        identities = metadata.get("participant_identities")
+        if isinstance(identities, dict):
+            if identities and all(
+                isinstance(value, dict) for value in identities.values()
+            ):
+                identity_items = list(identities.values())
+            else:
+                identity_items = [identities]
+        elif isinstance(identities, list):
+            identity_items = identities
+        else:
+            identity_items = []
+        labels: list[str] = []
+        searchable: list[str] = []
+        for identity in identity_items:
+            if not isinstance(identity, dict):
+                continue
+            display_name = str(
+                identity.get("display_name")
+                or identity.get("latest_display_name")
+                or identity.get("name")
+                or ""
+            ).strip()
+            aliases = cls._rerank_text_values(identity.get("aliases"))
+            if display_name:
+                searchable.append(display_name)
+            searchable.extend(aliases)
+            if not display_name and aliases:
+                display_name = aliases[0]
+                aliases = aliases[1:]
+            if not display_name:
+                continue
+            label = display_name
+            unique_aliases = [
+                alias
+                for alias in aliases
+                if alias.casefold() != display_name.casefold()
+            ]
+            if unique_aliases:
+                label += f" (aliases: {', '.join(unique_aliases[:4])})"
+            if bool(identity.get("is_bot")):
+                label += " [bot]"
+            labels.append(label)
+        for participant in cls._rerank_text_values(metadata.get("participants")):
+            searchable.append(participant)
+            if all(participant.casefold() not in label.casefold() for label in labels):
+                labels.append(participant)
+        return cls._rerank_text_values(labels)[:8], cls._rerank_text_values(searchable)
+
+    @staticmethod
+    def _rerank_token_overlap(tokens: list[str], values: list[str]) -> float:
+        normalized_tokens = [
+            str(token).strip().casefold() for token in tokens if str(token).strip()
+        ]
+        if not normalized_tokens or not values:
+            return 0.0
+        searchable = "\n".join(str(value) for value in values).casefold()
+        matched = sum(1 for token in normalized_tokens if token in searchable)
+        return max(0.0, min(1.0, matched / len(normalized_tokens)))
+
+    @staticmethod
+    def _rerank_signal_has_evidence(signal: dict[str, Any]) -> bool:
+        return bool(
+            signal.get("persona_summary")
+            or signal.get("topics")
+            or signal.get("participants")
+            or signal.get("atom_entries")
+            or signal.get("graph_entries")
+            or signal.get("entries")
+        )
+
     async def _rerank_graph_signals(
         self,
         query: str,
         candidates: list[SearchResult],
     ) -> dict[int, dict[str, Any]]:
         candidate_ids = [item.doc_id for item in candidates]
-        tokens = self.text.tokenize(query)
         raw = await self.storage.candidate_graph_evidence(
             candidate_ids,
-            tokens,
+            self.text.tokenize(query),
             max_entries_per_candidate=RERANK_GRAPH_MAX_EVIDENCE,
             graph_expansion_limit=self.config.recall.graph_expansion_limit,
             graph_expansion_hops=self.config.recall.graph_expansion_hops,
             graph_second_hop_weight=self.config.recall.graph_second_hop_weight,
         )
-        if not raw:
-            return {}
-        vector_scores = await self._rerank_graph_vector_scores(query, raw)
+        granularity = "memory"
+        graph_granularity = getattr(
+            getattr(self, "indexes", None), "graph_vector_granularity", None
+        )
+        if callable(graph_granularity):
+            try:
+                granularity = str(graph_granularity() or "unknown")
+            except Exception:
+                granularity = "unknown"
         signals: dict[int, dict[str, Any]] = {}
-        candidate_id_set = {item.doc_id for item in candidates}
-        for memory_id, payload in raw.items():
-            if int(memory_id) not in candidate_id_set:
-                continue
-            keyword_score = max(0.0, min(1.0, float(payload.get("keyword_score") or 0.0)))
-            node_score = max(0.0, min(1.0, float(payload.get("node_score") or 0.0)))
-            vector_score = max(0.0, min(1.0, float(vector_scores.get(memory_id) or 0.0)))
-            confidence = max(0.0, min(1.0, float(payload.get("graph_confidence") or 0.0)))
-            if confidence <= 0 and vector_score > 0:
+        for candidate in candidates:
+            payload = raw.get(candidate.doc_id, {})
+            keyword_score = self._bounded_rerank_score(payload.get("keyword_score"))
+            node_score = self._bounded_rerank_score(payload.get("node_score"))
+            vector_score = self._bounded_rerank_score(
+                candidate.score_breakdown.get("graph_vector_score")
+            )
+            confidence = self._bounded_rerank_score(payload.get("graph_confidence"))
+            has_match = max(keyword_score, node_score, vector_score) > 0.0
+            if confidence <= 0 and has_match:
                 confidence = 0.7
-            graph_score = max(
-                0.0,
+            graph_score = (
                 min(
                     1.0,
-                    0.45 * keyword_score
-                    + 0.25 * vector_score
+                    0.40 * keyword_score
+                    + 0.30 * vector_score
                     + 0.20 * node_score
                     + 0.10 * confidence,
-                ),
+                )
+                if has_match
+                else 0.0
             )
             entries = list(payload.get("entries") or [])[:RERANK_GRAPH_MAX_EVIDENCE]
-            signals[int(memory_id)] = {
-                "keyword_score": keyword_score,
-                "node_score": node_score,
-                "vector_score": vector_score,
+            if not has_match:
+                continue
+            signals[candidate.doc_id] = {
+                "graph_keyword_score": keyword_score,
+                "graph_node_score": node_score,
+                "graph_vector_score": vector_score,
+                "graph_vector_source": (
+                    (
+                        "recall_memory_index"
+                        if granularity == "memory"
+                        else "recall_graph_index"
+                    )
+                    if vector_score > 0.0
+                    else "none"
+                ),
+                "graph_vector_granularity": granularity,
                 "graph_confidence": confidence,
                 "graph_score": graph_score,
-                "evidence_count": len(entries) if graph_score > 0 else 0,
-                "entries": entries,
+                "graph_entries": entries,
             }
         return signals
 
-    async def _rerank_graph_vector_scores(
-        self,
-        query: str,
-        evidence: dict[int, dict[str, Any]],
-    ) -> dict[int, float]:
-        flattened: list[tuple[int, str]] = []
-        for memory_id, payload in evidence.items():
-            for entry in list(payload.get("entries") or [])[:RERANK_GRAPH_MAX_EVIDENCE]:
-                content = str(entry.get("content") or "").strip()
-                if content:
-                    flattened.append(
-                        (int(memory_id), content[:RERANK_GRAPH_ENTRY_CHAR_LIMIT])
-                    )
-        if not flattened:
-            return {}
-        vectors = await self.provider.get_embeddings(
-            [query[:RERANK_GRAPH_DOCUMENT_CHAR_LIMIT]]
-            + [content for _memory_id, content in flattened]
-        )
-        if len(vectors) != len(flattened) + 1:
-            raise RuntimeError("invalid rerank graph vector count")
-        query_vector = vectors[0]
-        scores: dict[int, float] = {}
-        for (memory_id, _content), vector in zip(flattened, vectors[1:], strict=True):
-            scores[memory_id] = max(
-                scores.get(memory_id, 0.0),
-                self._cosine_score(query_vector, vector),
-            )
-        return scores
-
     @staticmethod
-    def _cosine_score(left: list[float], right: list[float]) -> float:
-        dot = 0.0
-        left_norm = 0.0
-        right_norm = 0.0
-        for a, b in zip(left, right, strict=False):
-            fa = float(a)
-            fb = float(b)
-            dot += fa * fb
-            left_norm += fa * fa
-            right_norm += fb * fb
-        if left_norm <= 0 or right_norm <= 0:
-            return 0.0
-        cosine = dot / math.sqrt(left_norm * right_norm)
-        return max(0.0, min(1.0, cosine))
-
-    @staticmethod
-    def _rerank_document_with_graph_evidence(
-        content: str,
+    def _rerank_document_with_evidence(
+        candidate: SearchResult,
         signal: dict[str, Any],
     ) -> str:
-        entries = list(signal.get("entries") or [])[:RERANK_GRAPH_MAX_EVIDENCE]
-        if not entries:
-            return content
-        evidence_lines = []
-        for entry in entries:
-            text = str(entry.get("content") or "").strip()
-            if not text:
-                continue
-            prefix = str(entry.get("relation_type") or entry.get("entry_type") or "graph")
-            evidence_lines.append(
-                f"- {prefix}: {text[:RERANK_GRAPH_ENTRY_CHAR_LIMIT]}"
+        sections = [
+            "[Canonical memory]\n"
+            + str(candidate.content or "")[:RERANK_GRAPH_DOCUMENT_CHAR_LIMIT]
+        ]
+        persona_summary = str(signal.get("persona_summary") or "").strip()
+        if persona_summary:
+            sections.append(
+                "[Persona perspective]\n" + persona_summary[:RERANK_PERSONA_CHAR_LIMIT]
             )
-        if not evidence_lines:
-            return content
-        evidence = "\n".join(evidence_lines)
-        return (
-            f"{content[:RERANK_GRAPH_DOCUMENT_CHAR_LIMIT]}\n\n"
-            "[Graph evidence for rerank]\n"
-            f"{evidence}"
-        )
+
+        atom_lines: list[str] = []
+        for entry in list(signal.get("atom_entries") or [])[:RERANK_ATOM_MAX_EVIDENCE]:
+            content = str(entry.get("content") or "").strip()
+            if not content:
+                continue
+            atom_type = str(entry.get("atom_type") or "unknown")
+            atom_lines.append(
+                f"- {atom_type}: {content[:RERANK_ATOM_ENTRY_CHAR_LIMIT]}"
+            )
+        if atom_lines:
+            sections.append("[Active atomic facts]\n" + "\n".join(atom_lines))
+
+        participants = [
+            str(item).strip()
+            for item in list(signal.get("participants") or [])[:8]
+            if str(item).strip()
+        ]
+        if participants:
+            sections.append(
+                "[Stable participants]\n"
+                + "\n".join(f"- {item}" for item in participants)
+            )
+
+        topics = [
+            str(item).strip()
+            for item in list(signal.get("topics") or [])[:6]
+            if str(item).strip()
+        ]
+        if topics:
+            sections.append("[Topics]\n" + "\n".join(f"- {item}" for item in topics))
+
+        graph_lines: list[str] = []
+        graph_entries = list(
+            signal.get("graph_entries") or signal.get("entries") or []
+        )[:RERANK_GRAPH_MAX_EVIDENCE]
+        for entry in graph_entries:
+            content = str(entry.get("content") or "").strip()
+            if not content:
+                continue
+            relation = str(
+                entry.get("relation_type") or entry.get("entry_type") or "graph"
+            )
+            graph_lines.append(
+                f"- {relation}: {content[:RERANK_GRAPH_ENTRY_CHAR_LIMIT]}"
+            )
+        if graph_lines:
+            sections.append("[Graph relations]\n" + "\n".join(graph_lines))
+
+        # Intentionally excludes memory_sources/source_messages.  Rerank receives
+        # only the canonical candidate and its derived, library-owned evidence.
+        return "\n\n".join(sections)[:RERANK_DOCUMENT_TOTAL_CHAR_LIMIT]
 
     async def rebuild_indexes(
         self,
@@ -1003,9 +1382,7 @@ class PersonalityRAGService:
             if checkpoint_dir is None:
                 parent = self.data_dir / "indexes" / "maintenance-work"
                 parent.mkdir(parents=True, exist_ok=True)
-                work_dir = Path(
-                    tempfile.mkdtemp(prefix="shadow-", dir=str(parent))
-                )
+                work_dir = Path(tempfile.mkdtemp(prefix="shadow-", dir=str(parent)))
             else:
                 work_dir = Path(checkpoint_dir) / "continuous-shadow"
                 work_dir.mkdir(parents=True, exist_ok=True)
@@ -1230,9 +1607,7 @@ class PersonalityRAGService:
                             prepared
                         )
                     except Exception:
-                        await self.storage.replace_search_derivatives_from(
-                            rollback_db
-                        )
+                        await self.storage.replace_search_derivatives_from(rollback_db)
                         await asyncio.to_thread(
                             self._write_activation_journal,
                             {
@@ -1334,13 +1709,9 @@ class PersonalityRAGService:
             )
             or 0
         )
-        if active_documents != int(
-            report.get("document_fts") or 0
-        ):
+        if active_documents != int(report.get("document_fts") or 0):
             return "document_fts_count_mismatch"
-        if active_graph_entries != int(
-            report.get("graph_fts") or 0
-        ):
+        if active_graph_entries != int(report.get("graph_fts") or 0):
             return "graph_fts_count_mismatch"
         return ""
 
@@ -1729,21 +2100,15 @@ class PersonalityRAGService:
             }
             if target_status == "archived" and current_status != "archived":
                 if metadata_patch:
-                    await self.storage.update_memory_metadata(
-                        memory_id, metadata_patch
-                    )
-                details = await self.archive_memories(
-                    [memory_id], return_details=True
-                )
+                    await self.storage.update_memory_metadata(memory_id, metadata_patch)
+                details = await self.archive_memories([memory_id], return_details=True)
                 result = await self.storage.get_document(memory_id)
                 if result is not None:
                     result["index_update"] = details.get("index_update")
                 return result
             if target_status == "active" and current_status == "archived":
                 if metadata_patch:
-                    await self.storage.update_memory_metadata(
-                        memory_id, metadata_patch
-                    )
+                    await self.storage.update_memory_metadata(memory_id, metadata_patch)
                 return await self.restore_memory(memory_id)
         async with self._mutation_lock:
             if "content" in payload:
@@ -1886,9 +2251,7 @@ class PersonalityRAGService:
                 )
                 return result
 
-            success = await self.storage.update_memory_metadata(
-                memory_id, payload
-            )
+            success = await self.storage.update_memory_metadata(memory_id, payload)
             if not success:
                 return None
             self.retrieval.invalidate()
@@ -1900,9 +2263,7 @@ class PersonalityRAGService:
                     "status": "completed",
                     "index_changed": False,
                     "generation": index_status.get("generation"),
-                    "document_vectors": index_status.get(
-                        "document_vectors"
-                    ),
+                    "document_vectors": index_status.get("document_vectors"),
                     "graph_vectors": index_status.get("graph_vectors"),
                 }
             return result
@@ -1997,9 +2358,7 @@ class PersonalityRAGService:
         self, memory_id: int, persona_id: str | None
     ) -> dict[str, Any] | None:
         async with self._mutation_lock:
-            success = await self.storage.update_memory_persona(
-                memory_id, persona_id
-            )
+            success = await self.storage.update_memory_persona(memory_id, persona_id)
             if not success:
                 return None
             self.retrieval.invalidate()
@@ -2070,7 +2429,9 @@ class PersonalityRAGService:
             existing_ids = [int(item["id"]) for item in existing_documents]
             if not existing_ids:
                 return {"deleted": 0, "index_update": None} if return_details else 0
-            graph_entries = await self.storage.graph_entries_for_memory_ids(existing_ids)
+            graph_entries = await self.storage.graph_entries_for_memory_ids(
+                existing_ids
+            )
             graph_entry_ids = {int(item["id"]) for item in graph_entries}
             index_update = await self.indexes.delete_memories_incremental(
                 existing_ids,
@@ -2182,7 +2543,9 @@ class PersonalityRAGService:
                 )
             ).fetchall()
             for row in entry_node_rows:
-                entry_node_map.setdefault(int(row["entry_id"]), []).append(int(row["node_id"]))
+                entry_node_map.setdefault(int(row["entry_id"]), []).append(
+                    int(row["node_id"])
+                )
             node_ids = [int(row["id"]) for row in node_rows]
             edge_rows = []
             node_stats: dict[int, dict[str, Any]] = {}
@@ -2221,10 +2584,14 @@ class PersonalityRAGService:
                     edge_weight = float(row["weight"] or 0)
                     source_stats = node_stats.setdefault(source_id, {})
                     source_stats["degree"] = int(source_stats.get("degree", 0)) + 1
-                    source_stats["weight"] = float(source_stats.get("weight", 0.0)) + edge_weight
+                    source_stats["weight"] = (
+                        float(source_stats.get("weight", 0.0)) + edge_weight
+                    )
                     target_stats = node_stats.setdefault(target_id, {})
                     target_stats["degree"] = int(target_stats.get("degree", 0)) + 1
-                    target_stats["weight"] = float(target_stats.get("weight", 0.0)) + edge_weight
+                    target_stats["weight"] = (
+                        float(target_stats.get("weight", 0.0)) + edge_weight
+                    )
         edge_view = [
             {
                 "id": int(row["id"]),
@@ -2255,8 +2622,7 @@ class PersonalityRAGService:
         edge_view = [
             edge
             for edge in edge_view
-            if edge["source"] in allowed_node_ids
-            and edge["target"] in allowed_node_ids
+            if edge["source"] in allowed_node_ids and edge["target"] in allowed_node_ids
         ][:limit_edges]
         allowed_node_ids = _graph_k_core_node_ids(
             allowed_node_ids, edge_view, minimum_degree
@@ -2264,8 +2630,7 @@ class PersonalityRAGService:
         edge_view = [
             edge
             for edge in edge_view
-            if edge["source"] in allowed_node_ids
-            and edge["target"] in allowed_node_ids
+            if edge["source"] in allowed_node_ids and edge["target"] in allowed_node_ids
         ]
 
         visible_degrees = {node_id: 0 for node_id in allowed_node_ids}
@@ -2291,9 +2656,13 @@ class PersonalityRAGService:
                     "type": row["node_type"],
                     "label": row["node_value"],
                     "canonical_value": row["canonical_value"],
-                    "memory_count": int(node_stats.get(int(row["id"]), {}).get("memory_count", 0)),
+                    "memory_count": int(
+                        node_stats.get(int(row["id"]), {}).get("memory_count", 0)
+                    ),
                     "degree": visible_degrees.get(int(row["id"]), 0),
-                    "entry_count": int(node_stats.get(int(row["id"]), {}).get("entry_count", 0)),
+                    "entry_count": int(
+                        node_stats.get(int(row["id"]), {}).get("entry_count", 0)
+                    ),
                     "weight": visible_weights.get(int(row["id"]), 0.0),
                 }
                 for row in node_rows
@@ -2541,7 +2910,11 @@ class PersonalityRAGService:
             data = json.loads(state_path.read_text(encoding="utf-8") or "{}")
         except (OSError, json.JSONDecodeError):
             return {"version": 1, "library_id": self.memory_store_id}
-        return data if isinstance(data, dict) else {"version": 1, "library_id": self.memory_store_id}
+        return (
+            data
+            if isinstance(data, dict)
+            else {"version": 1, "library_id": self.memory_store_id}
+        )
 
     def _write_decay_state(self, state: dict[str, Any]) -> None:
         state_path = self.data_dir / "decay_state.json"
@@ -2557,13 +2930,8 @@ class PersonalityRAGService:
         today = self._today_key(now)
         state = self._load_decay_state()
         run_daily = state.get("last_daily_maintenance_date") != today
-        forgot_before = (
-            now
-            - self.config.maintenance.atom_forget_delay_days * 86400
-        )
-        purge_before = (
-            now - self.config.maintenance.atom_purge_delay_days * 86400
-        )
+        forgot_before = now - self.config.maintenance.atom_forget_delay_days * 86400
+        purge_before = now - self.config.maintenance.atom_purge_delay_days * 86400
         decayed = 0
         cleanup_ids: list[int] = []
         async with self.storage.connect() as db:
@@ -2587,9 +2955,7 @@ class PersonalityRAGService:
                     0.0,
                     min(
                         1.0,
-                        float(
-                            self.config.maintenance.protected_importance_threshold
-                        ),
+                        float(self.config.maintenance.protected_importance_threshold),
                     ),
                 )
                 document_rows = await (
@@ -2608,7 +2974,9 @@ class PersonalityRAGService:
                     effective_importance = importance
                     if decay_rate > 0 and importance < protected_threshold:
                         access_count = max(0, int(metadata.get("access_count", 0) or 0))
-                        last_access_time = float(metadata.get("last_access_time", 0) or 0)
+                        last_access_time = float(
+                            metadata.get("last_access_time", 0) or 0
+                        )
                         recent_access_factor = (
                             1.0 if last_access_time >= access_window_start else 0.5
                         )
@@ -2639,8 +3007,7 @@ class PersonalityRAGService:
                     if (
                         self.config.maintenance.auto_cleanup_enabled
                         and str(metadata.get("status") or "active") == "active"
-                        and age_days
-                        >= self.config.maintenance.cleanup_days_threshold
+                        and age_days >= self.config.maintenance.cleanup_days_threshold
                         and effective_importance
                         < self.config.maintenance.cleanup_importance_threshold
                     ):

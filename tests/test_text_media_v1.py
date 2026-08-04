@@ -4097,6 +4097,110 @@ async def test_registered_manager_creates_cross_type_same_id(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_text_media_summary_does_not_cold_load_provider_or_faiss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig(api_key="test", session_secret="test-session")
+    context = ApplicationContext.create(
+        source_root=Path(__file__).resolve().parents[1],
+        state_root=tmp_path / "state",
+        config=config,
+        configure_logs=False,
+    )
+    await context.manager.initialize()
+    try:
+        created = await context.manager.create_library(
+            {
+                "database_type": TEXT_MEDIA_V1_TYPE,
+                "id": "summary_only",
+                "name": "Summary only",
+                "provider_id": config.provider.id,
+            }
+        )
+        assert created["id"] == "summary_only"
+        ref = DatabaseRef(TEXT_MEDIA_V1_TYPE, "summary_only")
+        text_manager = context.manager._managers[TEXT_MEDIA_V1_TYPE]
+        await text_manager.unload_runtime(ref, reason="summary-test")
+
+        async def forbidden_runtime_load(_ref):
+            raise AssertionError("summary mode must not build a runtime")
+
+        async def forbidden_faiss_load(_self):
+            raise AssertionError("summary mode must not load FAISS")
+
+        monkeypatch.setattr(text_manager, "_build_service", forbidden_runtime_load)
+        monkeypatch.setattr(TextMediaIndex, "load", forbidden_faiss_load)
+        items = await text_manager.list_libraries(stats_mode="summary")
+
+        summary = next(item for item in items if item["id"] == "summary_only")
+        assert summary["stats"] == {
+            "documents": 0,
+            "entries": 0,
+            "chunks": 0,
+            "images": 0,
+        }
+        assert ref not in text_manager.runtimes
+    finally:
+        await context.manager.close()
+
+
+@pytest.mark.asyncio
+async def test_text_media_summary_cache_uses_file_signature_invalidation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig(api_key="test", session_secret="test-session")
+    context = ApplicationContext.create(
+        source_root=Path(__file__).resolve().parents[1],
+        state_root=tmp_path / "state",
+        config=config,
+        configure_logs=False,
+    )
+    await context.manager.initialize()
+    try:
+        await context.manager.create_library(
+            {
+                "database_type": TEXT_MEDIA_V1_TYPE,
+                "id": "signature_cache",
+                "name": "Before",
+                "provider_id": config.provider.id,
+            }
+        )
+        ref = DatabaseRef(TEXT_MEDIA_V1_TYPE, "signature_cache")
+        text_manager = context.manager._managers[TEXT_MEDIA_V1_TYPE]
+        await text_manager.unload_runtime(ref, reason="signature-test")
+        original = text_manager._offline_summary
+        calls = 0
+
+        def counted(directory: Path):
+            nonlocal calls
+            calls += 1
+            return original(directory)
+
+        monkeypatch.setattr(text_manager, "_offline_summary", counted)
+        first = await text_manager.list_libraries(stats_mode="summary")
+        second = await text_manager.list_libraries(stats_mode="summary")
+        calls_after_second = calls
+        third = await text_manager.list_libraries(stats_mode="summary")
+        assert calls == calls_after_second
+        assert first[0]["name"] == second[0]["name"] == "Before"
+        assert third[0]["name"] == "Before"
+
+        directory = database_type_registry.data_dir(context.manager.data_dir, ref)
+        storage = TextMediaStorage(directory)
+        try:
+            await storage.update_metadata({"name": "After"})
+        finally:
+            await storage.close()
+        refreshed = await text_manager.list_libraries(stats_mode="summary")
+        assert calls > calls_after_second
+        assert refreshed[0]["name"] == "After"
+    finally:
+        await context.manager.close()
+
+
+@pytest.mark.asyncio
 async def test_text_media_rerank_binding_usage_and_hot_unbind(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

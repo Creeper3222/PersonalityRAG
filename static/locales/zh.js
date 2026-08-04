@@ -465,6 +465,18 @@ const zhCN = {
   "runtimeResidencyHint": "默认库永久常驻；非默认库会在空闲后释放索引和模型连接，并按最近最少使用顺序控制常驻数量。",
   "runtimeIdleMinutes": "非默认库空闲回收分钟数",
   "runtimeMaxNonDefault": "非默认库最大常驻数量",
+  "performanceProfile": "性能档位",
+  "performanceProfileAdaptive": "自适应平衡",
+  "performanceProfileLatency": "低延迟",
+  "performanceProfileMemory": "低内存",
+  "performanceProfileHint": "仅调整线程、连接池与运行时驻留预算，不改变检索、召回、任务或数据语义。",
+  "effectiveCpu": "有效 CPU 核心",
+  "effectiveMemory": "有效内存上限",
+  "effectiveRuntimeBudget": "运行时内存预算",
+  "effectiveRuntimeCount": "已驻留 / 非默认上限",
+  "effectiveThreads": "FAISS / I/O 线程",
+  "effectiveHttpPools": "HTTP 连接池 / 租约",
+  "taskLoadMore": "加载更多",
   "settingsHint": "分别管理私有 WebUI、本机适配器接入端口和对外展示的 HTTPS 公网适配器地址。端口修改会在下次启动生效；全局 API Token 仅用于私有 WebUI 管理接口。",
   "currentAccessUrl": "本机 WebUI 地址",
   "accessBaseUrl": "本机地址显示基址",
@@ -1359,8 +1371,22 @@ const zhCN = {
   ,"autoArchiveEnabledHint": "开启后，自动清理会保留正文与原文并移除派生索引，之后可恢复；关闭时维持物理删除语义。"
   ,"protectedImportanceThreshold": "衰减保护重要性阈值"
   ,"protectedImportanceThresholdHint": "达到该阈值的记忆不会参与每日重要性衰减。设为 1 仅保护最高重要性的记忆。"
-  ,"canonicalSummary": "检索摘要（Canonical）"
+  ,"retrievalContent": "检索正文（Content）"
+  ,"canonicalSummary": "可选客观摘要（Canonical）"
   ,"personaSummary": "人格化摘要"
+  ,"selectMemory": "选择记忆"
+  ,"selectedMemoryCount": "已选择 {count} 条"
+  ,"batchImportance": "批量重要性"
+  ,"applyBatchImportance": "应用重要性"
+  ,"archiveSelected": "归档所选"
+  ,"restoreSelected": "恢复所选"
+  ,"deleteSelected": "删除所选"
+  ,"deleteSelectedMemories": "删除所选"
+  ,"archiveSelectedConfirm": "将所选 {count} 条记忆逐条安全归档并移出派生索引，是否继续？"
+  ,"restoreSelectedConfirm": "将所选 {count} 条归档记忆逐条恢复并重建派生数据，是否继续？"
+  ,"deleteSelectedConfirm": "将永久删除所选 {count} 条记忆及其派生数据，是否继续？"
+  ,"importanceRangeError": "重要性必须在 0 到 10 之间。"
+  ,"batchMemoryUpdated": "已处理 {count} 条记忆。"
   ,"noPersonaSummary": "这条记忆没有单独的人格化摘要。"
   ,"viewSourceMessages": "查看来源原文"
   ,"archiveMemory": "归档记忆"

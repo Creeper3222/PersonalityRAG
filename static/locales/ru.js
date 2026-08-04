@@ -312,6 +312,18 @@ const ruRU = {
   "runtimeResidencyHint": "Библиотека по умолчанию всегда остаётся в памяти. Неактивные библиотеки освобождают индексы и подключения к моделям, а их число ограничивается по принципу LRU.",
   "runtimeIdleMinutes": "Минуты простоя до освобождения",
   "runtimeMaxNonDefault": "Максимум резидентных дополнительных библиотек",
+  "performanceProfile": "Профиль производительности",
+  "performanceProfileAdaptive": "Адаптивный баланс",
+  "performanceProfileLatency": "Низкая задержка",
+  "performanceProfileMemory": "Низкое потребление памяти",
+  "performanceProfileHint": "Меняет только число потоков, пулы соединений и бюджет резидентных runtime. Семантика поиска, задач и данных не меняется.",
+  "effectiveCpu": "Доступные ядра CPU",
+  "effectiveMemory": "Лимит памяти",
+  "effectiveRuntimeBudget": "Бюджет памяти runtime",
+  "effectiveRuntimeCount": "Резидентные / лимит",
+  "effectiveThreads": "Потоки FAISS / I/O",
+  "effectiveHttpPools": "HTTP-пулы / аренды",
+  "taskLoadMore": "Загрузить ещё",
   "settingsHint": "Раздельная настройка приватного WebUI, локального порта адаптеров и публичного HTTPS URL адаптеров. Порты применяются при следующем запуске; глобальный API token доступен только приватному WebUI.",
   "currentAccessUrl": "Локальный URL WebUI",
   "accessBaseUrl": "Базовый URL для локального отображения",
@@ -1207,8 +1219,22 @@ const ruRU = {
   ,"autoArchiveEnabledHint": "Автоочистка сохраняет текст и источники, удаляя производные индексы, чтобы запись можно было восстановить. Выключено означает удаление."
   ,"protectedImportanceThreshold": "Порог защиты от снижения важности"
   ,"protectedImportanceThresholdHint": "Записи с этой или большей важностью не участвуют в ежедневном снижении. Значение 1 защищает только максимальную важность."
-  ,"canonicalSummary": "Резюме для поиска (canonical)"
+  ,"retrievalContent": "Текст для поиска"
+  ,"canonicalSummary": "Необязательное каноническое резюме"
   ,"personaSummary": "Персонализированное резюме"
+  ,"selectMemory": "Выбрать память"
+  ,"selectedMemoryCount": "Выбрано: {count}"
+  ,"batchImportance": "Групповая важность"
+  ,"applyBatchImportance": "Применить важность"
+  ,"archiveSelected": "Архивировать выбранное"
+  ,"restoreSelected": "Восстановить выбранное"
+  ,"deleteSelected": "Удалить выбранное"
+  ,"deleteSelectedMemories": "Удалить выбранное"
+  ,"archiveSelectedConfirm": "Безопасно архивировать {count} выбранных записей и удалить их производные индексы?"
+  ,"restoreSelectedConfirm": "Восстановить {count} выбранных записей и пересоздать производные данные?"
+  ,"deleteSelectedConfirm": "Безвозвратно удалить {count} выбранных записей и их производные данные?"
+  ,"importanceRangeError": "Важность должна быть от 0 до 10."
+  ,"batchMemoryUpdated": "Обработано записей: {count}."
   ,"noPersonaSummary": "Для этой записи нет отдельного персонализированного резюме."
   ,"viewSourceMessages": "Показать исходные сообщения"
   ,"archiveMemory": "Архивировать память"

@@ -4,6 +4,8 @@ import asyncio
 
 import pytest
 
+from personalityrag.config import AppConfig
+from personalityrag.libraries import DatabaseManager
 from personalityrag.sqlite_pool import SQLiteConnectionPool
 
 
@@ -28,9 +30,28 @@ async def test_pool_reuses_connections_and_rolls_back_unfinished_transactions(tm
         await lease.close()
 
     assert identity in seen
-    assert pool.connection_count == 2
+    assert pool.connection_count == 1
     await pool.close()
     assert pool.connection_count == 0
+
+
+@pytest.mark.asyncio
+async def test_pool_grows_only_for_concurrent_leases_and_reaps_extra_idle(tmp_path):
+    pool = SQLiteConnectionPool(tmp_path / "lazy.db", size=2)
+    await pool.start()
+    assert pool.connection_count == 0
+
+    first = await pool.acquire()
+    assert pool.connection_count == 1
+    second = await pool.acquire()
+    assert pool.connection_count == 2
+    pool._idle_seconds = 0.01
+    await first.close()
+    await second.close()
+
+    await asyncio.sleep(0.03)
+    assert pool.connection_count == 1
+    await pool.close()
 
 
 @pytest.mark.asyncio
@@ -52,3 +73,20 @@ async def test_pool_uses_exclusive_leases_and_close_waits_for_return(tmp_path):
     assert pool.connection_count == 1
     await reopened.close()
     await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_database_manager_close_drains_unattached_sqlite_pools(tmp_path):
+    manager = DatabaseManager(tmp_path / "state", AppConfig())
+    orphan = SQLiteConnectionPool(tmp_path / "offline-summary.db", size=2)
+    lease = await orphan.acquire()
+    worker = getattr(lease._connection, "_thread", None)
+    await lease.close()
+
+    assert orphan.connection_count == 1
+    assert worker is not None and worker.is_alive()
+
+    await manager.close()
+
+    assert orphan.connection_count == 0
+    assert worker.is_alive() is False

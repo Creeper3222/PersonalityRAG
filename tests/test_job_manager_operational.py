@@ -486,6 +486,56 @@ async def test_clear_finished_removes_only_terminal_history(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_finished_job_pages_are_stable_and_summary_only(tmp_path: Path) -> None:
+    jobs = await _manager(tmp_path)
+    ids = []
+
+    async def operation(progress):
+        await progress(1.0, "done")
+        return {"large_detail": "x" * 4096}
+
+    for index in range(5):
+        job_id = await jobs.start(
+            f"fixture-{index}",
+            operation,
+            library_id="paged-library",
+        )
+        ids.append(job_id)
+        await asyncio.wait_for(jobs.wait(job_id), timeout=1)
+
+    expected = sorted(
+        await asyncio.gather(*(jobs.get(job_id) for job_id in ids)),
+        key=lambda item: (-float(item["updated_at"]), str(item["id"])),
+    )
+    first, cursor = await jobs.list_page(scope="finished", limit=2)
+    second, next_cursor = await jobs.list_page(
+        scope="finished",
+        limit=2,
+        cursor=cursor,
+    )
+
+    assert [item["id"] for item in first + second] == [
+        item["id"] for item in expected[:4]
+    ]
+    assert cursor is not None
+    assert next_cursor is not None
+    assert all("result" not in item for item in first + second)
+    assert all("request_metadata" not in item for item in first + second)
+    detailed, _ = await jobs.list_page(
+        scope="finished",
+        limit=1,
+        include_details=True,
+    )
+    assert detailed[0]["result"]["large_detail"]["truncated"] is True
+    assert detailed[0]["result"]["large_detail"]["characters"] == 4096
+    assert "request_metadata" in detailed[0]
+    legacy = await jobs.list(scope="finished")
+    assert legacy[0]["result"]["large_detail"]["truncated"] is True
+    assert "request_metadata" in legacy[0]
+    await jobs.close()
+
+
+@pytest.mark.asyncio
 async def test_close_cancels_simple_jobs_and_retains_finished_history(
     tmp_path: Path,
 ) -> None:

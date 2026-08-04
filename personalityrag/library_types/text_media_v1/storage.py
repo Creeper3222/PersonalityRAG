@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -11,7 +12,11 @@ from typing import Any, Iterable
 import numpy as np
 
 from ...sqlite_pool import SQLiteConnectionPool
-from .retrieval import retrieval_config_json
+from ...resource_limits import configured_sqlite_pool_size
+from .retrieval import (
+    rerank_calibration_settings_fingerprint,
+    retrieval_config_json,
+)
 from .text import (
     DEFAULT_CHUNK_OVERLAP,
     DEFAULT_CHUNK_TARGET,
@@ -30,6 +35,46 @@ DATABASE_FILENAME = "textmediaknowledge.db"
 DEFAULT_UNIFORM_MEDIA_STRENGTH = 0.5
 RELATION_SCOPES = frozenset({"document", "entry", "chunk"})
 OUTPUT_POLICIES = frozenset({"auto", "with_result", "metadata_only", "disabled"})
+
+SUMMARY_SNAPSHOT_SQL = """SELECT lm.*,
+    (SELECT COUNT(*) FROM documents
+      WHERE status='ready') AS summary_documents,
+    (SELECT COUNT(*) FROM entries
+      WHERE status='active') AS summary_entries,
+    (SELECT COUNT(*) FROM chunks
+      WHERE status='active') AS summary_chunks,
+    (SELECT COUNT(*) FROM assets
+      WHERE kind='image' AND state='active') AS summary_images
+    FROM library_meta lm WHERE singleton=1"""
+
+SUMMARY_RECALIBRATION_SQL = """SELECT EXISTS(
+  SELECT 1 FROM document_assets da
+  WHERE da.semantic_mode='calibrated' AND (
+    COALESCE(da.calibration_rerank_provider_fingerprint,'')<>?
+    OR NOT EXISTS(
+      SELECT 1 FROM chunk_media_strengths cms
+      WHERE cms.document_id=da.document_id
+        AND cms.asset_id=da.asset_id
+        AND cms.rerank_semantic_strength IS NOT NULL
+        AND json_valid(cms.calibration_details_json)
+        AND COALESCE(json_extract(
+          cms.calibration_details_json,
+          '$.rerank_settings_fingerprint'
+        ),'')=?
+    )
+    OR EXISTS(
+      SELECT 1 FROM chunk_media_strengths cms
+      WHERE cms.document_id=da.document_id
+        AND cms.asset_id=da.asset_id
+        AND cms.rerank_semantic_strength IS NOT NULL
+        AND json_valid(cms.calibration_details_json)
+        AND COALESCE(json_extract(
+          cms.calibration_details_json,
+          '$.rerank_settings_fingerprint'
+        ),'')<>?
+    )
+  )
+) AS value"""
 
 
 def normalize_bm25_rows(
@@ -82,7 +127,10 @@ class TextMediaStorage:
     def __init__(self, root: Path):
         self.root = Path(root)
         self.path = self.root / DATABASE_FILENAME
-        self.pool = SQLiteConnectionPool(self.path, size=2)
+        self.pool = SQLiteConnectionPool(
+            self.path,
+            size=configured_sqlite_pool_size(),
+        )
 
     async def initialize(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -849,6 +897,112 @@ class TextMediaStorage:
             return dict(row)
         finally:
             await db.close()
+
+    async def summary_snapshot(self) -> dict[str, Any]:
+        """Read card/task metadata without initializing a full runtime.
+
+        Counts and metadata come from one SQLite snapshot.  The optional
+        recalibration flag is reduced in SQL and never materializes per-media
+        calibration rows in Python.
+        """
+
+        db = await self.pool.acquire()
+        try:
+            row = await (
+                await db.execute(SUMMARY_SNAPSHOT_SQL)
+            ).fetchone()
+            if row is None:
+                raise KeyError("library metadata")
+            payload = dict(row)
+            stats = {
+                "documents": int(payload.pop("summary_documents") or 0),
+                "entries": int(payload.pop("summary_entries") or 0),
+                "chunks": int(payload.pop("summary_chunks") or 0),
+                "images": int(payload.pop("summary_images") or 0),
+            }
+            rerank_fingerprint = str(
+                payload.get("rerank_provider_fingerprint") or ""
+            )
+            needs_recalibration = False
+            if rerank_fingerprint:
+                settings_fingerprint = rerank_calibration_settings_fingerprint(
+                    payload.get("retrieval_config_json")
+                )
+                mismatch = await (
+                    await db.execute(
+                        SUMMARY_RECALIBRATION_SQL,
+                        (
+                            rerank_fingerprint,
+                            settings_fingerprint,
+                            settings_fingerprint,
+                        ),
+                    )
+                ).fetchone()
+                needs_recalibration = bool(mismatch["value"])
+            return {
+                "metadata": payload,
+                "stats": stats,
+                "needs_recalibration": needs_recalibration,
+            }
+        finally:
+            await db.close()
+
+    @classmethod
+    def summary_snapshot_from_disk(cls, root: Path) -> dict[str, Any]:
+        """Read the exact summary snapshot without creating an aiosqlite worker.
+
+        This path is used only for unloaded library cards.  A short-lived,
+        query-only SQLite connection sees the same WAL snapshot as the async
+        implementation while avoiding one persistent thread per cold library.
+        """
+
+        path = Path(root) / DATABASE_FILENAME
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        database_uri = path.resolve().as_uri() + "?mode=ro"
+        db = sqlite3.connect(
+            database_uri,
+            uri=True,
+            timeout=5.0,
+            check_same_thread=False,
+        )
+        db.row_factory = sqlite3.Row
+        try:
+            db.execute("PRAGMA query_only=ON")
+            row = db.execute(SUMMARY_SNAPSHOT_SQL).fetchone()
+            if row is None:
+                raise KeyError("library metadata")
+            payload = dict(row)
+            stats = {
+                "documents": int(payload.pop("summary_documents") or 0),
+                "entries": int(payload.pop("summary_entries") or 0),
+                "chunks": int(payload.pop("summary_chunks") or 0),
+                "images": int(payload.pop("summary_images") or 0),
+            }
+            rerank_fingerprint = str(
+                payload.get("rerank_provider_fingerprint") or ""
+            )
+            needs_recalibration = False
+            if rerank_fingerprint:
+                settings_fingerprint = rerank_calibration_settings_fingerprint(
+                    payload.get("retrieval_config_json")
+                )
+                mismatch = db.execute(
+                    SUMMARY_RECALIBRATION_SQL,
+                    (
+                        rerank_fingerprint,
+                        settings_fingerprint,
+                        settings_fingerprint,
+                    ),
+                ).fetchone()
+                needs_recalibration = bool(mismatch["value"])
+            return {
+                "metadata": payload,
+                "stats": stats,
+                "needs_recalibration": needs_recalibration,
+            }
+        finally:
+            db.close()
 
     async def update_metadata(self, payload: dict[str, Any]) -> dict[str, Any]:
         allowed = {
@@ -3906,16 +4060,20 @@ class TextMediaStorage:
     async def statistics(self) -> dict[str, int]:
         db = await self.pool.acquire()
         try:
-            result: dict[str, int] = {}
-            for key, table, where in (
-                ("documents", "documents", "status='ready'"),
-                ("entries", "entries", "status='active'"),
-                ("chunks", "chunks", "status='active'"),
-                ("images", "assets", "kind='image' AND state='active'"),
-            ):
-                row = await (await db.execute(f"SELECT COUNT(*) AS value FROM {table} WHERE {where}")).fetchone()
-                result[key] = int(row["value"])
-            return result
+            row = await (
+                await db.execute(
+                    """SELECT
+                    (SELECT COUNT(*) FROM documents
+                      WHERE status='ready') AS documents,
+                    (SELECT COUNT(*) FROM entries
+                      WHERE status='active') AS entries,
+                    (SELECT COUNT(*) FROM chunks
+                      WHERE status='active') AS chunks,
+                    (SELECT COUNT(*) FROM assets
+                      WHERE kind='image' AND state='active') AS images"""
+                )
+            ).fetchone()
+            return {key: int(row[key] or 0) for key in row.keys()}
         finally:
             await db.close()
 

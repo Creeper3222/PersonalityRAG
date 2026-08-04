@@ -314,6 +314,18 @@ const enUS = {
   "runtimeResidencyHint": "The default library stays resident. Idle non-default libraries release indexes and model connections, with an LRU limit on resident runtimes.",
   "runtimeIdleMinutes": "Idle minutes before release",
   "runtimeMaxNonDefault": "Maximum resident non-default libraries",
+  "performanceProfile": "Performance profile",
+  "performanceProfileAdaptive": "Adaptive balance",
+  "performanceProfileLatency": "Low latency",
+  "performanceProfileMemory": "Low memory",
+  "performanceProfileHint": "Adjusts threads, connection pools, and runtime residency budgets only. Retrieval, recall, task, and data semantics remain unchanged.",
+  "effectiveCpu": "Effective CPU cores",
+  "effectiveMemory": "Effective memory limit",
+  "effectiveRuntimeBudget": "Runtime memory budget",
+  "effectiveRuntimeCount": "Resident / non-default limit",
+  "effectiveThreads": "FAISS / I/O threads",
+  "effectiveHttpPools": "HTTP pools / leases",
+  "taskLoadMore": "Load more",
   "settingsHint": "Manage the private WebUI, local adapter listener, and the public HTTPS adapter URL separately. Port changes take effect on the next launch; the global API token is only for private WebUI administration.",
   "currentAccessUrl": "Local WebUI URL",
   "accessBaseUrl": "Local display base URL",
@@ -1209,8 +1221,22 @@ const enUS = {
   ,"autoArchiveEnabledHint": "Automatic cleanup keeps content and sources but removes derived indexes so records can be restored. Off preserves deletion semantics."
   ,"protectedImportanceThreshold": "Decay-protection importance"
   ,"protectedImportanceThresholdHint": "Memories at or above this value skip daily importance decay. A value of 1 protects only maximum-importance memories."
-  ,"canonicalSummary": "Retrieval summary (canonical)"
+  ,"retrievalContent": "Retrieval content"
+  ,"canonicalSummary": "Optional canonical summary"
   ,"personaSummary": "Persona summary"
+  ,"selectMemory": "Select memory"
+  ,"selectedMemoryCount": "{count} selected"
+  ,"batchImportance": "Batch importance"
+  ,"applyBatchImportance": "Apply importance"
+  ,"archiveSelected": "Archive selected"
+  ,"restoreSelected": "Restore selected"
+  ,"deleteSelected": "Delete selected"
+  ,"deleteSelectedMemories": "Delete selected"
+  ,"archiveSelectedConfirm": "Safely archive {count} selected memories and remove their derived indexes?"
+  ,"restoreSelectedConfirm": "Restore {count} selected memories and regenerate their derived data?"
+  ,"deleteSelectedConfirm": "Permanently delete {count} selected memories and their derived data?"
+  ,"importanceRangeError": "Importance must be between 0 and 10."
+  ,"batchMemoryUpdated": "Processed {count} memories."
   ,"noPersonaSummary": "This memory has no separate persona-facing summary."
   ,"viewSourceMessages": "View source messages"
   ,"archiveMemory": "Archive memory"

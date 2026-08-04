@@ -127,18 +127,18 @@ def test_brand_new_config_does_not_persist_a_bootstrap_provider(tmp_path):
     assert reloaded.bootstrap_provider_enabled is False
 
 
-def test_faiss_thread_limit_defaults_to_eight_and_accepts_environment_override(
+def test_faiss_thread_limit_uses_adaptive_default_and_accepts_environment_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("PERSONALITYRAG_FAISS_THREADS", raising=False)
     assert indexes_module._configured_faiss_threads() == min(
-        8, resource_limits.effective_cpu_count()
+        4, resource_limits.effective_cpu_count()
     )
     monkeypatch.setenv("PERSONALITYRAG_FAISS_THREADS", "3")
     assert indexes_module._configured_faiss_threads() == 3
     monkeypatch.setenv("PERSONALITYRAG_FAISS_THREADS", "invalid")
     assert indexes_module._configured_faiss_threads() == min(
-        8, resource_limits.effective_cpu_count()
+        4, resource_limits.effective_cpu_count()
     )
 
 

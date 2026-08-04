@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .config import normalize_access_base_url, normalize_public_adapter_url
 from .identifiers import validate_identifier
+from .resource_limits import normalize_performance_profile
 
 
 def _validate_required_id(value: str, *, field: str) -> str:
@@ -38,6 +39,14 @@ class SettingsUpdate(BaseModel):
     clear_password: bool = False
     runtime_idle_minutes: int | None = Field(default=None, ge=1)
     max_non_default_runtimes: int | None = Field(default=None, ge=1)
+    performance_profile: str | None = None
+
+    @field_validator("performance_profile")
+    @classmethod
+    def clean_performance_profile(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return normalize_performance_profile(value)
 
     @field_validator("access_base_url")
     @classmethod
@@ -179,6 +188,7 @@ class MemorySourceUpdate(BaseModel):
 
 
 class MemoryResummaryCommit(BaseModel):
+    content: str | None = Field(default=None, min_length=1)
     canonical_summary: str = Field(min_length=1)
     persona_summary: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -189,6 +199,7 @@ class MemoryResummaryCommit(BaseModel):
 
 class MemoryTransferSummary(BaseModel):
     preview_item_id: str = Field(min_length=1, max_length=128)
+    content: str | None = Field(default=None, min_length=1)
     canonical_summary: str = Field(min_length=1)
     persona_summary: str | None = None
     importance: float | None = Field(default=None, ge=0, le=1)
