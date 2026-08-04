@@ -25,6 +25,7 @@ COPY tests ./tests
 COPY tools ./tools
 COPY run.py ./run.py
 COPY Dockerfile ./Dockerfile
+COPY docker-compose.local.yml ./docker-compose.local.yml
 COPY docker ./docker
 CMD ["python", "-m", "pytest", "-q"]
 

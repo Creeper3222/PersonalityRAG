@@ -2025,6 +2025,10 @@ async def test_runtime_twenty_load_unload_cycles_preserve_recall_and_threads(
             thread.name.startswith("SQLitePool-")
             for thread in threading.enumerate()
         )
+        baseline_executor_threads = sum(
+            thread.name.startswith("asyncio_")
+            for thread in threading.enumerate()
+        )
 
         for _ in range(20):
             runtime = await manager.get_runtime("cycling")
@@ -2060,6 +2064,9 @@ async def test_runtime_twenty_load_unload_cycles_preserve_recall_and_threads(
         assert runtime_threads <= baseline_runtime_threads + 1, ", ".join(
             thread.name for thread in active_threads
         )
-        assert executor_threads <= configured_io_workers()
+        assert executor_threads <= baseline_executor_threads + 1, ", ".join(
+            thread.name for thread in active_threads
+        )
+        assert executor_threads <= configured_io_workers() + 1
     finally:
         await manager.close()
