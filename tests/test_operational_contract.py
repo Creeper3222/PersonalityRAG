@@ -56,21 +56,158 @@ def test_http_route_contract() -> None:
         if method != "HEAD"
     )
 
-    assert len(routes) == 105
+    assert len(routes) == 149
     assert _stable_hash(routes) == (
-        "25cfebc76b7fffc7770c430964f8cc3cf51131775796a6bff9729cf7458c4ec4"
+        "c4bca7c216be5c76313e69fdc1a9573e9e6a9282b1afa139d5f5eada2af09d03"
     )
+    assert (
+        "GET",
+        "/api/v1/jobs/{job_id}/details",
+        "job_details",
+    ) in routes
     assert ("POST", "/api/v1/providers/test", "provider_test_compat") in routes
-    assert ("POST", "/api/v1/recall", "recall") in routes
+    assert not any(path.startswith("/api/v1/libraries") for _, path, _ in routes)
+    assert not any(path.startswith("/api/v1/databases/") for _, path, _ in routes)
+    assert ("GET", "/api/v1/database-types", "database_types") in routes
     assert (
         "POST",
-        "/api/v1/libraries/{library_id}/recall",
+        "/api/v1/memory-libraries/livingmemory_v8/{memory_store_id}/recall",
         "recall",
     ) in routes
     assert (
+        "GET",
+        "/api/v1/memory-libraries/livingmemory_v8/{memory_store_id}/memories/{memory_id}/source",
+        "memory_source",
+    ) in routes
+    assert (
         "POST",
-        "/api/v1/libraries/{library_id}/adapters/{adapter_id}/disconnect",
+        "/api/v1/memory-libraries/livingmemory_v8/{memory_store_id}/memories/{memory_id}/archive",
+        "archive_memory",
+    ) in routes
+    assert (
+        "POST",
+        "/api/v1/memory-libraries/livingmemory_v8/{memory_store_id}/transfers/imports/{preview_id}/commit",
+        "commit_memory_transfer",
+    ) in routes
+    assert (
+        "POST",
+        "/api/v1/knowledge-libraries/text_media_v1/{knowledge_base_id}/search",
+        "search",
+    ) in routes
+    assert (
+        "POST",
+        "/api/v1/knowledge-libraries/text_media_v1/{knowledge_base_id}/ingest-batches",
+        "ingest_batch",
+    ) in routes
+    assert (
+        "POST",
+        "/api/v1/knowledge-libraries/text_media_v1/imports/inspect",
+        "inspect_import",
+    ) in routes
+    assert (
+        "POST",
+        "/api/v1/knowledge-libraries/text_media_v1/transfer-batches/exports",
+        "create_batch_export",
+    ) in routes
+    assert (
+        "POST",
+        "/api/v1/knowledge-libraries/text_media_v1/transfer-batches/imports/{token}/commit",
+        "commit_batch_import",
+    ) in routes
+    assert (
+        "POST",
+        "/api/v1/knowledge-libraries/text_media_v1/{knowledge_base_id}/copy",
+        "copy_database",
+    ) in routes
+    assert (
+        "POST",
+        "/api/v1/knowledge-libraries/text_media_v1/{knowledge_base_id}/backup",
+        "backup_database",
+    ) in routes
+    assert (
+        "GET",
+        "/api/v1/knowledge-libraries/text_media_v1/{knowledge_base_id}/media-calibrations",
+        "list_media_calibrations",
+    ) in routes
+    assert (
+        "PUT",
+        "/api/v1/knowledge-libraries/text_media_v1/{knowledge_base_id}/document-media-relations/{document_id}/{asset_id}/semantic-calibration",
+        "recalibrate_document_media",
+    ) in routes
+    assert (
+        "GET",
+        "/api/v1/knowledge-libraries/text_media_v1/{knowledge_base_id}/assets/{asset_id}/content",
+        "asset_content",
+    ) in routes
+    assert (
+        "DELETE",
+        "/api/v1/knowledge-libraries/text_media_v1/{knowledge_base_id}/entries/{entry_id}",
+        "delete_entry",
+    ) in routes
+    assert (
+        "DELETE",
+        "/api/v1/knowledge-libraries/text_media_v1/{knowledge_base_id}/assets/{asset_id}",
+        "delete_image",
+    ) in routes
+    assert (
+        "GET",
+        "/api/v1/knowledge-libraries/text_media_v1/{knowledge_base_id}/documents/{document_id}",
+        "document_detail",
+    ) in routes
+    assert (
+        "POST",
+        "/api/v1/knowledge-libraries/text_media_v1/{knowledge_base_id}/documents/batch-delete",
+        "delete_documents_batch",
+    ) in routes
+    assert (
+        "GET",
+        "/api/v1/knowledge-libraries/text_media_v1/{knowledge_base_id}/chunks",
+        "chunks",
+    ) in routes
+    assert (
+        "GET",
+        "/api/v1/knowledge-libraries/text_media_v1/{knowledge_base_id}/chunks/{chunk_id}",
+        "chunk_detail",
+    ) in routes
+    assert (
+        "GET",
+        "/api/v1/knowledge-libraries/text_media_v1/{knowledge_base_id}/assets/{asset_id}",
+        "asset_detail",
+    ) in routes
+    assert (
+        "PUT",
+        "/api/v1/knowledge-libraries/text_media_v1/{knowledge_base_id}/assets/{asset_id}/media-descriptions",
+        "update_asset_media_descriptions",
+    ) in routes
+    assert (
+        "PUT",
+        "/api/v1/knowledge-libraries/text_media_v1/{knowledge_base_id}/visual-intent-policy",
+        "update_visual_intent_policy",
+    ) in routes
+    assert (
+        "POST",
+        "/api/v1/knowledge-libraries/text_media_v1/{knowledge_base_id}/visual-intent-policy/export",
+        "export_visual_intent_policy",
+    ) in routes
+    assert (
+        "POST",
+        "/api/v1/knowledge-libraries/text_media_v1/{knowledge_base_id}/visual-intent-policy/imports/inspect",
+        "inspect_visual_intent_policy_import",
+    ) in routes
+    assert (
+        "POST",
+        "/api/v1/memory-libraries/livingmemory_v8/{memory_store_id}/adapters/{adapter_id}/disconnect",
         "disconnect_adapter",
+    ) in routes
+    assert (
+        "POST",
+        "/api/v1/knowledge-libraries/text_media_v1/{knowledge_base_id}/adapters/heartbeat",
+        "knowledge_adapter_heartbeat",
+    ) in routes
+    assert (
+        "POST",
+        "/api/v1/knowledge-libraries/text_media_v1/{knowledge_base_id}/adapters/{adapter_id}/disconnect",
+        "disconnect_knowledge_adapter",
     ) in routes
     assert ("GET", "/api/v1/files", "list_files") in routes
     assert ("POST", "/api/v1/files/download", "download_files") in routes
@@ -80,15 +217,92 @@ def test_http_route_contract() -> None:
 
 
 def test_openapi_contract() -> None:
-    assert _stable_hash(app_module.app.openapi()) == (
-        "2e7633b4c8ee8d8401e05e992885f935f22e7610f36e58d188583572cd857b0f"
+    openapi = app_module.app.openapi()
+    assert _stable_hash(openapi) == (
+        "2f7507c8332d83268a07c00b35c7aeccac491a9318a9cb19fde6ca596f468562"
     )
+    assert (
+        "memory_type"
+        not in openapi["components"]["schemas"]["MemoryCreate"]["properties"]
+    )
+    assert (
+        "memory_type"
+        not in openapi["components"]["schemas"]["MemoryUpdate"]["properties"]
+    )
+    assert (
+        "database_type"
+        not in openapi["components"]["schemas"]["LivingMemoryV8Create"]["properties"]
+    )
+    search_threshold = openapi["components"]["schemas"]["SearchRequest"]["properties"][
+        "media_relevance_pivot"
+    ]
+    assert {item.get("type") for item in search_threshold["anyOf"]} == {
+        "number",
+        "null",
+    }
+    legacy_search_threshold = openapi["components"]["schemas"]["SearchRequest"][
+        "properties"
+    ]["media_score_threshold"]
+    assert legacy_search_threshold["deprecated"] is True
+    rerank_switch = openapi["components"]["schemas"]["SearchRequest"]["properties"][
+        "rerank"
+    ]
+    assert {item.get("type") for item in rerank_switch["anyOf"]} == {
+        "boolean",
+        "null",
+    }
+    retrieval = openapi["components"]["schemas"]["RetrievalSettingsRequest"][
+        "properties"
+    ]
+    assert retrieval["rerank_candidate_limit"]["default"] == 10
+    assert retrieval["rerank_fusion_weight"]["default"] == 0.30
+    assert retrieval["text_lexical_boost"]["default"] == 0.6
+    assert retrieval["rerank_rank_bonus_weight"]["default"] == 0.0
+    assert retrieval["rerank_rank_reliability_exponent"]["default"] == 1.5
+    retrieval_properties = openapi["components"]["schemas"]["RetrievalSettingsRequest"][
+        "properties"
+    ]
+    assert retrieval_properties["media_relevance_pivot_fallback"]["default"] == 0.35
+    assert retrieval_properties["media_pivot_positive_blend"]["default"] == 0.7
+    assert retrieval_properties["media_pivot_negative_weight"]["default"] == 0.35
+    assert (
+        retrieval_properties["media_pivot_negative_attenuation_floor"]["default"]
+        == 0.05
+    )
+    assert retrieval_properties["media_format_mismatch_factor"]["default"] == 0.1
+    assert retrieval_properties["media_content_mismatch_factor"]["default"] == 0.1
+    assert retrieval_properties["media_threshold_evidence_limit"]["default"] == 5
+    assert retrieval_properties["unbound_media_candidate_limit"]["default"] == 10
+    assert retrieval_properties["unbound_media_distinctive_boost"]["default"] == 0.35
+    assert retrieval_properties["unbound_media_collection_boost"]["default"] == 0.55
+    assert retrieval_properties["unbound_media_competition_floor"]["default"] == 0.35
+    assert retrieval_properties["unbound_media_reliability_target"]["default"] == 0.25
+    assert retrieval_properties["unbound_media_specificity_exponent"]["default"] == 1.0
+    assert retrieval_properties["unbound_media_advantage_target"]["default"] == 0.04
+    visual_policy = openapi["components"]["schemas"]["VisualIntentPolicyRequest"]
+    assert set(visual_policy["required"]) == {
+        "visual_object_terms",
+        "lookup_action_terms",
+        "generation_action_terms",
+        "reference_connector_terms",
+    }
+    assert all(
+        visual_policy["properties"][key]["maxItems"] == 256
+        for key in visual_policy["required"]
+    )
+    assert (
+        "/api/v1/knowledge-libraries/text_media_v1/{knowledge_base_id}/visual-intent-policy"
+    ) in openapi["paths"]
+    list_parameters = openapi["paths"][
+        "/api/v1/memory-libraries/livingmemory_v8/{memory_store_id}/memories"
+    ]["get"]["parameters"]
+    assert "memory_type" not in {item["name"] for item in list_parameters}
 
 
 def test_library_adapter_ids_are_force_disconnect_buttons() -> None:
-    source = (
-        REPO_ROOT / "static" / "modules" / "libraries.js"
-    ).read_text(encoding="utf-8")
+    source = (REPO_ROOT / "static" / "modules" / "libraries.js").read_text(
+        encoding="utf-8"
+    )
 
     assert 'class="${["used-lib-jump", "disconnect-adapter"' in source
     assert "confirmForceDisconnectAdapter" in source
@@ -97,12 +311,13 @@ def test_library_adapter_ids_are_force_disconnect_buttons() -> None:
 
 def test_webui_dom_id_contract() -> None:
     html = (REPO_ROOT / "static" / "index.html").read_text(encoding="utf-8")
-    dom_ids = sorted(set(re.findall(r'\bid="([^"]+)"', html)))
+    all_dom_ids = re.findall(r'\bid="([^"]+)"', html)
+    dom_ids = set(all_dom_ids)
 
-    assert len(dom_ids) == 365
-    assert _stable_hash(dom_ids) == (
-        "fa6651bec28503fc6daf86f5e00a2e8680c8f4f866ecacb8333be9d8b9592ebe"
-    )
+    assert len(all_dom_ids) == len(dom_ids)
+    assert "database-type-nav" in dom_ids
+    assert "page-database" in dom_ids
+    assert "database-page-host" in dom_ids
     assert "page-files" in dom_ids
     assert "file-table-body" in dom_ids
     assert "file-auth-modal" in dom_ids
@@ -114,6 +329,29 @@ def test_webui_dom_id_contract() -> None:
     assert "updates-modal" in dom_ids
     assert "provider-context-mode" in dom_ids
     assert "provider-context-source-label" in dom_ids
+    assert "text-media-create-modal" in dom_ids
+    text_media_html = (
+        REPO_ROOT / "static" / "database-types" / "text-media-v1.html"
+    ).read_text(encoding="utf-8")
+    living_html = (
+        REPO_ROOT / "static" / "database-types" / "livingmemory-v8.html"
+    ).read_text(encoding="utf-8")
+    assert "text-media-workspace-modal" not in dom_ids
+    assert 'id="text-media-import-preview"' in text_media_html
+    assert '<select id="text-media-edit-provider" required>' in text_media_html
+    assert 'id="text-media-edit-original-provider" type="hidden"' in text_media_html
+    assert 'id="text-media-visual-policy-groups"' in text_media_html
+    assert 'id="text-media-visual-policy-reset"' in text_media_html
+    assert 'id="text-media-protected-blocker-list"' in text_media_html
+    text_media_js = (REPO_ROOT / "static" / "modules" / "text-media-v1.js").read_text(
+        encoding="utf-8"
+    )
+    assert '"text_media_index_rebuild"' in text_media_js
+    assert 'reason: "library_edit_provider_switch"' in text_media_js
+    assert 'id="page-graph"' in living_html
+    assert 'id="page-memory"' in living_html
+    assert 'id="page-recall"' in living_html
+    assert 'id="page-library-overview"' in living_html
 
 
 def test_settings_panels_keep_consistent_vertical_spacing() -> None:
@@ -127,9 +365,9 @@ def test_system_overview_grid_and_toggle_ownership() -> None:
     system_js = (REPO_ROOT / "static" / "modules" / "system.js").read_text(
         encoding="utf-8"
     )
-    libraries_js = (
-        REPO_ROOT / "static" / "modules" / "libraries.js"
-    ).read_text(encoding="utf-8")
+    libraries_js = (REPO_ROOT / "static" / "modules" / "libraries.js").read_text(
+        encoding="utf-8"
+    )
 
     assert (
         ".system-grid{display:grid;grid-template-columns:"
@@ -174,12 +412,13 @@ async def test_health_and_settings_core_fields_remain_stable() -> None:
         "status",
         "product",
         "version",
-        "livingmemory_database_version",
         "time",
     }
     settings_fields = {
         "host",
         "access_base_url",
+        "public_adapter_url",
+        "recommended_adapter_url",
         "configured_port",
         "configured_webui_url",
         "actual_port",
@@ -199,6 +438,8 @@ async def test_health_and_settings_core_fields_remain_stable() -> None:
         "deployment_mode",
         "managed_settings",
         "runtime_residency",
+        "performance_profile",
+        "effective_performance",
         "version",
     }
 

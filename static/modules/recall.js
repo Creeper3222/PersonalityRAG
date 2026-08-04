@@ -1,6 +1,8 @@
-export function createRecallController({ $, state, t, toast, libraryApi, escapeHtml, selectedLibrary, selectedLibraryHasRerank, setRecallK, setRecallRerankK, updateRecallRerankControls }) {
+export function createRecallController({ $, state, t, toast, selectedDatabaseApi, escapeHtml, selectedDatabase, selectedDatabaseHasRerank, setRecallK, setRecallRerankK, updateRecallRerankControls, asyncGuard }) {
+let recallGeneration = 0;
+
 function setRecallView(view) {
-  state.recallView = view === "rerank" && selectedLibraryHasRerank() ? "rerank" : "embedding";
+  state.recallView = view === "rerank" && selectedDatabaseHasRerank() ? "rerank" : "embedding";
   updateRecallRerankControls();
   document.querySelectorAll("[data-recall-view]").forEach((button) => {
     button.classList.toggle("active", button.dataset.recallView === state.recallView);
@@ -57,6 +59,11 @@ function renderRecallResults() {
   const items = state.recallView === "rerank"
     ? state.recallCache.rerank
     : state.recallCache.embedding;
+  if (!state.recallCache.summary) {
+    $("recall-summary").innerHTML = "";
+    $("recall-results").innerHTML = "";
+    return;
+  }
   $("recall-summary").innerHTML = recallSummaryHtml(items);
   $("recall-results").innerHTML =
     items
@@ -78,52 +85,75 @@ function renderRecallResults() {
       .join("") || `<div class="panel">${escapeHtml(t("recallNoResult"))}</div>`;
 }
 
-$("run-recall").onclick = async () => {
+function resetRecallTest() {
+  recallGeneration += 1;
+  $("recall-persona").value = "";
+  $("recall-session").value = "";
+  setRecallK();
+  setRecallRerankK();
+  state.recallView = "embedding";
+  state.recallCache = {
+    embedding: [],
+    rerank: [],
+    rerankMeta: null,
+    summary: null,
+  };
+  renderRecallResults();
+}
+
+$("run-recall").onclick = async (event) => {
   const query = $("recall-query").value.trim();
   if (!query) {
     return;
   }
-  const embeddingK = setRecallK($("recall-k").value);
-  const hasRerank = selectedLibraryHasRerank();
-  const rerankK = hasRerank ? setRecallRerankK($("recall-rerank-k").value) : embeddingK;
-  const payload = {
-    query,
-    k: embeddingK,
-    persona_id: $("recall-persona").value || null,
-    session_id: $("recall-session").value || null,
-    rerank: hasRerank,
-  };
-  if (hasRerank) {
-    payload.rerank_k = rerankK;
-    payload.include_baseline = true;
-  }
-  try {
-    const data = await libraryApi("/recall", {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-    state.recallCache.summary = data;
-    state.recallCache.embedding = data.baseline_results || data.results || [];
-    state.recallCache.rerank = hasRerank ? data.results || [] : [];
-    state.recallCache.rerankMeta = data.rerank || null;
-    if (!hasRerank) {
-      state.recallView = "embedding";
-    }
-    renderRecallResults();
-    const resultItems = state.recallView === "rerank"
-      ? state.recallCache.rerank
-      : state.recallCache.embedding;
-    const meta = state.recallCache.rerankMeta || {};
-    let msg = t("recallToastSuccess", { count: resultItems.length });
+  const generation = recallGeneration;
+  await asyncGuard.run("recall:run", async () => {
+    const embeddingK = setRecallK($("recall-k").value);
+    const hasRerank = selectedDatabaseHasRerank();
+    const rerankK = hasRerank ? setRecallRerankK($("recall-rerank-k").value) : embeddingK;
+    const payload = {
+      query,
+      k: embeddingK,
+      persona_id: $("recall-persona").value || null,
+      session_id: $("recall-session").value || null,
+      rerank: hasRerank,
+    };
     if (hasRerank) {
-      msg += meta.applied ? t("recallToastRerank") : t("recallToastRerankFail");
-    } else {
-      msg += t("recallToastNoRerank");
+      payload.rerank_k = rerankK;
+      payload.include_baseline = true;
     }
-    toast(msg);
-  } catch (error) {
-    toast(error.message, true);
-  }
+    try {
+      const data = await selectedDatabaseApi("/recall", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      if (generation !== recallGeneration) return;
+      state.recallCache.summary = data;
+      state.recallCache.embedding = data.baseline_results || data.results || [];
+      state.recallCache.rerank = hasRerank ? data.results || [] : [];
+      state.recallCache.rerankMeta = data.rerank || null;
+      if (!hasRerank) {
+        state.recallView = "embedding";
+      }
+      renderRecallResults();
+      const resultItems = state.recallView === "rerank"
+        ? state.recallCache.rerank
+        : state.recallCache.embedding;
+      const meta = state.recallCache.rerankMeta || {};
+      let msg = t("recallToastSuccess", { count: resultItems.length });
+      if (hasRerank) {
+        msg += meta.applied ? t("recallToastRerank") : t("recallToastRerankFail");
+      } else {
+        msg += t("recallToastNoRerank");
+      }
+      toast(msg);
+    } catch (error) {
+      toast(error.message, true);
+    }
+  }, {
+    button: event.currentTarget,
+    busyText: t("loading"),
+  });
 };
 
 $("recall-k")?.addEventListener("input", (event) => {
@@ -134,5 +164,5 @@ $("recall-rerank-k")?.addEventListener("input", (event) => {
   setRecallRerankK(event.target.value);
 });
 
-  return { setRecallView, renderRecallResults };
+  return { setRecallView, renderRecallResults, resetRecallTest };
 }

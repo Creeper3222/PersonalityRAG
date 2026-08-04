@@ -3,6 +3,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
+from personalityrag.sqlite_pool import SQLiteConnectionPool
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEST_STATE_ROOT = REPO_ROOT / ".test-runtime"
@@ -11,3 +15,9 @@ TEST_STATE_ROOT = REPO_ROOT / ".test-runtime"
 # ignored test-only tree so a test collection can never mutate the live tree.
 os.environ["PERSONALITYRAG_STATE_ROOT"] = str(TEST_STATE_ROOT)
 os.environ.setdefault("PERSONALITYRAG_SUPPRESS_BROWSER", "1")
+
+
+@pytest.fixture(autouse=True)
+async def close_sqlite_pools_after_test():
+    yield
+    await SQLiteConnectionPool.close_open_pools()

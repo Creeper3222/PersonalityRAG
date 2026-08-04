@@ -75,7 +75,7 @@ def test_runtime_version_and_linux_asset_are_centralized() -> None:
     from personalityrag.version import VERSION
 
     assert PLATFORM_NAME == "linux-docker"
-    assert release_asset_name() == "PersonalityRAG-linux-v0.1.0.zip"
+    assert release_asset_name() == "PersonalityRAG-linux-v0.1.2.zip"
     assert "v0.1.0" not in (root / "run.py").read_text(encoding="utf-8")
     assert 'id="sidebar-version"' in (root / "static" / "index.html").read_text(encoding="utf-8")
     assert f'version = "{VERSION}"' in (root / "pyproject.toml").read_text(encoding="utf-8")

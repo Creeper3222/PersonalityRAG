@@ -4,7 +4,7 @@ from collections.abc import Awaitable, Callable
 
 import aiosqlite
 
-from ..task_types import ADAPTER_BUSY_JOB_KINDS
+from ..database_types import DatabaseRef
 
 
 Connect = Callable[[], Awaitable[aiosqlite.Connection]]
@@ -63,14 +63,16 @@ class ProviderRepository(_Repository):
             await db.close()
 
 
-class LibraryRepository(_Repository):
-    async def get_row(self, library_id: str) -> aiosqlite.Row | None:
+class MemoryStoreRepository(_Repository):
+    """Repository for the frozen ``libraries`` compatibility table."""
+
+    async def get_row(self, memory_store_id: str) -> aiosqlite.Row | None:
         db = await self.connect()
         try:
             return await (
                 await db.execute(
                     "SELECT * FROM libraries WHERE id=? AND deleted_at IS NULL",
-                    (library_id,),
+                    (memory_store_id,),
                 )
             ).fetchone()
         finally:
@@ -89,16 +91,44 @@ class LibraryRepository(_Repository):
             await db.close()
 
 
+# Deprecated import alias. New runtime code uses MemoryStoreRepository while
+# the SQL table name remains frozen for v0.1.1 compatibility.
+LibraryRepository = MemoryStoreRepository
+
+
 class AdapterRepository(_Repository):
-    async def active_rows(
+    async def active_database_rows(
         self,
-        library_ids: list[str],
+        databases: list[DatabaseRef],
         *,
         cutoff: float,
     ) -> list[aiosqlite.Row]:
-        if not library_ids:
+        if not databases:
             return []
-        placeholders = ",".join("?" for _ in library_ids)
+        clauses = " OR ".join("(database_type=? AND database_id=?)" for _ in databases)
+        params = [part for ref in databases for part in (ref.database_type, ref.id)]
+        db = await self.connect()
+        try:
+            return await (
+                await db.execute(
+                    f"""SELECT * FROM database_adapter_connections
+                    WHERE ({clauses}) AND state='active' AND last_seen>=?
+                    ORDER BY last_seen DESC,adapter_id""",
+                    (*params, cutoff),
+                )
+            ).fetchall()
+        finally:
+            await db.close()
+
+    async def active_rows(
+        self,
+        memory_store_ids: list[str],
+        *,
+        cutoff: float,
+    ) -> list[aiosqlite.Row]:
+        if not memory_store_ids:
+            return []
+        placeholders = ",".join("?" for _ in memory_store_ids)
         db = await self.connect()
         try:
             return await (
@@ -107,7 +137,7 @@ class AdapterRepository(_Repository):
                     WHERE library_id IN ({placeholders})
                     AND state='active' AND last_seen>=?
                     ORDER BY last_seen DESC,adapter_id""",
-                    (*library_ids, cutoff),
+                    (*memory_store_ids, cutoff),
                 )
             ).fetchall()
         finally:
@@ -116,22 +146,20 @@ class AdapterRepository(_Repository):
 
 class JobRepository(_Repository):
     async def active_long_rows(
-        self, library_ids: list[str]
+        self, database_resource_keys: list[str]
     ) -> list[aiosqlite.Row]:
-        if not library_ids:
+        if not database_resource_keys:
             return []
-        library_placeholders = ",".join("?" for _ in library_ids)
-        kind_placeholders = ",".join("?" for _ in ADAPTER_BUSY_JOB_KINDS)
+        resource_placeholders = ",".join("?" for _ in database_resource_keys)
         db = await self.connect()
         try:
             return await (
                 await db.execute(
                     f"""SELECT * FROM jobs
-                    WHERE library_id IN ({library_placeholders})
-                    AND kind IN ({kind_placeholders})
+                    WHERE library_id IN ({resource_placeholders})
                     AND status IN ('queued','running','pausing','paused','interrupted','stopping')
                     ORDER BY created_at""",
-                    (*library_ids, *ADAPTER_BUSY_JOB_KINDS),
+                    tuple(database_resource_keys),
                 )
             ).fetchall()
         finally:

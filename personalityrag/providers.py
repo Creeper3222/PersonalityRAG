@@ -19,6 +19,7 @@ from .context_lengths import (
 )
 from .identifiers import validate_identifier
 from .logger import logger, safe_summary
+from .http_pool import PooledAsyncClient, acquire_http_client
 
 
 PROVIDER_TEMPLATES: dict[str, dict[str, Any]] = {
@@ -388,20 +389,21 @@ class HTTPEmbeddingProvider(EmbeddingProvider):
             return False
         return value.is_private or value.is_loopback
 
-    def _http_client(self, *, base_url: str) -> httpx.AsyncClient:
-        kwargs: dict[str, Any] = {
-            "base_url": base_url,
-            "timeout": self.config.timeout_seconds,
-            "trust_env": not self._is_local_or_private(base_url),
-        }
+    def _http_client(self, *, base_url: str) -> PooledAsyncClient:
+        trust_env = not self._is_local_or_private(base_url)
         if self.config.proxy:
-            kwargs["proxy"] = self.config.proxy
-            kwargs["trust_env"] = False
-        if self.config.api_key:
-            kwargs["headers"] = {
-                "Authorization": f"Bearer {self.config.api_key}"
-            }
-        return httpx.AsyncClient(**kwargs)
+            trust_env = False
+        return acquire_http_client(
+            base_url=base_url,
+            timeout=self.config.timeout_seconds,
+            proxy=self.config.proxy or None,
+            trust_env=trust_env,
+            headers=(
+                {"Authorization": f"Bearer {self.config.api_key}"}
+                if self.config.api_key
+                else None
+            ),
+        )
 
     def _model_matches(self, item: dict[str, Any]) -> bool:
         configured = self.config.model.strip().casefold()
@@ -625,17 +627,21 @@ class GeminiEmbeddingProvider(HTTPEmbeddingProvider):
             api_base += "/v1beta"
         self.api_base = api_base
         self.model = config.model.strip().removeprefix("models/")
-        kwargs: dict[str, Any] = {
-            "base_url": api_base,
-            "timeout": config.timeout_seconds,
-            "trust_env": not self._is_local_or_private(api_base),
-        }
-        if config.proxy:
-            kwargs["proxy"] = config.proxy
-            kwargs["trust_env"] = False
-        if config.api_key:
-            kwargs["headers"] = {"x-goog-api-key": config.api_key}
-        self._client = httpx.AsyncClient(**kwargs)
+        self._client = acquire_http_client(
+            base_url=api_base,
+            timeout=config.timeout_seconds,
+            proxy=config.proxy or None,
+            trust_env=(
+                not self._is_local_or_private(api_base)
+                if not config.proxy
+                else False
+            ),
+            headers=(
+                {"x-goog-api-key": config.api_key}
+                if config.api_key
+                else None
+            ),
+        )
         self._resolved_model = self.model
 
     async def list_models(self) -> list[dict[str, Any]]:
@@ -899,18 +905,21 @@ class HTTPRerankProvider(RerankProvider):
         self.config = config
         self._resolved_model: str | None = None
 
-    def _http_client(self, *, base_url: str) -> httpx.AsyncClient:
-        kwargs: dict[str, Any] = {
-            "base_url": base_url,
-            "timeout": self.config.timeout_seconds,
-            "trust_env": not HTTPEmbeddingProvider._is_local_or_private(base_url),
-        }
+    def _http_client(self, *, base_url: str) -> PooledAsyncClient:
+        trust_env = not HTTPEmbeddingProvider._is_local_or_private(base_url)
         if self.config.proxy:
-            kwargs["proxy"] = self.config.proxy
-            kwargs["trust_env"] = False
-        if self.config.api_key:
-            kwargs["headers"] = {"Authorization": f"Bearer {self.config.api_key}"}
-        return httpx.AsyncClient(**kwargs)
+            trust_env = False
+        return acquire_http_client(
+            base_url=base_url,
+            timeout=self.config.timeout_seconds,
+            proxy=self.config.proxy or None,
+            trust_env=trust_env,
+            headers=(
+                {"Authorization": f"Bearer {self.config.api_key}"}
+                if self.config.api_key
+                else None
+            ),
+        )
 
     async def _retry(self, operation):
         last_error: Exception | None = None

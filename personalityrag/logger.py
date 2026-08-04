@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import logging
+import queue
 import re
 import threading
 from collections import deque
 from datetime import datetime
-from logging.handlers import RotatingFileHandler
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +19,13 @@ logger = logging.getLogger(LOGGER_NAME)
 
 _SECRET_PATTERNS = (
     re.compile(r"(prag_[A-Za-z0-9_\-]{12,})"),
+    re.compile(r"(?i)\b(?:psk|pkb)-[A-Za-z0-9_-]{16,}\b"),
     re.compile(r"(?i)(api[_-]?key|authorization|bearer|token|cookie)(\s*[=:]\s*)([^,\s}]+)"),
+    re.compile(r"(?i)data:image/[^;\s]+;base64,[A-Za-z0-9+/=]+"),
+    re.compile(
+        r"(?i)https?://[^\s]+/api/v1/knowledge-libraries/[^\s?]+/"
+        r"assets/[^\s?]+/(?:content|thumbnail)(?:\?[^\s]*)?"
+    ),
 )
 
 
@@ -37,6 +45,15 @@ def safe_summary(value: Any, *, max_chars: int = 120) -> str:
     text = " ".join(str(value or "").split())
     text = sanitize_log_message(text, max_chars=max_chars)
     return text
+
+
+class RedactingFilter(logging.Filter):
+    """Sanitize every record before it reaches WebUI, file, or console sinks."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = sanitize_log_message(record.getMessage())
+        record.args = ()
+        return True
 
 
 class WebLogBuffer:
@@ -159,7 +176,7 @@ class WebLogBuffer:
 
 class WebLogHandler(logging.Handler):
     def __init__(self, buffer: WebLogBuffer):
-        super().__init__(level=logging.DEBUG)
+        super().__init__()
         self.buffer = buffer
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -170,10 +187,59 @@ class WebLogHandler(logging.Handler):
 
 
 _buffer = WebLogBuffer()
+_log_queue: queue.Queue[logging.LogRecord] | None = None
+_queue_listener: QueueListener | None = None
+_persistent_handlers: tuple[logging.Handler, ...] = ()
+
+
+class BoundedQueueHandler(QueueHandler):
+    def __init__(
+        self,
+        record_queue: queue.Queue[logging.LogRecord],
+        fallback_handlers: tuple[logging.Handler, ...],
+    ):
+        super().__init__(record_queue)
+        self.fallback_handlers = fallback_handlers
+
+    def enqueue(self, record: logging.LogRecord) -> None:
+        try:
+            self.queue.put_nowait(record)
+        except queue.Full:
+            if record.levelno >= logging.WARNING:
+                for handler in self.fallback_handlers:
+                    if record.levelno >= handler.level:
+                        handler.handle(record)
 
 
 def get_log_buffer() -> WebLogBuffer:
     return _buffer
+
+
+def flush_logging() -> None:
+    record_queue = _log_queue
+    if record_queue is not None:
+        record_queue.join()
+    for handler in _persistent_handlers:
+        try:
+            handler.flush()
+        except (OSError, ValueError):
+            pass
+
+
+def shutdown_logging() -> None:
+    global _log_queue, _queue_listener, _persistent_handlers
+    listener = _queue_listener
+    if listener is not None:
+        flush_logging()
+        listener.stop()
+    for handler in _persistent_handlers:
+        try:
+            handler.close()
+        except Exception:
+            pass
+    _log_queue = None
+    _queue_listener = None
+    _persistent_handlers = ()
 
 
 def configure_logging(
@@ -185,10 +251,13 @@ def configure_logging(
     web_max_entries: int = 2000,
     web_max_bytes: int = 4 * 1024 * 1024,
     web_max_entry_bytes: int = 32 * 1024,
+    file_enabled: bool = True,
 ) -> None:
-    global _buffer
+    global _buffer, _log_queue, _queue_listener, _persistent_handlers
+    shutdown_logging()
     level = getattr(logging, str(level_name or "INFO").upper(), logging.INFO)
-    log_file.parent.mkdir(parents=True, exist_ok=True)
+    if file_enabled:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
     _buffer = WebLogBuffer(
         max_entries=web_max_entries,
         max_bytes=web_max_bytes,
@@ -201,9 +270,10 @@ def configure_logging(
     )
 
     app_logger = logging.getLogger(LOGGER_NAME)
-    # Keep DEBUG records available to the WebUI buffer while file and console
-    # handlers continue to honor the configured persistent logging level.
-    app_logger.setLevel(logging.DEBUG)
+    # Avoid constructing and redacting records that every configured sink
+    # would discard. DEBUG remains available when the configured level is
+    # explicitly DEBUG.
+    app_logger.setLevel(level)
     app_logger.propagate = False
     for handler in list(app_logger.handlers):
         app_logger.removeHandler(handler)
@@ -212,22 +282,45 @@ def configure_logging(
         except Exception:
             pass
 
-    file_handler = RotatingFileHandler(
-        log_file,
-        maxBytes=max(1, int(file_max_bytes)),
-        backupCount=max(0, int(file_backup_count)),
-        encoding="utf-8",
-    )
-    file_handler.setLevel(level)
-    file_handler.setFormatter(formatter)
-
     web_handler = WebLogHandler(_buffer)
-    web_handler.setLevel(logging.DEBUG)
+    web_handler.setLevel(level)
 
     stream_handler = logging.StreamHandler()
     stream_handler.setLevel(level)
     stream_handler.setFormatter(formatter)
 
-    app_logger.addHandler(file_handler)
+    record_queue: queue.Queue[logging.LogRecord] = queue.Queue(maxsize=8192)
+    persistent_handlers_list: list[logging.Handler] = []
+    if file_enabled:
+        file_handler = RotatingFileHandler(
+            log_file,
+            maxBytes=max(1, int(file_max_bytes)),
+            backupCount=max(0, int(file_backup_count)),
+            encoding="utf-8",
+        )
+        file_handler.setLevel(level)
+        file_handler.setFormatter(formatter)
+        persistent_handlers_list.append(file_handler)
+    persistent_handlers_list.append(stream_handler)
+    persistent_handlers = tuple(persistent_handlers_list)
+    queue_handler = BoundedQueueHandler(record_queue, persistent_handlers)
+    queue_handler.setLevel(level)
+    redacting_filter = RedactingFilter()
+    queue_handler.addFilter(redacting_filter)
+    web_handler.addFilter(redacting_filter)
+    listener = QueueListener(
+        record_queue,
+        *persistent_handlers,
+        respect_handler_level=True,
+    )
+    listener.start()
+
+    _log_queue = record_queue
+    _queue_listener = listener
+    _persistent_handlers = persistent_handlers
+
+    app_logger.addHandler(queue_handler)
     app_logger.addHandler(web_handler)
-    app_logger.addHandler(stream_handler)
+
+
+atexit.register(shutdown_logging)

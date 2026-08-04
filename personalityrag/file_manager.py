@@ -84,13 +84,20 @@ HIDDEN_EXACT_NAMES = {
     "node_modules",
 }
 HIDDEN_PREFIXES = (".venv",)
-SOURCE_READONLY_ROOTS = ("personalityrag", "static", "assets", "docker", "tools")
+SOURCE_READONLY_ROOTS = (
+    "personalityrag",
+    "static",
+    "assets",
+    "docker",
+    "tools",
+)
 SOURCE_READONLY_FILES = {
     ".dockerignore",
     ".env.example",
     "Dockerfile",
     "docker-compose.local.yml",
     "docker-compose.yml",
+    "launcher.bat",
     "pyproject.toml",
     "run.py",
 }
@@ -602,11 +609,19 @@ class FileManager:
 
     @staticmethod
     async def _write_upload(upload: UploadFile, destination: Path) -> None:
+        await run_blocking(
+            FileManager._write_upload_sync,
+            upload.file,
+            destination,
+        )
+
+    @staticmethod
+    def _write_upload_sync(source: Any, destination: Path) -> None:
         written = 0
         try:
             with destination.open("wb") as handle:
                 while True:
-                    chunk = await upload.read(FILE_UPLOAD_CHUNK_BYTES)
+                    chunk = source.read(FILE_UPLOAD_CHUNK_BYTES)
                     if not chunk:
                         break
                     written += len(chunk)

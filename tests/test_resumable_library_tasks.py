@@ -10,6 +10,11 @@ import numpy as np
 import pytest
 
 from personalityrag.config import AppConfig, IndexRebuildSettings, ProviderConfig
+from personalityrag.database_types import (
+    DatabaseRef,
+    LIVINGMEMORY_V8_TYPE,
+    database_type_registry,
+)
 from personalityrag.graph import GraphBuilder
 from personalityrag.indexes import DEFAULT_DOCUMENT_EMBED_CHARS
 from personalityrag.libraries import LibraryManager
@@ -104,6 +109,12 @@ def _database_signature(path: Path) -> str:
                 row[1]
                 for row in connection.execute(f'PRAGMA table_info("{table}")').fetchall()
             ]
+            if table.startswith("graph_"):
+                columns = [
+                    value
+                    for value in columns
+                    if value not in {"created_at", "updated_at"}
+                ]
             if not columns:
                 continue
             order = ",".join(f'"{value}"' for value in columns)
@@ -163,7 +174,10 @@ async def test_import_pause_resume_matches_uninterrupted_and_stop_restores_empty
     config = ProviderConfig(dimensions=8, index_rebuild_settings=rebuild)
     provider = ControlledProvider(config)
     monkeypatch.setattr("personalityrag.service.build_provider", lambda _config: provider)
-    monkeypatch.setattr("personalityrag.libraries.build_provider", lambda _config: provider)
+    monkeypatch.setattr(
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider",
+        lambda _config: provider,
+    )
     manager = LibraryManager(tmp_path / "PersonalityRAG", AppConfig(provider=config))
     await manager.initialize()
     try:
@@ -201,7 +215,11 @@ async def test_import_pause_resume_matches_uninterrupted_and_stop_restores_empty
         assert paused_job["checkpoint"]["completed_documents"] == 1
         assert paused_job["capabilities"]["resume"] is True
         workspace = (
-            manager.data_dir / "libraries" / "paused" / "task_checkpoints" / paused_id
+            database_type_registry.data_dir(
+                manager.data_dir, DatabaseRef(LIVINGMEMORY_V8_TYPE, "paused")
+            )
+            / "task_checkpoints"
+            / paused_id
         )
         assert len(list((workspace / "index" / "segments").glob("*.npz"))) == 1
 

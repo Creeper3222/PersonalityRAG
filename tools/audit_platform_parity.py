@@ -10,16 +10,28 @@ DEFAULT_ALLOWED = {
     ".gitattributes",
     ".gitignore",
     "Dockerfile",
+    "DELIVERY.md",
+    "IMPLEMENTATION_AUDIT.md",
     "README.md",
     "docker-compose.local.yml",
     "docker-compose.yml",
     "docker/entrypoint.sh",
+    "docs/REMOTE_ADAPTER_DEPLOYMENT.md",
+    "docs/examples/Caddyfile",
+    "docs/examples/nginx.personalityrag.conf",
+    "docs/operations/compatibility-inventory.md",
+    "docs/operations/livingmemory-2.5-alignment.md",
+    "docs/operations/livingmemory-2.5.3-alignment.md",
+    "docs/operations/performance-baseline-v0.1.1.md",
     "launcher.bat",
+    "personalityrag/application_context.py",
     "personalityrag/backup_migration.py",
     "personalityrag/config.py",
+    "personalityrag/compat.py",
     "personalityrag/docker_engine.py",
     "personalityrag/docker_update_helper.py",
     "personalityrag/file_manager.py",
+    "personalityrag/logger.py",
     "personalityrag/routes/updates.py",
     "personalityrag/update_manifest.py",
     "personalityrag/updates.py",
@@ -54,8 +66,17 @@ IGNORED_PARTS = {
     ".test-runtime",
     ".venv",
     "__pycache__",
+    "config",
     "data",
+    "reports",
+    "test-results",
 }
+
+IGNORED_ROOT_PREFIXES = (
+    ".codex-",
+    ".venv",
+    "lm_recall_compare_",
+)
 
 
 def source_files(root: Path) -> dict[str, Path]:
@@ -64,7 +85,10 @@ def source_files(root: Path) -> dict[str, Path]:
         if not path.is_file():
             continue
         relative = path.relative_to(root)
-        if any(part in IGNORED_PARTS for part in relative.parts):
+        if (
+            any(part in IGNORED_PARTS for part in relative.parts)
+            or relative.parts[0].startswith(IGNORED_ROOT_PREFIXES)
+        ):
             continue
         result[relative.as_posix()] = path
     return result

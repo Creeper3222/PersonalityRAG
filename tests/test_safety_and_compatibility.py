@@ -158,7 +158,14 @@ def test_core_atom_classifier_matches_livingmemory_types():
         "episodic",
         "unknown",
     ]
-    assert [atom["confidence"] for atom in atoms] == [0.85, 0.82, 0.80, 0.78, 0.75, 0.60]
+    assert [atom["confidence"] for atom in atoms] == [
+        0.85,
+        0.82,
+        0.80,
+        0.78,
+        0.75,
+        0.60,
+    ]
     assert atoms[0]["event_time"] is not None
     assert all(atom["entities"] == ["会议", "张三"] for atom in atoms)
     assert all(atom["session_id"] == "s1" for atom in atoms)
@@ -201,7 +208,10 @@ def test_service_respects_atom_disabled_for_generated_atoms(tmp_path: Path):
 
 def test_dynamic_route_weights_follow_query_intent():
     engine = RetrievalEngine(
-        None, None, TextProcessor(), RecallConfig()  # type: ignore[arg-type]
+        None,
+        None,
+        TextProcessor(),
+        RecallConfig(),  # type: ignore[arg-type]
     )
     relation_document, relation_graph, relation_intent = engine._route_weights(
         "谁和澄月是朋友"
@@ -217,7 +227,10 @@ def test_dynamic_route_weights_follow_query_intent():
 
 def test_mmr_prefers_diversity_after_highest_score():
     engine = RetrievalEngine(
-        None, None, TextProcessor(), RecallConfig(mmr_lambda=0.7)  # type: ignore[arg-type]
+        None,
+        None,
+        TextProcessor(),
+        RecallConfig(mmr_lambda=0.7),  # type: ignore[arg-type]
     )
     selected = engine._mmr(
         [
@@ -304,7 +317,11 @@ async def test_merge_routes_backfills_memory_for_graph_only_hits():
 
     assert [item.doc_id for item in results] == [7]
     assert results[0].content == "canonical memory text"
-    assert results[0].metadata == {"importance": 0.9, "source": "memory"}
+    assert results[0].metadata == {
+        "importance": 0.9,
+        "source": "memory",
+        "has_source": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -377,7 +394,7 @@ async def test_service_repairs_incomplete_fts_during_index_rebuild():
 
 
 @pytest.mark.asyncio
-async def test_importance_weight_scales_document_route_importance():
+async def test_document_route_matches_livingmemory_250_weighting():
     class FakeStorage:
         async def get_document(self, doc_id: int):
             importance = 0.9 if doc_id == 2 else 0.2
@@ -410,13 +427,20 @@ async def test_importance_weight_scales_document_route_importance():
     results = await engine._document_route("memory", 2, None, None)
 
     assert [item.doc_id for item in results] == [2, 1]
-    assert results[0].final_score == pytest.approx(1.8)
-    assert results[0].score_breakdown["importance_weight"] == 2
+    assert results[0].final_score == pytest.approx(0.9)
+    assert results[0].score_breakdown == {
+        "rrf_normalized": pytest.approx(0.9839),
+        "importance": 0.9,
+        "recency_weight": 1.0,
+        "days_old": 0.0,
+        "final_score": 0.9,
+    }
 
 
 def _rerank_service(
     *,
     graph_enabled: bool = True,
+    atom_enabled: bool = False,
     rows: list[RerankResult] | None = None,
 ) -> PersonalityRAGService:
     service = PersonalityRAGService.__new__(PersonalityRAGService)
@@ -428,7 +452,8 @@ def _rerank_service(
             graph_route_weight=0.65,
             cross_route_bonus=0.08,
             dynamic_route_weighting=False,
-        )
+        ),
+        maintenance=MaintenanceConfig(atom_enabled=atom_enabled),
     )
     service.reranker = FakeReranker(rows or [])
     service.rerank_provider_revision = SimpleNamespace(
@@ -444,7 +469,7 @@ def _rerank_service(
 
 
 @pytest.mark.asyncio
-async def test_graph_disabled_rerank_keeps_plain_rerank_behavior():
+async def test_disabled_structured_evidence_keeps_plain_rerank_behavior():
     service = _rerank_service(
         graph_enabled=False,
         rows=[RerankResult(2, 0.9), RerankResult(1, 0.8)],
@@ -464,7 +489,7 @@ async def test_graph_disabled_rerank_keeps_plain_rerank_behavior():
 
 
 @pytest.mark.asyncio
-async def test_graph_enhanced_rerank_promotes_candidate_with_graph_signal():
+async def test_structured_rerank_promotes_candidate_with_graph_signal():
     service = _rerank_service(
         rows=[
             RerankResult(0, 1.0),
@@ -478,7 +503,7 @@ async def test_graph_enhanced_rerank_promotes_candidate_with_graph_signal():
         _result(3, 0.1, "other text"),
     ]
 
-    async def fake_graph_signals(_query, _candidates):
+    async def fake_evidence_signals(_query, _candidates):
         return {
             2: {
                 "graph_score": 1.0,
@@ -493,16 +518,28 @@ async def test_graph_enhanced_rerank_promotes_candidate_with_graph_signal():
                         "relation_type": "fact",
                     }
                 ],
+                "graph_entries": [
+                    {
+                        "content": "candidate graph evidence",
+                        "entry_type": "fact",
+                        "relation_type": "fact",
+                    }
+                ],
+                "atom_entries": [],
+                "topics": [],
+                "participants": [],
+                "persona_summary": "",
             }
         }
 
-    service._rerank_graph_signals = fake_graph_signals  # type: ignore[method-assign]
+    service._rerank_evidence_signals = fake_evidence_signals  # type: ignore[method-assign]
 
     results, meta = await service.apply_rerank("relationship query", candidates, 2)
 
     assert [item.doc_id for item in results] == [2, 1]
     assert service.reranker.calls[0]["top_n"] == len(candidates)
-    assert "[Graph evidence for rerank]" in service.reranker.calls[0]["documents"][1]
+    assert "[Graph relations]" in service.reranker.calls[0]["documents"][1]
+    assert meta["evidence_enhanced"] is True
     assert meta["graph_enhanced"] is True
     assert meta["graph_candidate_count"] == 1
     assert results[0].score_breakdown["rerank_graph_score"] == 1.0
@@ -538,15 +575,12 @@ async def test_rerank_graph_helper_is_scoped_to_embedding_candidates():
     storage = FakeStorage()
     service.storage = storage
 
-    async def fake_vector_scores(_query, _raw):
-        return {2: 0.5, 99: 1.0}
-
-    service._rerank_graph_vector_scores = fake_vector_scores  # type: ignore[method-assign]
     candidates = [
         _result(1, 0.3, "one"),
         _result(2, 0.2, "two"),
         _result(3, 0.1, "three"),
     ]
+    candidates[1].score_breakdown["graph_vector_score"] = 0.5
 
     results, meta = await service.apply_rerank("query", candidates, 3)
 
@@ -557,7 +591,7 @@ async def test_rerank_graph_helper_is_scoped_to_embedding_candidates():
 
 
 @pytest.mark.asyncio
-async def test_rerank_graph_vector_failure_falls_back_to_plain_rerank():
+async def test_rerank_reuses_memory_graph_vector_without_embedding_call():
     class FakeStorage:
         async def candidate_graph_evidence(self, *_args, **_kwargs):
             return {
@@ -569,13 +603,106 @@ async def test_rerank_graph_vector_failure_falls_back_to_plain_rerank():
                 }
             }
 
-    service = _rerank_service(rows=[RerankResult(1, 0.9), RerankResult(0, 0.8)])
+    class EmbeddingMustNotRun:
+        async def get_embeddings(self, _texts):
+            raise AssertionError("rerank must reuse the recall graph-vector signal")
+
+    service = _rerank_service(rows=[RerankResult(0, 0.9), RerankResult(1, 0.8)])
     service.storage = FakeStorage()
+    service.provider = EmbeddingMustNotRun()
+    candidates = [_result(1, 0.2, "one"), _result(2, 0.1, "two")]
+    candidates[0].score_breakdown["graph_vector_score"] = 0.82
 
-    async def failing_vector_scores(_query, _raw):
-        raise RuntimeError("vector unavailable")
+    results, meta = await service.apply_rerank("query", candidates, 2)
 
-    service._rerank_graph_vector_scores = failing_vector_scores  # type: ignore[method-assign]
+    assert {item.doc_id for item in results} == {1, 2}
+    assert meta["graph_candidate_count"] == 1
+    first = next(item for item in results if item.doc_id == 1)
+    assert first.score_breakdown["rerank_graph_vector_score"] == 0.82
+    assert first.score_breakdown["rerank_graph_vector_source"] == "recall_memory_index"
+
+
+@pytest.mark.asyncio
+async def test_atom_and_identity_evidence_enriches_only_existing_candidates():
+    class FakeStorage:
+        def __init__(self):
+            self.candidate_ids: list[int] | None = None
+
+        async def candidate_atom_evidence(self, candidate_ids, *_args, **_kwargs):
+            self.candidate_ids = list(candidate_ids)
+            return {
+                2: {
+                    "keyword_score": 1.0,
+                    "entity_score": 0.8,
+                    "quality_score": 0.9,
+                    "entries": [
+                        {
+                            "content": "Alice prefers the blue shield",
+                            "atom_type": "preference",
+                            "importance": 0.9,
+                            "confidence": 0.9,
+                            "match_score": 1.0,
+                        }
+                    ],
+                },
+                99: {
+                    "keyword_score": 1.0,
+                    "entity_score": 1.0,
+                    "quality_score": 1.0,
+                    "entries": [{"content": "outside candidate"}],
+                },
+            }
+
+    service = _rerank_service(
+        graph_enabled=False,
+        atom_enabled=True,
+        rows=[RerankResult(1, 0.9), RerankResult(0, 0.8)],
+    )
+    storage = FakeStorage()
+    service.storage = storage
+    candidates = [_result(1, 0.3, "first"), _result(2, 0.2, "second")]
+    candidates[1].metadata = {
+        "persona_summary": "I remember Alice choosing the blue shield.",
+        "topics": ["shield preference"],
+        "participants": ["Alice"],
+        "participant_identities": [
+            {
+                "platform": "test",
+                "sender_id": "12345",
+                "identity_key": "test:12345",
+                "display_name": "Alice",
+                "aliases": ["Alicia"],
+                "is_bot": False,
+            }
+        ],
+        "source_messages": ["DO_NOT_SEND_RAW_SOURCE"],
+    }
+
+    results, meta = await service.apply_rerank("Alice shield", candidates, 2)
+
+    assert storage.candidate_ids == [1, 2]
+    assert {item.doc_id for item in results} == {1, 2}
+    document = service.reranker.calls[0]["documents"][1]
+    assert "[Persona perspective]" in document
+    assert "[Active atomic facts]" in document
+    assert "[Stable participants]" in document
+    assert "test:12345" not in document
+    assert "12345" not in document
+    assert "DO_NOT_SEND_RAW_SOURCE" not in document
+    assert meta["atom_candidate_count"] == 1
+    atom_result = next(item for item in results if item.doc_id == 2)
+    assert atom_result.score_breakdown["rerank_atom_score"] > 0
+    assert atom_result.score_breakdown["rerank_atom_types"] == ["preference"]
+
+
+@pytest.mark.asyncio
+async def test_rerank_evidence_failure_falls_back_to_plain_rerank():
+    service = _rerank_service(rows=[RerankResult(1, 0.9), RerankResult(0, 0.8)])
+
+    async def failing_evidence(_query, _candidates):
+        raise RuntimeError("evidence unavailable")
+
+    service._rerank_evidence_signals = failing_evidence  # type: ignore[method-assign]
     candidates = [_result(1, 0.2, "one"), _result(2, 0.1, "two")]
 
     results, meta = await service.apply_rerank("query", candidates, 1)
@@ -583,6 +710,58 @@ async def test_rerank_graph_vector_failure_falls_back_to_plain_rerank():
     assert [item.doc_id for item in results] == [2]
     assert service.reranker.calls[0]["top_n"] == 1
     assert meta["graph_enhanced"] is False
+
+
+@pytest.mark.asyncio
+async def test_candidate_atom_evidence_is_active_unexpired_and_candidate_scoped(
+    tmp_path: Path,
+):
+    storage = Storage(tmp_path)
+    await storage.initialize()
+
+    async def create(
+        content: str, status: str = "active", expires_at: float | None = None
+    ):
+        memory_id = await storage.create_memory(
+            {
+                "content": content,
+                "atoms": [
+                    {
+                        "atom_type": "factual",
+                        "content": f"alpha fact for {content}",
+                        "importance": 0.8,
+                        "confidence": 0.9,
+                    }
+                ],
+            },
+            TextProcessor().tokenize,
+            GraphBuilder().build,
+        )
+        if status != "active" or expires_at is not None:
+            async with storage.connect() as db:
+                await db.execute(
+                    "UPDATE memory_atoms SET status=?,expires_at=COALESCE(?,expires_at) "
+                    "WHERE parent_memory_id=?",
+                    (status, expires_at, memory_id),
+                )
+                await db.commit()
+        return memory_id
+
+    active_id = await create("active")
+    forgotten_id = await create("forgotten", status="forgotten")
+    expired_id = await create("expired", expires_at=0.0)
+    outside_id = await create("outside")
+
+    evidence = await storage.candidate_atom_evidence(
+        [active_id, forgotten_id, expired_id],
+        ["alpha"],
+        now=1.0,
+    )
+
+    assert set(evidence) == {active_id}
+    assert outside_id not in evidence
+    assert evidence[active_id]["entries"][0]["atom_type"] == "factual"
+    assert evidence[active_id]["keyword_score"] > 0
 
 
 def test_provider_bypasses_environment_proxy_for_local_and_private_urls():
@@ -667,17 +846,13 @@ async def test_failed_rebuild_keeps_previous_generation_active(tmp_path: Path):
         TextProcessor().tokenize,
         GraphBuilder().build,
     )
-    healthy = IndexManager(
-        tmp_path, storage, DeterministicProvider(), "deterministic"
-    )
+    healthy = IndexManager(tmp_path, storage, DeterministicProvider(), "deterministic")
     await healthy.initialize()
     first = await healthy.rebuild()
     current_before = (tmp_path / "indexes" / "CURRENT").read_text().strip()
     assert current_before == first["generation"]
 
-    failing = IndexManager(
-        tmp_path, storage, FailingProvider(), "intentional-failure"
-    )
+    failing = IndexManager(tmp_path, storage, FailingProvider(), "intentional-failure")
     await failing.initialize()
     with pytest.raises(RuntimeError, match="intentional rebuild failure"):
         await failing.rebuild()

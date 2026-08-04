@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .config import normalize_access_base_url
+from .config import normalize_access_base_url, normalize_public_adapter_url
 from .identifiers import validate_identifier
+from .resource_limits import normalize_performance_profile
 
 
 def _validate_required_id(value: str, *, field: str) -> str:
@@ -31,12 +32,21 @@ class LoginRequest(BaseModel):
 
 class SettingsUpdate(BaseModel):
     access_base_url: str | None = Field(default=None, max_length=255)
+    public_adapter_url: str | None = Field(default=None, max_length=512)
     port: int | None = Field(default=None, ge=1, le=65535)
     access_port: int | None = Field(default=None, ge=1, le=65535)
     new_password: str | None = None
     clear_password: bool = False
     runtime_idle_minutes: int | None = Field(default=None, ge=1)
     max_non_default_runtimes: int | None = Field(default=None, ge=1)
+    performance_profile: str | None = None
+
+    @field_validator("performance_profile")
+    @classmethod
+    def clean_performance_profile(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return normalize_performance_profile(value)
 
     @field_validator("access_base_url")
     @classmethod
@@ -48,6 +58,18 @@ class SettingsUpdate(BaseModel):
         except ValueError as exc:
             raise ValueError(
                 "服务接入端点 URL 需为不带端口、路径、查询参数或尾斜杠的 http(s) 基址"
+            ) from exc
+
+    @field_validator("public_adapter_url")
+    @classmethod
+    def clean_public_adapter_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            return normalize_public_adapter_url(value)
+        except ValueError as exc:
+            raise ValueError(
+                "公网适配器 URL 必须是不带路径、凭据、查询参数或片段的 HTTPS 地址"
             ) from exc
 
 
@@ -75,6 +97,51 @@ class AtomInput(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ParticipantIdentity(BaseModel):
+    identity_key: str | None = Field(default=None, max_length=512)
+    sender_id: str = Field(min_length=1, max_length=256)
+    platform: str = Field(default="unknown", min_length=1, max_length=128)
+    display_name: str = Field(min_length=1, max_length=256)
+    aliases: list[str] = Field(default_factory=list, max_length=32)
+    is_bot: bool = False
+
+    @field_validator("sender_id", "platform", "display_name")
+    @classmethod
+    def normalize_required_text(cls, value: str) -> str:
+        normalized = str(value or "").strip()
+        if not normalized:
+            raise ValueError("participant identity fields cannot be empty")
+        return normalized
+
+    @field_validator("aliases")
+    @classmethod
+    def normalize_aliases(cls, values: list[str]) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for raw in values:
+            value = str(raw or "").strip()
+            key = value.casefold()
+            if not value or len(value) > 256 or key in seen:
+                continue
+            seen.add(key)
+            result.append(value)
+        return result
+
+    @model_validator(mode="after")
+    def normalize_identity_key(self):
+        self.platform = self.platform.lower()
+        expected = f"{self.platform}:{self.sender_id}"
+        supplied = str(self.identity_key or "").strip()
+        if supplied and supplied.casefold() != expected.casefold():
+            raise ValueError("participant identity_key does not match platform/sender_id")
+        self.identity_key = expected
+        if self.display_name.casefold() not in {
+            alias.casefold() for alias in self.aliases
+        }:
+            self.aliases.append(self.display_name)
+        return self
+
+
 class MemoryCreate(BaseModel):
     content: str
     canonical_summary: str | None = None
@@ -83,11 +150,19 @@ class MemoryCreate(BaseModel):
     session_id: str | None = None
     importance: float = Field(default=0.5, ge=0, le=1)
     status: str = "active"
-    memory_type: str = "GENERAL"
     topics: list[str] = Field(default_factory=list)
     participants: list[str] = Field(default_factory=list)
+    participant_identities: list[ParticipantIdentity] = Field(
+        default_factory=list,
+        max_length=64,
+    )
     key_facts: list[str] = Field(default_factory=list)
     atoms: list[AtomInput] = Field(default_factory=list)
+    source_messages: list[dict[str, Any]] = Field(default_factory=list)
+    source_time_strategy: str = Field(
+        default="preserve", pattern="^(preserve|derive|none)$"
+    )
+    source_time_tags: dict[str, Any] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -99,7 +174,6 @@ class MemoryUpdate(BaseModel):
         pattern="^(auto|display|0-10|ten|stored|normalized|0-1)$",
     )
     status: str | None = None
-    memory_type: str | None = None
     session_id: str | None = None
     persona_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -107,6 +181,40 @@ class MemoryUpdate(BaseModel):
 
 class MemoryPersonaUpdate(BaseModel):
     persona_id: str = ""
+
+
+class MemorySourceUpdate(BaseModel):
+    source_messages: list[dict[str, Any]] = Field(min_length=1)
+
+
+class MemoryResummaryCommit(BaseModel):
+    content: str | None = Field(default=None, min_length=1)
+    canonical_summary: str = Field(min_length=1)
+    persona_summary: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    expected_content_sha256: str | None = Field(
+        default=None, pattern="^[0-9a-fA-F]{64}$"
+    )
+
+
+class MemoryTransferSummary(BaseModel):
+    preview_item_id: str = Field(min_length=1, max_length=128)
+    content: str | None = Field(default=None, min_length=1)
+    canonical_summary: str = Field(min_length=1)
+    persona_summary: str | None = None
+    importance: float | None = Field(default=None, ge=0, le=1)
+    topics: list[str] = Field(default_factory=list)
+    participants: list[str] = Field(default_factory=list)
+    participant_identities: list[ParticipantIdentity] = Field(
+        default_factory=list,
+        max_length=64,
+    )
+    key_facts: list[str] = Field(default_factory=list)
+
+
+class MemoryTransferCommit(BaseModel):
+    duplicate_mode: str = Field(default="skip", pattern="^(skip|allow)$")
+    summaries: list[MemoryTransferSummary] = Field(default_factory=list)
 
 
 class RecallRequest(BaseModel):
@@ -169,6 +277,9 @@ class GraphQuery(BaseModel):
     session_id: str | None = None
     persona_id: str | None = None
     limit_memories: int = Field(default=10, ge=1, le=24)
+    limit_entries: int = Field(default=40, ge=12, le=80)
+    limit_nodes: int = Field(default=56, ge=12, le=80)
+    limit_edges: int = Field(default=96, ge=12, le=120)
 
 
 class RebuildRequest(BaseModel):
@@ -259,6 +370,8 @@ class ProviderCopy(BaseModel):
 
 class DebugProviderRevisionPatch(BaseModel):
     patch: dict[str, Any] = Field(default_factory=dict)
+    password: str = Field(default="", max_length=512)
+    risk_confirmed: bool = False
 
 
 class DebugProviderRevisionReset(BaseModel):
@@ -266,10 +379,31 @@ class DebugProviderRevisionReset(BaseModel):
     bind_libraries_to_latest: bool = False
     library_revisions: dict[str, int] = Field(default_factory=dict)
     delete_revisions_after_latest: bool = False
+    force_non_equivalent: bool = False
+    password: str = Field(default="", max_length=512)
+    risk_confirmed: bool = False
+
+
+class DebugSessionUnlock(BaseModel):
+    password: str = Field(min_length=1, max_length=512)
+
+
+class DebugDatabaseBindingPatch(BaseModel):
+    provider_id: str
+    revision: int = Field(ge=1)
+    assert_functional_compatibility: bool = False
+    password: str = Field(default="", max_length=512)
+    risk_confirmed: bool = False
+
+    @field_validator("provider_id")
+    @classmethod
+    def validate_provider_id(cls, value: str) -> str:
+        return _validate_required_id(value, field="Provider ID")
 
 
 class LibraryCreate(BaseModel):
     id: str
+    database_type: str = "livingmemory_v8"
     name: str
     description: str = ""
     default_persona_id: str = ""
@@ -284,6 +418,11 @@ class LibraryCreate(BaseModel):
     @classmethod
     def validate_id(cls, value: str) -> str:
         return _validate_required_id(value, field="记忆库 ID")
+
+    @field_validator("database_type")
+    @classmethod
+    def validate_database_type(cls, value: str) -> str:
+        return _validate_required_id(value, field="数据库类型")
 
     @field_validator("provider_id")
     @classmethod

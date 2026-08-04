@@ -1,11 +1,10 @@
-export function createSystemController({ $, state, t, toast, libraryApi, statCards, formatVersionTag, escapeHtml }) {
+export function createSystemController({ $, state, t, toast, selectedDatabaseApi, statCards, formatVersionTag, escapeHtml }) {
 async function loadSystem() {
   try {
-    const data = await libraryApi("/stats");
+    const data = await selectedDatabaseApi("/stats");
     state.stats = data;
     statCards($("system-version-stats"), [
       [t("serviceVersion"), formatVersionTag(data.service_version)],
-      [t("livingMemoryDbVersion"), formatVersionTag(data.livingmemory_database_version)],
     ]);
     statCards($("system-stats"), [
       [t("statsMemories"), data.total_memories],
@@ -37,6 +36,7 @@ async function loadSystem() {
         )
         .join("") || t("noBackups");
   } catch (error) {
+    if (error?.name === "AbortError") return;
     toast(error.message, true);
   }
 }
@@ -45,17 +45,19 @@ function systemCollapsedHeight() {
   return Math.max(280, Math.round(window.innerHeight * 0.5));
 }
 
-function applySystemPanelCollapseState({ panelId, contentId, toggleId, expanded }) {
+function applySystemPanelCollapseState({ panelId, contentId, toggleId, topToggleId, expanded }) {
   const panel = $(panelId);
   const content = $(contentId);
   const toggle = $(toggleId);
-  if (!panel || !content || !toggle) return;
+  const topToggle = $(topToggleId);
+  if (!panel || !content || !toggle || !topToggle) return;
   const collapsedHeight = systemCollapsedHeight();
   panel.style.setProperty("--system-panel-collapsed-height", `${collapsedHeight}px`);
   const overflowing = content.scrollHeight > collapsedHeight + 24;
   if (!overflowing) {
     toggle.classList.add("hidden");
     toggle.classList.remove("expanded");
+    topToggle.classList.add("hidden");
     panel.classList.remove("system-panel-collapsed", "system-panel-expanded");
     return;
   }
@@ -67,6 +69,10 @@ function applySystemPanelCollapseState({ panelId, contentId, toggleId, expanded 
   toggle.title = title;
   toggle.setAttribute("aria-label", title);
   toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+  topToggle.classList.toggle("hidden", !expanded);
+  const collapseTitle = t("collapseLibraryCard");
+  topToggle.title = collapseTitle;
+  topToggle.setAttribute("aria-label", collapseTitle);
 }
 
 function applySystemProviderCollapseState() {
@@ -74,6 +80,7 @@ function applySystemProviderCollapseState() {
     panelId: "system-provider-panel",
     contentId: "provider-status",
     toggleId: "system-provider-toggle",
+    topToggleId: "system-provider-collapse-top",
     expanded: state.systemProviderExpanded,
   });
 }
@@ -83,6 +90,7 @@ function applySystemIndexCollapseState() {
     panelId: "system-index-panel",
     contentId: "index-status",
     toggleId: "system-index-toggle",
+    topToggleId: "system-index-collapse-top",
     expanded: state.systemIndexExpanded,
   });
 }
@@ -105,6 +113,16 @@ $("system-provider-toggle")?.addEventListener("click", () => {
 
 $("system-index-toggle")?.addEventListener("click", () => {
   state.systemIndexExpanded = !state.systemIndexExpanded;
+  applySystemIndexCollapseState();
+});
+
+$("system-provider-collapse-top")?.addEventListener("click", () => {
+  state.systemProviderExpanded = false;
+  applySystemProviderCollapseState();
+});
+
+$("system-index-collapse-top")?.addEventListener("click", () => {
+  state.systemIndexExpanded = false;
   applySystemIndexCollapseState();
 });
 

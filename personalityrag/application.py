@@ -5,15 +5,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
-from starlette.middleware.gzip import GZipMiddleware
 
 from . import __version__
 from .application_context import ApplicationContext, activate_context, reset_context
 from .http_middleware import (
     RequestContextMiddleware,
-    adapter_busy_guard,
-    static_asset_cache_policy,
 )
+from .compression import SelectiveGZipMiddleware
 from .logger import logger
 
 
@@ -41,7 +39,7 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
                 if os.environ.get(warning_key):
                     logger.warning(os.environ[warning_key])
             await context.manager.initialize()
-            logger.info("服务初始化完成：默认记忆库与模型提供商已加载")
+            logger.info("服务初始化完成：数据库目录与模型提供商目录已加载")
             yield
         finally:
             logger.info("服务正在关闭：释放记忆库 runtime 与模型提供商连接")
@@ -58,11 +56,16 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
     app.mount("/static", StaticFiles(directory=context.static_dir), name="static")
 
     from .routes import ROUTERS
+    from .database_types import database_type_registry
 
     for router in ROUTERS:
         app.include_router(router)
-    app.middleware("http")(static_asset_cache_policy)
-    app.middleware("http")(adapter_busy_guard)
-    app.add_middleware(GZipMiddleware, minimum_size=500)
+    for router in database_type_registry.api_routers():
+        app.include_router(router)
+    app.add_middleware(
+        SelectiveGZipMiddleware,
+        minimum_size=1024,
+        compresslevel=5,
+    )
     app.add_middleware(RequestContextMiddleware, context=context)
     return app

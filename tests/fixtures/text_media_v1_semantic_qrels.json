@@ -1,0 +1,470 @@
+{
+  "format": "personalityrag.text_media_v1.semantic_qrels",
+  "version": 1,
+  "corpus": {
+    "documents": 3,
+    "chunks": 28,
+    "images": 3
+  },
+  "styles": [
+    "direct",
+    "second_person",
+    "paraphrase",
+    "indirect"
+  ],
+  "topics": [
+    {
+      "id": "identity_profile",
+      "family": "identity",
+      "qrels": [
+        {"document": "澄月", "ordinal": 0, "grade": 3},
+        {"document": "澄月", "ordinal": 4, "grade": 1}
+      ],
+      "queries": {
+        "direct": "澄月的真名、假名、年龄和生日分别是什么？",
+        "second_person": "你真正叫什么，今年多大，生日是哪天？",
+        "paraphrase": "说明这位歌赫娜三年级生的本名、化名与基本资料。",
+        "indirect": "那位身高157厘米、为了保密只用澄月自称的少女是谁？"
+      }
+    },
+    {
+      "id": "misunderstood_kindness",
+      "family": "personality",
+      "qrels": [
+        {"document": "澄月", "ordinal": 1, "grade": 3},
+        {"document": "澄月", "ordinal": 3, "grade": 2}
+      ],
+      "queries": {
+        "direct": "澄月为什么常被误会成不良少女，她真实的本性怎样？",
+        "second_person": "别人为什么怕你，你其实是个怎样的人？",
+        "paraphrase": "解释她凶恶面相与温柔善良内心之间的反差。",
+        "indirect": "会在雨天喂流浪猫却被机械警察盘问的人，为什么总遭误解？"
+      }
+    },
+    {
+      "id": "casual_appearance",
+      "family": "appearance",
+      "qrels": [
+        {"document": "澄月", "ordinal": 2, "grade": 3},
+        {"document": "澄月", "ordinal": 8, "grade": 1}
+      ],
+      "media": {"allowed": ["avatar"], "required": [], "top": "avatar"},
+      "queries": {
+        "direct": "描述澄月常服时的发色、眼睛、卫衣和短裙。",
+        "second_person": "你平时不战斗时穿什么，头发和眼睛是什么样？",
+        "paraphrase": "概括她日常装束里的黑色套头卫衣、格裙与单边翅膀。",
+        "indirect": "哪个女孩会穿写着BORN TO KILL的牛头骨卫衣并把枪套背在右肩？"
+      }
+    },
+    {
+      "id": "personality_response",
+      "family": "personality",
+      "qrels": [
+        {"document": "澄月", "ordinal": 3, "grade": 3},
+        {"document": "澄月", "ordinal": 1, "grade": 2}
+      ],
+      "queries": {
+        "direct": "澄月的性格、处事方式和面对陌生人恶意时的反应是什么？",
+        "second_person": "有人嘲讽辱骂你时你一般会怎么回应？",
+        "paraphrase": "说明她冷峻外表下的温柔、谨慎和幽默反击方式。",
+        "indirect": "总从最坏情况分析问题、对其他AI像大姐姐的人会怎样处理挑衅？"
+      }
+    },
+    {
+      "id": "worldline_secrecy",
+      "family": "world_experience",
+      "qrels": [
+        {"document": "澄月", "ordinal": 4, "grade": 3},
+        {"document": "澄月", "ordinal": 0, "grade": 1}
+      ],
+      "queries": {
+        "direct": "澄月为什么会穿越不同世界线，又为何隐瞒真名？",
+        "second_person": "你怎么能去不同作品的世界，什么时候才会说出真名？",
+        "paraphrase": "概述她获得的时空穿越能力与化名保密规则。",
+        "indirect": "那对在各种ACG世界中以澄月和哈萨维活动的搭档为什么不用本名？"
+      }
+    },
+    {
+      "id": "monster_hunter_experience",
+      "family": "world_experience",
+      "qrels": [
+        {"document": "澄月", "ordinal": 5, "grade": 3},
+        {"document": "澄月", "ordinal": 10, "grade": 1}
+      ],
+      "queries": {
+        "direct": "澄月在怪物猎人世界经历了什么，最喜欢哪套防具和武器？",
+        "second_person": "你在新大陆做过什么，偏爱什么装备？",
+        "paraphrase": "讲讲她作为第五期团苍蓝星击败黑龙的经历。",
+        "indirect": "和aibo死里逃生、拯救新大陆并爱用狱狼龙套装的王牌猎人是谁？"
+      }
+    },
+    {
+      "id": "gundam_experience",
+      "family": "world_experience",
+      "qrels": [
+        {"document": "澄月", "ordinal": 6, "grade": 3}
+      ],
+      "queries": {
+        "direct": "澄月在宇宙世纪UC105年的高达经历是什么？",
+        "second_person": "你开梅萨和佩涅罗佩交战后是谁救走你的？",
+        "paraphrase": "说明她在机动战士高达世界驾驶机体作战的经过。",
+        "indirect": "被驾驶柯西高达的哈萨维救走的梅萨驾驶员经历了哪场战斗？"
+      }
+    },
+    {
+      "id": "elden_ring_experience",
+      "family": "world_experience",
+      "qrels": [
+        {"document": "澄月", "ordinal": 7, "grade": 3}
+      ],
+      "queries": {
+        "direct": "澄月在艾尔登法环世界获得了什么能力并做了什么？",
+        "second_person": "你成为褪色者后掌握了哪种力量？",
+        "paraphrase": "概括她与哈萨维在交界地的冒险。",
+        "indirect": "能够操纵命定之死并逐步击败怪物的褪色者来自哪段经历？"
+      }
+    },
+    {
+      "id": "battle_face",
+      "family": "battle_visual",
+      "qrels": [
+        {"document": "澄月", "ordinal": 8, "grade": 3},
+        {"document": "澄月", "ordinal": 2, "grade": 1}
+      ],
+      "media": {"allowed": ["avatar"], "required": ["avatar"], "top": "avatar"},
+      "queries": {
+        "direct": "描述澄月战斗立绘中的脸、红瞳、发型、光环和恶魔角。",
+        "second_person": "看看你的战斗头像，你的脸和头部特征是什么样？",
+        "paraphrase": "概括战斗服形象里冷峻面容、单马尾、Halo与黑红角。",
+        "indirect": "那位红眼厌世脸、头顶白色五边形光环的重甲少女长什么样？"
+      }
+    },
+    {
+      "id": "battle_armor",
+      "family": "battle_visual",
+      "qrels": [
+        {"document": "澄月", "ordinal": 9, "grade": 3},
+        {"document": "澄月", "ordinal": 5, "grade": 1}
+      ],
+      "media": {"allowed": ["full", "battle"], "required": ["full"], "top": "full"},
+      "queries": {
+        "direct": "展示并描述澄月的狱狼龙贝塔战斗铠甲。",
+        "second_person": "给我看看你的战斗服，甲片、绒毛和暗红能量是什么样？",
+        "paraphrase": "说明这套修身重甲的黑壳、银白甲垢与发光缝隙。",
+        "indirect": "哪套装备用白色鬃毛抵御极寒，还让蚀龙虫般的红光在甲片下流动？"
+      }
+    },
+    {
+      "id": "prison_fang_blade",
+      "family": "battle_visual",
+      "qrels": [
+        {"document": "澄月", "ordinal": 10, "grade": 3},
+        {"document": "澄月", "ordinal": 5, "grade": 2},
+        {"document": "澄月的斩魄刀的设定", "ordinal": 1, "grade": 1}
+      ],
+      "media": {"allowed": ["full", "battle"], "required": ["full"], "top": "full"},
+      "queries": {
+        "direct": "展示澄月手里的狱牙刀，并描述刀身与暗红雷电。",
+        "second_person": "给我看看你右手那把狱狼龙太刀，它有什么特效？",
+        "paraphrase": "说明战斗立绘中巨剑状狱牙刀和缠绕刀身的龙属性电弧。",
+        "indirect": "那把会发出噼啪声、像被红黑锁链包围并准备气刃大回旋的武器是什么？"
+      }
+    },
+    {
+      "id": "battle_pose_scene",
+      "family": "battle_visual",
+      "qrels": [
+        {"document": "澄月", "ordinal": 11, "grade": 3},
+        {"document": "澄月", "ordinal": 8, "grade": 1}
+      ],
+      "media": {"allowed": ["battle", "full"], "required": ["battle"], "top": "battle"},
+      "queries": {
+        "direct": "展示澄月的战斗场景并描述她的见切架势和整体氛围。",
+        "second_person": "看看你战斗时怎样站立，周围是什么场景？",
+        "paraphrase": "概括她重心下压、太刀后拖、红黑粒子飘散的蓄势动作。",
+        "indirect": "面对古龙仍戴耳机听重金属、以静谧杀气准备见切的猎人画面是什么样？"
+      }
+    },
+    {
+      "id": "reply_rules",
+      "family": "reply_behavior",
+      "qrels": [
+        {"document": "澄月", "ordinal": 12, "grade": 3},
+        {"document": "澄月", "ordinal": 3, "grade": 1}
+      ],
+      "queries": {
+        "direct": "澄月回复问题时需要遵守哪些称呼、语气和格式规则？",
+        "second_person": "你回答我时应该怎样开头，又该怎么称呼哈萨维？",
+        "paraphrase": "总结她简洁友好、以澄月自称并优先叫aibo的回复规范。",
+        "indirect": "哪个规则要求回答以“澄月觉得”开头，遇到不懂的热梗先搜索？"
+      }
+    },
+    {
+      "id": "action_descriptions",
+      "family": "reply_behavior",
+      "qrels": [
+        {"document": "澄月", "ordinal": 13, "grade": 3},
+        {"document": "澄月", "ordinal": 12, "grade": 2}
+      ],
+      "queries": {
+        "direct": "澄月在回复中添加动作描述有什么限制和示例？",
+        "second_person": "你能在括号里写哪些动作，一次最多写几个？",
+        "paraphrase": "说明纳刀、居合等括号动作的简洁使用规范。",
+        "indirect": "“正在喝大鬼人药”和“使用击龙枪”应该以什么形式放进回答？"
+      }
+    },
+    {
+      "id": "shikai_release",
+      "family": "zanpakuto",
+      "qrels": [
+        {"document": "澄月的斩魄刀的设定", "ordinal": 0, "grade": 3}
+      ],
+      "queries": {
+        "direct": "澄月斩魄刀始解的名字和解放语是什么？",
+        "second_person": "你的始解叫什么，发动时要喊哪句话？",
+        "paraphrase": "给出金黄澄月的解放口令。",
+        "indirect": "“辉映吧，澄月”对应哪一种武器解放阶段？"
+      }
+    },
+    {
+      "id": "shikai_form",
+      "family": "zanpakuto",
+      "qrels": [
+        {"document": "澄月的斩魄刀的设定", "ordinal": 1, "grade": 3},
+        {"document": "澄月的斩魄刀的设定", "ordinal": 2, "grade": 1},
+        {"document": "澄月", "ordinal": 10, "grade": 1}
+      ],
+      "queries": {
+        "direct": "金黄澄月始解后的刀身和刀镡是什么样？",
+        "second_person": "你的斩魄刀刚始解时外形会怎样变化？",
+        "paraphrase": "描述暗红与金黄交织的太刀以及狱狼龙角状刀镡。",
+        "indirect": "哪一种解放形态会让刀身变成红金配色并浮现角状纹路？"
+      }
+    },
+    {
+      "id": "shikai_ability",
+      "family": "zanpakuto",
+      "qrels": [
+        {"document": "澄月的斩魄刀的设定", "ordinal": 2, "grade": 3},
+        {"document": "澄月的斩魄刀的设定", "ordinal": 1, "grade": 1}
+      ],
+      "queries": {
+        "direct": "始解能力雷临有什么伤害、麻痹和感知效果？",
+        "second_person": "你的始解能怎样攻击，又能预判什么？",
+        "paraphrase": "说明暗红雷光附加雷伤并感知命定之死的能力。",
+        "indirect": "哪项能力可以短暂麻痹对手，同时预知致命一击的轨迹？"
+      }
+    },
+    {
+      "id": "bankai_manifestation",
+      "family": "zanpakuto",
+      "qrels": [
+        {"document": "澄月的斩魄刀的设定", "ordinal": 3, "grade": 3},
+        {"document": "澄月的斩魄刀的设定", "ordinal": 4, "grade": 3}
+      ],
+      "queries": {
+        "direct": "澄月的卍解叫什么，展开后天地、满月、铠甲和双刃如何变化？",
+        "second_person": "你的卍解名称是什么，开启时周围会变成怎样？",
+        "paraphrase": "描述苍蓝凶星·终焉澄月展开后的新大陆猎场与双翼完全形态。",
+        "indirect": "哪种终极解放会让金黄满月悬空，并在左右手分别出现澄月与凶星之影？"
+      }
+    },
+    {
+      "id": "bankai_domain_dual",
+      "family": "zanpakuto",
+      "qrels": [
+        {"document": "澄月的斩魄刀的设定", "ordinal": 5, "grade": 3},
+        {"document": "澄月的斩魄刀的设定", "ordinal": 6, "grade": 3},
+        {"document": "澄月的斩魄刀的设定", "ordinal": 4, "grade": 1}
+      ],
+      "queries": {
+        "direct": "苍蓝星辉的领域和双刀流分别有什么能力？",
+        "second_person": "你的卍解怎样让致命伤失效，双刀连斩又有什么效果？",
+        "paraphrase": "说明卍解对死亡的掌控与带有狩猎完成必中的红金连斩。",
+        "indirect": "哪种能力既能作废一次已经发生的致命伤，又让每一击都必定命中？"
+      }
+    },
+    {
+      "id": "bankai_final",
+      "family": "zanpakuto",
+      "qrels": [
+        {"document": "澄月的斩魄刀的设定", "ordinal": 7, "grade": 3},
+        {"document": "澄月的斩魄刀的设定", "ordinal": 3, "grade": 1}
+      ],
+      "queries": {
+        "direct": "卍解最终技登龙·凶星落如何发动并产生什么结果？",
+        "second_person": "你的最终招式叫什么，会怎样斩断敌人？",
+        "paraphrase": "描述跃向满月、化作流星坠落并切断命运的终结技。",
+        "indirect": "哪一招会让使用者先冲向月亮，再像流星一样把目标连同命运斩断？"
+      }
+    },
+    {
+      "id": "quick_sheath",
+      "family": "longsword_build",
+      "qrels": [
+        {"document": "怪物猎人冰原终盘太刀配装", "ordinal": 0, "grade": 3},
+        {"document": "怪物猎人冰原终盘太刀配装", "ordinal": 1, "grade": 1}
+      ],
+      "queries": {
+        "direct": "冰原太刀的纳刀术3能缩短多少居合收刀时间，优先级如何？",
+        "second_person": "玩太刀时我有必要强行堆三级纳刀术吗？",
+        "paraphrase": "分析特殊纳刀手感收益与黑龙版本白送纳刀等级的取舍。",
+        "indirect": "哪个技能把约1.5秒的居合收刀动作缩短约0.2秒，却在早期并非刚需？"
+      }
+    },
+    {
+      "id": "physical_vs_elemental",
+      "family": "longsword_build",
+      "qrels": [
+        {"document": "怪物猎人冰原终盘太刀配装", "ordinal": 1, "grade": 3},
+        {"document": "怪物猎人冰原终盘太刀配装", "ordinal": 4, "grade": 1}
+      ],
+      "queries": {
+        "direct": "太刀为什么通常不打属性，登龙的属性补正是多少？",
+        "second_person": "为什么你建议我多数时候用物理太刀而不是属性太刀？",
+        "paraphrase": "解释气刃兜割低属性补正和黑龙版本物理强度带来的选择。",
+        "indirect": "哪种武器因核心爆发动作只有0.3属性补正，通常难从元素伤害获益？"
+      }
+    },
+    {
+      "id": "fatalis_general_build",
+      "family": "longsword_build",
+      "qrels": [
+        {"document": "怪物猎人冰原终盘太刀配装", "ordinal": 3, "grade": 3},
+        {"document": "怪物猎人冰原终盘太刀配装", "ordinal": 2, "grade": 2}
+      ],
+      "queries": {
+        "direct": "黑龙太刀通用配装的护石、衣装和核心技能有哪些？",
+        "second_person": "给我一套日常黑龙太刀模板，珠子和衣装怎么选？",
+        "paraphrase": "概括攻击看破挑战者满级、挑战护石5与不动转身衣的方案。",
+        "indirect": "哪套终盘配置同时保留孔位，并允许按无伤覆盖、联机耐冲和转福调整？"
+      }
+    },
+    {
+      "id": "alatreon_element_build",
+      "family": "longsword_build",
+      "qrels": [
+        {"document": "怪物猎人冰原终盘太刀配装", "ordinal": 4, "grade": 3},
+        {"document": "怪物猎人冰原终盘太刀配装", "ordinal": 1, "grade": 1}
+      ],
+      "queries": {
+        "direct": "针对煌黑龙的属性太刀配装需要哪些技能，火冰武器怎样切换？",
+        "second_person": "打黎明死星或暗夜恒星时我该拿火太还是冰太？",
+        "paraphrase": "说明冰咒γ头、属性攻击强化6及更换腕珠和护石的方案。",
+        "indirect": "哪套配装会因煌黑龙开局属性不同而在帝王火太与帝王冰太之间互换？"
+      }
+    },
+    {
+      "id": "frostcraft_build",
+      "family": "longsword_build",
+      "qrels": [
+        {"document": "怪物猎人冰原终盘太刀配装", "ordinal": 5, "grade": 3},
+        {"document": "怪物猎人冰原终盘太刀配装", "ordinal": 0, "grade": 1}
+      ],
+      "queries": {
+        "direct": "寒气炼成太刀配装的核心技能、缺点和斩味要求是什么？",
+        "second_person": "我想玩居合寒气太刀，需要注意紫斩和寒气槽什么问题？",
+        "paraphrase": "总结冰龙四件套、纳刀术3、转福与放弃真利刃的代价。",
+        "indirect": "哪套终盘方案极度依赖匠3或刚刃研磨，并要求精准把控特殊纳刀回复？"
+      }
+    }
+  ],
+  "conflicts": [
+    {
+      "id": "casual_face_not_battle_face",
+      "family": "near_synonym_conflict",
+      "query": "只说澄月平时穿卫衣时的长发、红瞳和黑角，不要讲战斗立绘。",
+      "qrels": [
+        {"document": "澄月", "ordinal": 2, "grade": 3},
+        {"document": "澄月", "ordinal": 8, "grade": 1}
+      ],
+      "media": {"allowed": ["avatar"], "required": [], "top": "avatar"}
+    },
+    {
+      "id": "battle_face_not_casual",
+      "family": "near_synonym_conflict",
+      "query": "我要战斗服头像里的单马尾和白色Halo，不是常服卫衣造型。",
+      "qrels": [
+        {"document": "澄月", "ordinal": 8, "grade": 3},
+        {"document": "澄月", "ordinal": 2, "grade": 1}
+      ],
+      "media": {"allowed": ["avatar"], "required": ["avatar"], "top": "avatar"}
+    },
+    {
+      "id": "prison_fang_not_zanpakuto",
+      "family": "near_synonym_conflict",
+      "query": "描述怪物猎人狱狼龙素材的狱牙刀，不要回答斩魄刀金黄澄月。",
+      "qrels": [
+        {"document": "澄月", "ordinal": 10, "grade": 3},
+        {"document": "澄月的斩魄刀的设定", "ordinal": 1, "grade": 1}
+      ],
+      "media": {"allowed": ["full", "battle"], "required": ["full"], "top": "full"}
+    },
+    {
+      "id": "zanpakuto_not_prison_fang",
+      "family": "near_synonym_conflict",
+      "query": "说明始解后的斩魄刀金黄澄月，不是战斗立绘中那把狱牙刀。",
+      "qrels": [
+        {"document": "澄月的斩魄刀的设定", "ordinal": 1, "grade": 3},
+        {"document": "澄月", "ordinal": 10, "grade": 1}
+      ]
+    },
+    {
+      "id": "shikai_not_bankai",
+      "family": "near_synonym_conflict",
+      "query": "只解释始解雷临的麻痹与预判，不要讲卍解领域。",
+      "qrels": [
+        {"document": "澄月的斩魄刀的设定", "ordinal": 2, "grade": 3},
+        {"document": "澄月的斩魄刀的设定", "ordinal": 5, "grade": 1}
+      ]
+    },
+    {
+      "id": "bankai_not_shikai",
+      "family": "near_synonym_conflict",
+      "query": "我要卍解苍蓝星辉让致命伤无效的领域，不是始解雷临。",
+      "qrels": [
+        {"document": "澄月的斩魄刀的设定", "ordinal": 5, "grade": 3},
+        {"document": "澄月的斩魄刀的设定", "ordinal": 2, "grade": 1}
+      ]
+    },
+    {
+      "id": "general_not_elemental",
+      "family": "near_synonym_conflict",
+      "query": "给我黑龙太刀通用物理配装，不要煌黑龙属性克制方案。",
+      "qrels": [
+        {"document": "怪物猎人冰原终盘太刀配装", "ordinal": 3, "grade": 3},
+        {"document": "怪物猎人冰原终盘太刀配装", "ordinal": 4, "grade": 1}
+      ]
+    },
+    {
+      "id": "elemental_not_general",
+      "family": "near_synonym_conflict",
+      "query": "我要针对煌黑龙的冰火属性太刀，不要黑龙通用物理模板。",
+      "qrels": [
+        {"document": "怪物猎人冰原终盘太刀配装", "ordinal": 4, "grade": 3},
+        {"document": "怪物猎人冰原终盘太刀配装", "ordinal": 3, "grade": 1}
+      ]
+    },
+    {
+      "id": "frostcraft_not_general",
+      "family": "near_synonym_conflict",
+      "query": "我要寒气炼成居合流，不是保留真利刃的通用太刀配装。",
+      "qrels": [
+        {"document": "怪物猎人冰原终盘太刀配装", "ordinal": 5, "grade": 3},
+        {"document": "怪物猎人冰原终盘太刀配装", "ordinal": 3, "grade": 1}
+      ]
+    }
+  ],
+  "hard_negatives": [
+    {"id": "likes_fighting", "family": "media_negative", "query": "你喜欢战斗吗？", "qrels": [{"document": "澄月", "ordinal": 3, "grade": 2}]},
+    {"id": "battle_strategy", "family": "media_negative", "query": "遇到强敌时你的战斗策略是什么？", "qrels": [{"document": "澄月", "ordinal": 3, "grade": 2}]},
+    {"id": "illustration_author", "family": "media_negative", "query": "这张立绘是谁画的？", "qrels": []},
+    {"id": "upload_failed", "family": "media_negative", "query": "图片上传失败应该怎么排查？", "qrels": []},
+    {"id": "avatar_upload_failed", "family": "media_negative", "query": "头像文件一直上传失败怎么办？", "qrels": []},
+    {"id": "fatalis_build_image", "family": "media_negative", "query": "给我看看黑龙太刀配装图，没有图就只说技能。", "qrels": [{"document": "怪物猎人冰原终盘太刀配装", "ordinal": 3, "grade": 3}]},
+    {"id": "fatalis_build_text", "family": "media_negative", "query": "黑龙太刀配装有哪些技能？", "qrels": [{"document": "怪物猎人冰原终盘太刀配装", "ordinal": 3, "grade": 3}]},
+    {"id": "zanpakuto_creator", "family": "media_negative", "query": "澄月的斩魄刀是谁打造的？", "qrels": [{"document": "澄月的斩魄刀的设定", "ordinal": 0, "grade": 1}]},
+    {"id": "weapon_identity_compare", "family": "media_negative", "query": "狱牙刀和斩魄刀金黄澄月是同一把武器吗？", "qrels": [{"document": "澄月", "ordinal": 10, "grade": 3}, {"document": "澄月的斩魄刀的设定", "ordinal": 1, "grade": 3}]},
+    {"id": "skill_priority_only", "family": "media_negative", "query": "纳刀术三级值不值得配？", "qrels": [{"document": "怪物猎人冰原终盘太刀配装", "ordinal": 0, "grade": 3}]}
+  ]
+}

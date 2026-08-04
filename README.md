@@ -1,10 +1,15 @@
-# PersonalityRAG Linux / Docker v0.1.0
+# PersonalityRAG Linux / Docker v0.1.2
 
-PersonalityRAG 是独立运行的人格记忆 RAG 服务。本分支提供 Linux/Docker 发行版，与 Windows v0.1.0 保持核心能力、数据库、API、WebUI、召回和配置包兼容，并提供 amd64/arm64 多架构镜像。
+PersonalityRAG 是独立运行的人格记忆与文本媒体知识库 RAG 服务。本分支提供 Linux/Docker 发行版，与 Windows v0.1.2 保持核心能力、数据库、API、WebUI、召回、检索和配置包兼容，并提供 amd64/arm64 多架构镜像。
 
-- Windows 版与项目主页：[Creeper3222/PersonalityRAG](https://github.com/Creeper3222/PersonalityRAG)
-- AstrBot 适配器：[astrbot_plugin_personality_rag_adapter](https://github.com/Creeper3222/astrbot_plugin_personality_rag_adapter)
 - Docker Hub：`138763327/personalityrag-linux`
+
+## 相关仓库链接
+
+- [PersonalityRAG Windows](https://github.com/Creeper3222/PersonalityRAG)
+- [PersonalityRAG Linux/Docker](https://github.com/Creeper3222/PersonalityRAG/tree/Linux-Docker)
+- [AstrBot 记忆库适配器](https://github.com/Creeper3222/astrbot_plugin_personality_rag_adapter)
+- [AstrBot 知识库适配器](https://github.com/Creeper3222/astrbot_plugin_personality_knowledgebase_adapter)
 
 项目采用 AGPL-3.0-only。完整版权与第三方声明见 GitHub 仓库。
 
@@ -18,7 +23,7 @@ docker compose up -d
 默认地址：
 
 - WebUI：`http://127.0.0.1:8765/`
-- AstrBot / 记忆库接入：`http://127.0.0.1:8766/`
+- AstrBot / 记忆库与知识库接入：`http://127.0.0.1:8766/`
 
 正式 Compose 默认拉取：
 
@@ -26,7 +31,7 @@ docker compose up -d
 138763327/personalityrag-linux:latest
 ```
 
-首次启动会在挂载的状态目录生成配置、密钥和默认记忆库。请从容器日志读取首次 API Key，并妥善备份状态目录。
+首次启动会在挂载的状态目录生成配置、密钥和空的默认记忆库。全新安装不会预置模型 Provider；请从容器日志读取首次 API Key，在 WebUI 中添加实际使用的 Embedding/Rerank Provider，并妥善备份状态目录。
 
 ## Docker Engine Socket 与版本切换
 
@@ -58,17 +63,18 @@ docker compose -f docker-compose.local.yml up -d --build
 容器内部端口固定为：
 
 - WebUI：`8765`
-- 记忆库接入：`8766`
+- 适配器接入：`8766`
 
 基础设置页中的两个端口在 Docker 模式下只读。需要修改宿主端口时，请编辑 `.env` 中的 `PERSONALITYRAG_WEBUI_HOST_PORT` 和 `PERSONALITYRAG_ACCESS_HOST_PORT`，然后重新执行 `docker compose up -d`。
 
-默认 Embedding 地址为 `http://host.docker.internal:8001/v1`，只用于首次配置。模型运行在其他容器或远端时，可在 WebUI 中正常修改 Provider。
+全新安装不会创建默认 Embedding Provider。模型运行在宿主机时可使用 `http://host.docker.internal:<端口>`；运行在同一 Docker 网络或远端时，应在 WebUI 中填写对应的容器 origin 或 HTTPS origin。
 
 ## 功能与平台一致性
 
 Linux/Docker 版同步提供：
 
-- 记忆、图谱、会话、Persona、Embedding 召回和 Rerank。
+- LivingMemory v8 记忆、图谱、会话、Persona、Embedding 召回和 Rerank。
+- `text_media_v1` 文本/媒体文件管理、索引、检索、签名媒体读取和校准。
 - OpenAI、Ollama、vLLM、Gemini 与 NVIDIA Embedding Provider。
 - 可暂停、继续、停止、取消和异常恢复的持久化长任务。
 - 安全断点、索引分段、任务前状态回滚和任务历史清理。
@@ -85,7 +91,7 @@ Docker 版可直接导入 Windows 版导出的 `.prag` 配置包。Provider、�
 - AstrBot 运行在宿主机：使用 `http://127.0.0.1:<映射后的接入端口>`。
 - AstrBot 与 PersonalityRAG 位于同一 Docker 网络：使用 `http://personalityrag:8766`。
 
-适配器仍需配置正确的记忆库 ID 和对应的 `psk-` 库级密钥。
+记忆适配器需配置正确的 LivingMemory v8 库 ID 与对应的 `psk-` 库级密钥；知识库适配器需配置 `text_media_v1` 库 ID 与对应的 `pkb-` 库级密钥。接入地址必须填写完整 origin（例如 `http://127.0.0.1:8766` 或公网 `https://rag.example.com:443`），不能填写 WebUI 地址、路径、凭据、查询或片段。
 
 ## Docker Hub 标签
 

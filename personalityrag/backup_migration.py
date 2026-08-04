@@ -27,21 +27,35 @@ from .context_lengths import (
     MIN_VALID_CONTEXT_TOKENS,
     static_context_table_metadata,
 )
+from .database_types import (
+    LIVINGMEMORY_V8_TYPE,
+    TEXT_MEDIA_V1_TYPE,
+    DatabaseRef,
+    database_type_registry,
+)
 from .identifiers import validate_identifier
 from .io_utils import run_blocking
-from .libraries import LibraryManager
+from . import library_types as _registered_database_types  # noqa: F401
+from .libraries import DatabaseManager
 from .logger import logger
-from .migration import (
+from .library_types.livingmemory_v8.migration import (
     sha256_file,
     sqlite_backup,
     validate_conversations_db_file,
     validate_livingmemory_db_file,
 )
-from .storage import Storage
+from .library_types.livingmemory_v8.storage import Storage
+from .library_types.text_media_v1.package import (
+    export_tmkb,
+    extract_tmkb,
+    install_tmkb,
+    inspect_tmkb,
+)
 
 
 PACKAGE_FORMAT = "personalityrag.prag"
-PACKAGE_VERSION = 1
+PACKAGE_VERSION = 2
+SUPPORTED_PACKAGE_VERSIONS = frozenset({1, 2})
 MAX_PACKAGE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_EXTRACTED_BYTES = 8 * 1024 * 1024 * 1024
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
@@ -151,6 +165,7 @@ def _safe_member(name: str) -> str:
 def _global_config_payload(config: AppConfig) -> dict[str, Any]:
     payload = asdict(config)
     payload.pop("provider", None)
+    payload.pop("bootstrap_provider_enabled", None)
     return payload
 
 
@@ -191,6 +206,17 @@ async def _add_sqlite_file(
         "path": target,
         "sha256": digest,
         "size": target.stat().st_size,
+    }
+
+
+async def _add_path_file(
+    files: dict[str, dict[str, Any]], archive_name: str, source: Path
+) -> None:
+    digest = await run_blocking(sha256_file, source)
+    files[archive_name] = {
+        "path": source,
+        "sha256": digest,
+        "size": source.stat().st_size,
     }
 
 
@@ -237,7 +263,15 @@ def _write_package(target: Path, password: str, files: dict[str, dict[str, Any]]
                 if "bytes" in item:
                     archive.writestr(name, item["bytes"])
                 else:
-                    archive.write(item["path"], name)
+                    archive.write(
+                        item["path"],
+                        name,
+                        compress_type=(
+                            zipfile.ZIP_STORED
+                            if name.endswith(".tmkb")
+                            else zipfile.ZIP_DEFLATED
+                        ),
+                    )
             archive.writestr("manifest.json", manifest_bytes)
         if temporary.stat().st_size > MAX_PACKAGE_BYTES:
             raise PragPackageError("配置包过大")
@@ -250,7 +284,7 @@ async def export_prag_package(
     *,
     root: Path,
     config: AppConfig,
-    manager: LibraryManager,
+    manager: DatabaseManager,
     target: Path,
     password: str,
     include_libraries: bool,
@@ -270,13 +304,45 @@ async def export_prag_package(
         library_entries = []
         if include_libraries:
             library_snapshot = await manager.control.export_library_snapshot()
-            for index, library in enumerate(library_snapshot["libraries"], start=1):
+            database_records = list(library_snapshot["libraries"])
+            for detail in await manager._managers[TEXT_MEDIA_V1_TYPE].list_libraries(
+                stats_mode="summary"
+            ):
+                database_records.append(
+                    {
+                        "id": detail["id"],
+                        "database_type": TEXT_MEDIA_V1_TYPE,
+                        "name": detail["name"],
+                        "description": detail.get("description") or "",
+                        "provider_id": detail.get("provider_id") or "",
+                        "provider_revision": detail.get("provider_revision") or 0,
+                        "status": detail.get("status") or "ready",
+                        "is_default": False,
+                        "created_at": detail.get("created_at"),
+                        "updated_at": detail.get("updated_at"),
+                    }
+                )
+            for index, library in enumerate(database_records, start=1):
                 library_id = str(library["id"])
+                database_type = str(
+                    library.get("database_type") or LIVINGMEMORY_V8_TYPE
+                )
+                database_type_registry.require(database_type)
                 base = f"libraries/{index:04d}"
-                library_dir = manager.data_dir / "libraries" / library_id
-                empty = await _library_empty(library_dir, manager.system_path)
+                library_dir = database_type_registry.data_dir(
+                    manager.data_dir,
+                    DatabaseRef(database_type, library_id),
+                )
+                empty = (
+                    await _library_empty(library_dir, manager.system_path)
+                    if database_type == LIVINGMEMORY_V8_TYPE
+                    else bool((await manager.library_detail(
+                        DatabaseRef(database_type, library_id)
+                    ))["stats"]["documents"] == 0)
+                )
                 entry = {
                     "id": library_id,
+                    "database_type": database_type,
                     "path": base,
                     "empty": empty,
                     "files": {},
@@ -286,7 +352,16 @@ async def export_prag_package(
                     f"{base}/library.json",
                     {"library": library, "empty": empty},
                 )
-                if not empty:
+                if database_type == TEXT_MEDIA_V1_TYPE:
+                    package_name = f"databases/{TEXT_MEDIA_V1_TYPE}/{library_id}.tmkb"
+                    package_path = work_dir / f"{TEXT_MEDIA_V1_TYPE}-{library_id}.tmkb"
+                    service = await manager.get_runtime(
+                        DatabaseRef(TEXT_MEDIA_V1_TYPE, library_id)
+                    )
+                    await export_tmkb(service=service, target=package_path)
+                    await _add_path_file(files, package_name, package_path)
+                    entry["files"]["native_package"] = package_name
+                elif not empty:
                     livingmemory_db = library_dir / "livingmemory.db"
                     conversations_db = library_dir / "conversations.db"
                     if livingmemory_db.exists():
@@ -305,14 +380,30 @@ async def export_prag_package(
             _add_json_file(
                 files,
                 "libraries/libraries.json",
-                {"libraries": [item["id"] for item in library_entries]},
+                {
+                    "libraries": [item["id"] for item in library_entries],
+                    "databases": [
+                        {
+                            "database_type": item["database_type"],
+                            "id": item["id"],
+                        }
+                        for item in library_entries
+                    ],
+                },
             )
 
         default_library_id = ""
+        default_database: dict[str, str] | None = None
         if include_libraries:
             for entry in library_snapshot["libraries"]:
                 if entry.get("is_default"):
                     default_library_id = str(entry.get("id") or "")
+                    default_database = {
+                        "database_type": str(
+                            entry.get("database_type") or LIVINGMEMORY_V8_TYPE
+                        ),
+                        "id": default_library_id,
+                    }
                     break
         files["manifest.json"] = {
             "manifest": {
@@ -325,6 +416,7 @@ async def export_prag_package(
                     "include_providers": bool(include_providers),
                 },
                 "default_library_id": default_library_id,
+                "default_database": default_database,
                 "libraries": library_entries,
                 "providers": {
                     "count": len((provider_snapshot or {}).get("providers") or [])
@@ -425,30 +517,51 @@ def _validate_package_structure(
     elif raw_libraries:
         raise PragPackageError("配置包范围未包含记忆库但清单非空")
 
-    library_ids: set[str] = set()
+    database_refs: set[tuple[str, str]] = set()
     library_paths: set[str] = set()
     for entry in raw_libraries:
         if not isinstance(entry, dict):
             raise PragPackageError("配置包记忆库条目不合法")
         library_id = str(entry.get("id") or "")
+        database_type = str(
+            entry.get("database_type") or LIVINGMEMORY_V8_TYPE
+        )
         try:
             validate_identifier(library_id, field="记忆库 ID")
+            validate_identifier(database_type, field="数据库类型")
+            database_type_registry.require(database_type)
+        except KeyError as exc:
+            raise PragPackageError(f"配置包包含未注册的数据库类型：{database_type}") from exc
         except ValueError as exc:
             raise PragPackageError(str(exc)) from exc
         base = _safe_member(entry.get("path") or "")
-        if not library_id or library_id in library_ids or base in library_paths:
+        database_ref = (database_type, library_id)
+        if not library_id or database_ref in database_refs or base in library_paths:
             raise PragPackageError("配置包记忆库 ID 或路径重复")
-        library_ids.add(library_id)
+        database_refs.add(database_ref)
         library_paths.add(base)
         required.add(f"{base}/library.json")
         raw_files = entry.get("files") or {}
         if not isinstance(raw_files, dict):
             raise PragPackageError(f"配置包记忆库文件清单不合法：{library_id}")
-        unknown = set(raw_files) - {"livingmemory_db", "conversations_db"}
+        allowed_files = (
+            {"native_package"}
+            if database_type == TEXT_MEDIA_V1_TYPE
+            else {"livingmemory_db", "conversations_db"}
+        )
+        unknown = set(raw_files) - allowed_files
         if unknown:
             raise PragPackageError(f"配置包记忆库文件类型不合法：{library_id}")
         for file_name, raw_path in raw_files.items():
             member = _safe_member(raw_path)
+            if file_name == "native_package":
+                expected = f"databases/{TEXT_MEDIA_V1_TYPE}/{library_id}.tmkb"
+                if member != expected:
+                    raise PragPackageError(
+                        f"配置包知识库子封包路径不合法：{library_id}"
+                    )
+                required.add(member)
+                continue
             if not member.startswith(f"{base}/"):
                 raise PragPackageError(
                     f"配置包记忆库文件路径与条目不匹配：{library_id}"
@@ -463,11 +576,27 @@ def _validate_package_structure(
                     f"配置包记忆库文件名不合法：{library_id}"
                 )
             required.add(member)
-        if not bool(entry.get("empty")) and "livingmemory_db" not in raw_files:
+        if database_type == TEXT_MEDIA_V1_TYPE and "native_package" not in raw_files:
+            raise PragPackageError(f"知识库缺少 .tmkb 子封包：{library_id}")
+        if (
+            database_type == LIVINGMEMORY_V8_TYPE
+            and not bool(entry.get("empty"))
+            and "livingmemory_db" not in raw_files
+        ):
             raise PragPackageError(f"非空记忆库缺少 livingmemory.db：{library_id}")
 
-    default_library_id = str(manifest.get("default_library_id") or "")
-    if scope["include_libraries"] and default_library_id not in library_ids:
+    raw_default_database = manifest.get("default_database")
+    if isinstance(raw_default_database, dict):
+        default_database = (
+            str(raw_default_database.get("database_type") or LIVINGMEMORY_V8_TYPE),
+            str(raw_default_database.get("id") or ""),
+        )
+    else:
+        default_database = (
+            LIVINGMEMORY_V8_TYPE,
+            str(manifest.get("default_library_id") or ""),
+        )
+    if scope["include_libraries"] and default_database not in database_refs:
         raise PragPackageError("配置包默认记忆库不在记忆库清单中")
 
     missing_required = sorted(required - set(declared))
@@ -500,7 +629,7 @@ def _extract_verified_package(
                 raise PragPackageError("配置包 manifest.json 结构不合法")
             if manifest.get("format") != PACKAGE_FORMAT:
                 raise PragPackageError("不是有效的 PersonalityRAG 配置包")
-            if int(manifest.get("version") or 0) != PACKAGE_VERSION:
+            if int(manifest.get("version") or 0) not in SUPPORTED_PACKAGE_VERSIONS:
                 raise PragPackageError("不支持的 PersonalityRAG 配置包版本")
             raw_file_manifest = manifest.get("files")
             if not isinstance(raw_file_manifest, dict):
@@ -603,9 +732,9 @@ def _copytree_replace(source: Path, target: Path, data_dir: Path) -> None:
     resolved_data_dir = data_dir.resolve()
     if (
         resolved_target.parent != resolved_data_dir
-        or resolved_target.name != "libraries"
+        or resolved_target.name != "databases"
     ):
-        raise PragPackageError("refusing to restore an unsafe libraries directory")
+        raise PragPackageError("refusing to restore an unsafe database directory")
     if target.exists():
         shutil.rmtree(target)
     if source.exists():
@@ -614,14 +743,14 @@ def _copytree_replace(source: Path, target: Path, data_dir: Path) -> None:
         target.mkdir(parents=True, exist_ok=True)
 
 
-def _reset_libraries_directory(target: Path, data_dir: Path) -> None:
+def _reset_database_type_directory(target: Path, data_dir: Path) -> None:
     resolved_target = target.resolve()
     resolved_data_dir = data_dir.resolve()
     if (
-        resolved_target.parent != resolved_data_dir
-        or resolved_target.name != "libraries"
+        resolved_target.parent.parent.parent != resolved_data_dir
+        or resolved_target.parent.parent.name != "databases"
     ):
-        raise PragPackageError("refusing to replace an unsafe libraries directory")
+        raise PragPackageError("refusing to replace an unsafe database type directory")
     if target.exists():
         shutil.rmtree(target)
     target.mkdir(parents=True, exist_ok=True)
@@ -630,7 +759,7 @@ def _reset_libraries_directory(target: Path, data_dir: Path) -> None:
 async def _backup_current_state(
     *,
     config_path: Path,
-    manager: LibraryManager,
+    manager: DatabaseManager,
     rollback_dir: Path,
 ) -> None:
     await run_blocking(
@@ -648,17 +777,17 @@ async def _backup_current_state(
         await run_blocking(
             sqlite_backup, manager.system_path, rollback_dir / "personalityrag_system.db"
         )
-    libraries_root = manager.data_dir / "libraries"
-    if libraries_root.exists():
+    databases_root = manager.data_dir / "databases"
+    if databases_root.exists():
         await run_blocking(
-            shutil.copytree, libraries_root, rollback_dir / "libraries"
+            shutil.copytree, databases_root, rollback_dir / "databases"
         )
 
 
 async def _restore_rollback(
     *,
     config_path: Path,
-    manager: LibraryManager,
+    manager: DatabaseManager,
     rollback_dir: Path,
 ) -> None:
     backup_config = rollback_dir / "config.json"
@@ -679,20 +808,20 @@ async def _restore_rollback(
         await run_blocking(sqlite_backup, backup_system, manager.system_path)
     await run_blocking(
         _copytree_replace,
-        rollback_dir / "libraries",
-        manager.data_dir / "libraries",
+        rollback_dir / "databases",
+        manager.data_dir / "databases",
         manager.data_dir,
     )
 
 
-async def _close_runtimes(manager: LibraryManager) -> None:
+async def _close_runtimes(manager: DatabaseManager) -> None:
     for library_id in list(manager.runtimes):
         await manager.unload_runtime(library_id, reason="backup_migration")
 
 
 async def _prepare_library_files(
     *,
-    manager: LibraryManager,
+    manager: DatabaseManager,
     extract_dir: Path,
     manifest: dict[str, Any],
     available_provider_ids: set[str],
@@ -700,6 +829,13 @@ async def _prepare_library_files(
     libraries = []
     missing_providers: set[str] = set()
     for entry in manifest.get("libraries") or []:
+        database_type = str(
+            entry.get("database_type") or LIVINGMEMORY_V8_TYPE
+        )
+        try:
+            driver = database_type_registry.require(database_type)
+        except KeyError as exc:
+            raise PragPackageError(f"配置包包含未注册的数据库类型：{database_type}") from exc
         base = extract_dir / _safe_member(entry.get("path") or "")
         library_payload = await run_blocking(
             _load_json,
@@ -708,6 +844,10 @@ async def _prepare_library_files(
         library = dict(library_payload.get("library") or {})
         if str(library.get("id") or "") != str(entry.get("id") or ""):
             raise PragPackageError("配置包记忆库 ID 与条目不一致")
+        payload_type = str(library.get("database_type") or database_type)
+        if payload_type != database_type:
+            raise PragPackageError("配置包数据库类型与条目不一致")
+        library["database_type"] = database_type
         provider_id = str(library.get("provider_id") or "")
         if provider_id and provider_id not in available_provider_ids:
             missing_providers.add(provider_id)
@@ -715,6 +855,20 @@ async def _prepare_library_files(
         if rerank_provider_id and rerank_provider_id not in available_provider_ids:
             missing_providers.add(rerank_provider_id)
         files = dict(entry.get("files") or {})
+        if database_type == TEXT_MEDIA_V1_TYPE:
+            native_package = extract_dir / _safe_member(files["native_package"])
+            await run_blocking(inspect_tmkb, native_package)
+            async with _temporary_directory("prag-tmkb-validate-") as validate_dir:
+                await run_blocking(extract_tmkb, native_package, validate_dir)
+            libraries.append(
+                {
+                    "library": library,
+                    "driver": driver,
+                    "empty": bool(entry.get("empty")),
+                    "native_package": native_package,
+                }
+            )
+            continue
         livingmemory_db = (
             extract_dir / _safe_member(files["livingmemory_db"])
             if files.get("livingmemory_db")
@@ -738,6 +892,7 @@ async def _prepare_library_files(
         libraries.append(
             {
                 "library": library,
+                "driver": driver,
                 "empty": bool(entry.get("empty")),
                 "livingmemory_db": livingmemory_db,
                 "conversations_db": conversations_db,
@@ -750,17 +905,37 @@ async def _prepare_library_files(
 
 
 async def _install_library_files(
-    *, manager: LibraryManager, prepared: dict[str, Any]
+    *, manager: DatabaseManager, prepared: dict[str, Any]
 ) -> None:
-    libraries_root = manager.data_dir / "libraries"
+    memory_root = database_type_registry.type_root(
+        manager.data_dir, LIVINGMEMORY_V8_TYPE
+    )
+    text_root = database_type_registry.type_root(manager.data_dir, TEXT_MEDIA_V1_TYPE)
     await run_blocking(
-        _reset_libraries_directory,
-        libraries_root,
+        _reset_database_type_directory,
+        memory_root,
         manager.data_dir,
     )
+    await run_blocking(
+        _reset_database_type_directory,
+        text_root,
+        manager.data_dir,
+    )
+    await manager.control.delete_database_identities_by_type(TEXT_MEDIA_V1_TYPE)
     for item in prepared.get("libraries") or []:
         library_id = str(item["library"]["id"])
-        library_dir = libraries_root / library_id
+        if item["library"]["database_type"] == TEXT_MEDIA_V1_TYPE:
+            await install_tmkb(
+                manager=manager._managers[TEXT_MEDIA_V1_TYPE],
+                package_path=item["native_package"],
+                target_id=library_id,
+                name_override=str(item["library"].get("name") or library_id),
+            )
+            continue
+        library_dir = database_type_registry.data_dir(
+            manager.data_dir,
+            DatabaseRef(item["library"]["database_type"], library_id),
+        )
         await run_blocking(
             library_dir.mkdir,
             parents=True,
@@ -789,7 +964,7 @@ async def import_prag_package(
     root: Path,
     config_path: Path,
     config: AppConfig,
-    manager: LibraryManager,
+    manager: DatabaseManager,
     package_path: Path,
     password: str,
     preserve_managed_network: bool = False,
@@ -808,7 +983,14 @@ async def import_prag_package(
             _load_json,
             extract_dir / "config" / "global.json",
         )
-        next_config = app_config_from_dict(global_config, provider=config.provider)
+        next_config = app_config_from_dict(
+            global_config,
+            provider=(
+                config.provider
+                if config.bootstrap_provider_enabled
+                else None
+            ),
+        )
         ignored_config_fields: list[str] = []
         if preserve_managed_network:
             for field_name in DOCKER_MANAGED_CONFIG_FIELDS:
@@ -845,44 +1027,57 @@ async def import_prag_package(
                 manifest=manifest,
                 available_provider_ids=available_provider_ids,
             )
-        await _close_runtimes(manager)
         try:
-            await _backup_current_state(
-                config_path=config_path,
-                manager=manager,
-                rollback_dir=rollback_dir,
-            )
+            try:
+                await manager.suspend_runtime_activity()
+                await _close_runtimes(manager)
+                await _backup_current_state(
+                    config_path=config_path,
+                    manager=manager,
+                    rollback_dir=rollback_dir,
+                )
+                try:
+                    save_config(config_path, next_config)
+                    manager.config = next_config
+                    if provider_snapshot is not None:
+                        await manager.control.restore_provider_snapshot(
+                            provider_snapshot
+                        )
+                    if prepared_libraries is not None:
+                        await manager.control.restore_library_snapshot(
+                            {
+                                "libraries": [
+                                    item["library"]
+                                    for item in prepared_libraries["libraries"]
+                                    if item["library"]["database_type"]
+                                    == LIVINGMEMORY_V8_TYPE
+                                ]
+                            }
+                        )
+                        await _install_library_files(
+                            manager=manager, prepared=prepared_libraries
+                        )
+                    await manager.refresh_default_library(load=False)
+                    if rollback_dir.exists():
+                        await run_blocking(
+                            shutil.rmtree,
+                            rollback_dir,
+                            ignore_errors=True,
+                        )
+                except Exception:
+                    logger.exception("备份迁移配置包导入失败，正在回滚")
+                    await _close_runtimes(manager)
+                    await manager.control.pool.close()
+                    await _restore_rollback(
+                        config_path=config_path,
+                        manager=manager,
+                        rollback_dir=rollback_dir,
+                    )
+                    manager.config = config
+                    raise
+            finally:
+                await manager.resume_runtime_activity()
         except Exception:
-            await manager.refresh_default_library(load=True)
-            raise
-        try:
-            save_config(config_path, next_config)
-            manager.config = next_config
-            if provider_snapshot is not None:
-                await manager.control.restore_provider_snapshot(provider_snapshot)
-            if prepared_libraries is not None:
-                await manager.control.restore_library_snapshot(
-                    {"libraries": [item["library"] for item in prepared_libraries["libraries"]]}
-                )
-                await _install_library_files(
-                    manager=manager, prepared=prepared_libraries
-                )
-            await manager.refresh_default_library(load=False)
-            if rollback_dir.exists():
-                await run_blocking(
-                    shutil.rmtree,
-                    rollback_dir,
-                    ignore_errors=True,
-                )
-        except Exception:
-            logger.exception("备份迁移配置包导入失败，正在回滚")
-            await _close_runtimes(manager)
-            await _restore_rollback(
-                config_path=config_path,
-                manager=manager,
-                rollback_dir=rollback_dir,
-            )
-            manager.config = config
             await manager.refresh_default_library(load=True)
             raise
     result = {
@@ -895,8 +1090,8 @@ async def import_prag_package(
             "missing_providers", []
         ),
         "indexes_pending": bool(scope.get("include_libraries")),
-        "restart_required": True,
         "ignored_config_fields": ignored_config_fields,
+        "restart_required": True,
     }
     logger.warning(
         "备份迁移配置包导入完成：include_libraries=%s include_providers=%s libraries=%s providers=%s",

@@ -23,11 +23,13 @@ COPY assets ./assets
 COPY tests ./tests
 COPY tools ./tools
 COPY run.py ./run.py
+COPY Dockerfile ./Dockerfile
+COPY docker ./docker
 CMD ["python", "-m", "pytest", "-q"]
 
 FROM base AS runtime
 
-ARG PERSONALITYRAG_VERSION=v0.1.0
+ARG PERSONALITYRAG_VERSION=v0.1.1
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="PersonalityRAG Linux" \
       org.opencontainers.image.version="${PERSONALITYRAG_VERSION}" \
@@ -42,7 +44,8 @@ COPY run.py ./run.py
 COPY docker/entrypoint.sh /usr/local/bin/personalityrag-entrypoint.sh
 
 RUN chmod +x /usr/local/bin/personalityrag-entrypoint.sh \
-    && mkdir -p /app/state/config /app/state/data
+    && mkdir -p /app/state/config /app/state/data \
+    && python -m compileall -q /app/personalityrag /app/run.py
 
 EXPOSE 8765 8766
 VOLUME ["/app/state"]

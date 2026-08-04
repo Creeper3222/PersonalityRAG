@@ -28,19 +28,28 @@ export function createApiClient({
   onUnauthorized = () => {},
   unauthorizedMessage = () => "Unauthorized",
   onOperationalError = () => {},
-  getUnauthorizedGeneration = () => 0,
 } = {}) {
-  return async function api(path, options = {}) {
-    const {
-      suppressUnauthorizedHandler = false,
-      suppressOperationalError = false,
-      ...requestOptions
-    } = options;
-    const headers = { ...(requestOptions.headers || {}) };
-    if (!(requestOptions.body instanceof FormData) && !headers["Content-Type"]) {
-      headers["Content-Type"] = "application/json";
-    }
-    const unauthorizedGeneration = getUnauthorizedGeneration();
+  const inFlightGets = new Map();
+  const signalIds = new WeakMap();
+  let nextSignalId = 1;
+
+  function signalKey(signal) {
+    if (!signal) return "none";
+    if (!signalIds.has(signal)) signalIds.set(signal, nextSignalId++);
+    return String(signalIds.get(signal));
+  }
+
+  function singleFlightKey(path, requestOptions, headers, errorPolicy) {
+    const method = String(requestOptions.method || "GET").toUpperCase();
+    if (method !== "GET" || requestOptions.body != null) return "";
+    const headerKey = Object.entries(headers)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([name, value]) => `${name}:${value}`)
+      .join("|");
+    return `${path}|${headerKey}|${requestOptions.cache || ""}|${signalKey(requestOptions.signal)}|${errorPolicy}`;
+  }
+
+  async function execute(path, requestOptions, headers, suppressUnauthorizedHandler, suppressOperationalError) {
     let response;
     try {
       response = await fetch(baseUrl + path, {
@@ -55,10 +64,7 @@ export function createApiClient({
       throw error;
     }
     if (response.status === 401) {
-      if (
-        !suppressUnauthorizedHandler
-        && unauthorizedGeneration === getUnauthorizedGeneration()
-      ) {
+      if (!suppressUnauthorizedHandler) {
         onUnauthorized();
         throw new ApiError(unauthorizedMessage(), 401);
       }
@@ -72,6 +78,39 @@ export function createApiClient({
       throw error;
     }
     return response.status === 204 ? null : response.json();
+  }
+
+  return async function api(path, options = {}) {
+    const {
+      suppressUnauthorizedHandler = false,
+      suppressOperationalError = false,
+      ...requestOptions
+    } = options;
+    const headers = { ...(requestOptions.headers || {}) };
+    if (!(requestOptions.body instanceof FormData) && !headers["Content-Type"]) {
+      headers["Content-Type"] = "application/json";
+    }
+    const key = singleFlightKey(
+      path,
+      requestOptions,
+      headers,
+      `${suppressUnauthorizedHandler}:${suppressOperationalError}`,
+    );
+    if (key && inFlightGets.has(key)) return inFlightGets.get(key);
+    const request = execute(
+      path,
+      requestOptions,
+      headers,
+      suppressUnauthorizedHandler,
+      suppressOperationalError,
+    );
+    if (!key) return request;
+    inFlightGets.set(key, request);
+    try {
+      return await request;
+    } finally {
+      if (inFlightGets.get(key) === request) inFlightGets.delete(key);
+    }
   };
 }
 

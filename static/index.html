@@ -31,7 +31,8 @@
         <small id="sidebar-library-id">—</small>
         <em id="sidebar-library-provider">—</em>
       </button>
-      <nav>
+      <div class="sidebar-scroll">
+        <nav>
         <button class="nav active" data-page="libraries"><span class="nav-ico"><svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M937.407352 331.085604L511.999488 118.390387 86.591625 331.085604l425.407863 212.695217L937.407352 331.085604zM511.999488 188.985212l284.211405 142.100392L511.999488 473.184973 227.788083 331.085604 511.999488 188.985212zM852.191106 448.012663l85.216245 42.594097L511.999488 703.301977 86.591625 490.606761l85.216245-42.594097 340.191618 170.07656L852.191106 448.012663zM852.191106 607.534843l85.216245 42.594097L511.999488 862.823134 86.591625 650.128941l85.216245-42.594097 340.191618 170.075537L852.191106 607.534843z"></path></svg></span><b data-i18n="libraries">记忆库</b></button>
         <button class="nav" data-page="providers"><span class="nav-ico"><svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M53.333333 384a32 32 0 0 0 64 0h-64z m853.333334 0a32 32 0 0 0 64 0h-64zM117.333333 384V298.666667h-64v85.333333h64z m0-85.333333c0-56.746667 18.773333-101.546667 49.28-132.053334C197.162667 136.106667 241.92 117.333333 298.666667 117.333333v-64c-71.253333 0-133.12 23.893333-177.28 68.053334C77.226667 165.504 53.333333 227.413333 53.333333 298.666667h64zM298.666667 117.333333h426.666666v-64H298.666667v64z m426.666666 0c56.746667 0 101.546667 18.773333 132.053334 49.28C887.893333 197.162667 906.666667 241.92 906.666667 298.666667h64c0-71.253333-23.893333-133.12-68.053334-177.28C858.496 77.226667 796.586667 53.333333 725.333333 53.333333v64zM906.666667 298.666667v85.333333h64V298.666667h-64zM117.333333 640a32 32 0 1 0-64 0h64z m853.333334 0a32 32 0 0 0-64 0h64z m-917.333334 0v85.333333h64v-85.333333h-64z m0 85.333333c0 71.253333 23.893333 133.12 68.053334 177.28C165.504 946.773333 227.413333 970.666667 298.666667 970.666667v-64c-56.746667 0-101.546667-18.773333-132.053334-49.28C136.106667 826.837333 117.333333 782.08 117.333333 725.333333h-64zM298.666667 970.666667h426.666666v-64H298.666667v64z m426.666666 0c71.253333 0 133.12-23.893333 177.28-68.053334C946.773333 858.496 970.666667 796.586667 970.666667 725.333333h-64c0 56.746667-18.773333 101.546667-49.28 132.053334-30.549333 30.506667-75.306667 49.28-132.053334 49.28v64zM970.666667 725.333333v-85.333333h-64v85.333333h64zM301.909333 367.402667a32 32 0 0 0-32.085333 55.381333l32.085333-55.381333zM512 526.08l-16.042667 27.690667a32 32 0 0 0 32.085334 0L512 526.08z m240.469333-102.442667a32 32 0 0 0-32.085333-55.381333l32.085333 55.381333z m-482.645333-0.853333l226.133333 130.986667 32.085334-55.381334-226.133334-130.986666-32.085333 55.381333z m258.218667 130.986667l224.426666-130.133334-32.085333-55.381333-224.426667 130.133333 32.085334 55.381334z"></path><path d="M480 758.186667a32 32 0 0 0 64 0h-64z m64-232.533334a32 32 0 1 0-64 0h64z m0 232.533334v-232.533334h-64v232.533334h64z"></path><path d="M459.093333 268.373333l15.573334 27.946667 0.341333-0.170667-15.914667-27.776z m-136.533333 75.946667l15.530667 27.989333-15.530667-27.989333z m0 335.786667l15.573333-27.946667-0.213333-0.128-15.36 28.074667z m136.533333 75.946666l15.616-27.946666h-0.042666l-15.573334 27.946666z m106.24 0l15.445334 28.032 0.128-0.085333-15.573334-27.946667z m136.533334-75.946666l-15.530667-27.989334 15.530667 27.989334z m0-335.786667l-15.573334 27.946667 0.213334 0.128 15.36-28.074667z m-136.533334-75.946667l-15.786666 27.861334 0.213333 0.085333 15.573333-27.946667z m-121.813333-27.946666l-136.533333 75.946666 31.146666 55.893334 136.533334-75.946667-31.146667-55.893333z m-136.533333 75.946666c-21.504 11.946667-39.296 31.701333-51.626667 52.565334-12.373333 20.906667-21.12 46.08-21.12 70.954666h64c0-10.581333 4.053333-24.618667 12.202667-38.4 8.106667-13.781333 18.474667-24.106667 27.648-29.184l-31.061334-55.978666zM234.24 439.893333v144.64h64v-144.64h-64z m0 144.64c0 24.746667 8.533333 49.92 20.906667 70.869334 12.288 20.949333 30.165333 40.789333 52.053333 52.778666l30.72-56.149333c-9.258667-5.077333-19.541333-15.36-27.605333-29.013333-8.064-13.738667-12.074667-27.818667-12.074667-38.485334h-64z m72.746667 123.52l136.533333 75.946667 31.146667-55.893333-136.533334-75.946667-31.146666 55.893333z m136.533333 75.946667c20.48 11.434667 45.397333 16.213333 68.522667 16.213333 23.168 0 48.128-4.778667 68.693333-16.128l-30.848-56.064c-8.832 4.864-22.485333 8.192-37.845333 8.192s-28.8-3.328-37.333334-8.106666l-31.232 55.893333z m137.386667 0l136.533333-75.946667-31.146667-55.893333-136.533333 75.946667 31.146667 55.893333z m136.533333-75.946667c21.504-11.946667 39.338667-31.701333 51.626667-52.565333 12.373333-20.906667 21.12-46.08 21.12-70.954667h-64c0 10.581333-4.053333 24.618667-12.202667 38.4-8.106667 13.781333-18.474667 24.106667-27.648 29.184l31.061333 55.978667zM790.186667 584.533333v-144.64h-64v144.64h64z m0-144.64c0-24.746667-8.533333-49.92-20.906667-70.869333-12.288-20.949333-30.165333-40.789333-52.053333-52.778667l-30.72 56.149334c9.258667 5.077333 19.541333 15.36 27.605333 29.013333 8.064 13.738667 12.074667 27.818667 12.074667 38.485333h64z m-72.746667-123.52l-136.533333-75.946666-31.146667 55.893333 136.533333 75.946667 31.146667-55.893334z m-136.362667-75.861333c-20.650667-11.690667-45.738667-16.64-69.034666-16.64-23.253333 0-48.298667 4.949333-68.864 16.725333l31.829333 55.552c8.448-4.864 21.76-8.277333 37.034667-8.277333 15.232 0 28.757333 3.413333 37.546666 8.362667l31.488-55.722667z"></path></svg></span><b data-i18n="providers">模型提供商</b></button>
         <button class="nav" data-page="graph"><span class="nav-ico"><svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M490.212766 381.276596c102.28017 0 185.191489 82.911319 185.191489 185.191489s-82.911319 185.191489-185.191489 185.191489-185.191489-82.911319-185.191489-185.191489 82.911319-185.191489 185.191489-185.191489z m0 54.468085c-72.192 0-130.723404 58.531404-130.723404 130.723404s58.531404 130.723404 130.723404 130.723404 130.723404-58.531404 130.723404-130.723404-58.531404-130.723404-130.723404-130.723404zM795.234043 795.234043a98.042553 98.042553 0 1 1 0 196.085106 98.042553 98.042553 0 0 1 0-196.085106z m0 54.468085a43.574468 43.574468 0 1 0 0 87.148936 43.574468 43.574468 0 0 0 0-87.148936zM163.404255 729.87234a98.042553 98.042553 0 1 1 0 196.085107 98.042553 98.042553 0 0 1 0-196.085107z m0 54.468086a43.574468 43.574468 0 1 0 0 87.148936 43.574468 43.574468 0 0 0 0-87.148936zM206.978723 141.617021a98.042553 98.042553 0 1 1 0 196.085107 98.042553 98.042553 0 0 1 0-196.085107z m0 54.468085a43.574468 43.574468 0 1 0 0 87.148937 43.574468 43.574468 0 0 0 0-87.148937z"></path><path d="M263.189787 263.778043l150.081362 172.663829-41.112511 35.731064-150.081361-172.66383zM622.679149 655.948255l150.081362 172.66383-41.112511 35.731064-150.081362-172.66383zM359.957787 636.873532L177.239149 774.547064l32.789787 43.509106 182.685958-137.684425zM718.924255 241.053957L571.882213 416.299574l41.722553 35.012086 147.052936-175.245617z"></path><path d="M806.12766 32.680851c72.192 0 130.723404 58.531404 130.723404 130.723404s-58.531404 130.723404-130.723404 130.723405-130.723404-58.531404-130.723405-130.723405S733.93566 32.680851 806.12766 32.680851z m0 54.468085a76.255319 76.255319 0 1 0 0 152.510638 76.255319 76.255319 0 0 0 0-152.510638z"></path></svg></span><b data-i18n="graph">知识图谱</b></button>
@@ -39,9 +40,12 @@
         <button class="nav" data-page="recall"><span>⌕</span><b data-i18n="recall">召回测试</b></button>
         <button class="nav" data-page="system"><span class="nav-ico"><svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M979.84 771.2H44.16C19.84 771.2 0 751.36 0 727.04V97.28c0-24.32 19.84-44.16 44.16-44.16h936.32c24.32 0 44.16 19.84 44.16 44.16v629.76c-0.64 24.32-20.48 44.16-44.8 44.16zM68.48 702.72h887.68V121.6H68.48v581.12zM160 902.4h700.16v68.48H160z"></path><path d="M474.24 736.64h68.48v199.68h-68.48z m3.2-200.32L369.28 420.48l-72.96 90.24H153.6v-67.84h110.08L365.44 316.8l94.72 100.48L576.64 179.2l115.84 263.68h138.88v67.84H647.68l-74.24-169.6z"></path></svg></span><b data-i18n="system">系统概览</b></button>
         <button class="nav" data-page="settings"><span class="nav-ico"><svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M897.536 614.4a70.314667 70.314667 0 0 1-0.853333 23.552 130.730667 130.730667 0 0 1-8.192 27.648 122.368 122.368 0 0 1-13.824 25.6 49.322667 49.322667 0 0 1-17.066667 16.213333 39.936 39.936 0 0 1-17.066667 4.949334 51.2 51.2 0 0 1-17.066666-3.242667 146.944 146.944 0 0 0-20.309334-4.608 92.16 92.16 0 0 0-24.746666 0 112.981333 112.981333 0 0 0-25.258667 5.290667 46.933333 46.933333 0 0 0-21.504 13.824 79.872 79.872 0 0 0-22.698667 46.250666A91.648 91.648 0 0 0 716.8 819.2a30.378667 30.378667 0 0 1-2.56 32.426667 62.293333 62.293333 0 0 1-15.36 13.482666 165.717333 165.717333 0 0 1-23.210667 12.458667A138.069333 138.069333 0 0 1 648.533333 887.466667a102.4 102.4 0 0 1-24.234666 3.242666 20.48 20.48 0 0 1-13.824-5.632 32.597333 32.597333 0 0 1-9.045334-12.288 100.181333 100.181333 0 0 0-30.378666-43.52 75.264 75.264 0 0 0-50.005334-18.261333 77.312 77.312 0 0 0-50.005333 18.261333 100.010667 100.010667 0 0 0-31.232 42.666667 28.501333 28.501333 0 0 1-12.288 14.336 36.522667 36.522667 0 0 1-17.066667 4.437333 92.501333 92.501333 0 0 1-25.6-4.096 257.536 257.536 0 0 1-28.501333-10.069333 131.242667 131.242667 0 0 1-25.6-14.336 68.266667 68.266667 0 0 1-17.066667-16.213333 24.064 24.064 0 0 1-4.437333-13.482667 48.810667 48.810667 0 0 1 5.973333-21.504A81.066667 81.066667 0 0 0 320.853333 768a73.557333 73.557333 0 0 0-20.821333-44.202667 51.2 51.2 0 0 0-26.965333-16.213333 108.202667 108.202667 0 0 0-30.890667-2.901333 136.533333 136.533333 0 0 0-34.133333 6.485333 33.109333 33.109333 0 0 1-22.869334-1.536 36.181333 36.181333 0 0 1-17.066666-15.189333A143.701333 143.701333 0 0 1 153.6 668.501333a165.888 165.888 0 0 1-9.386667-29.184A69.290667 69.290667 0 0 1 142.336 614.4a25.429333 25.429333 0 0 1 17.066667-22.698667 115.2 115.2 0 0 0 43.861333-32.085333A74.24 74.24 0 0 0 221.866667 509.610667 71.168 71.168 0 0 0 202.581333 460.8a123.392 123.392 0 0 0-43.861333-31.744 21.504 21.504 0 0 1-12.288-11.776 40.106667 40.106667 0 0 1-4.778667-19.114667A95.914667 95.914667 0 0 1 144.896 375.466667 144.896 144.896 0 0 1 153.6 349.525333a121.173333 121.173333 0 0 1 12.117333-22.357333 48.298667 48.298667 0 0 1 15.018667-15.018667 18.090667 18.090667 0 0 1 12.629333-3.242666 66.56 66.56 0 0 1 13.482667 3.242666 96.768 96.768 0 0 0 51.2 5.973334 82.261333 82.261333 0 0 0 46.762667-23.04 56.832 56.832 0 0 0 14.165333-24.064 127.829333 127.829333 0 0 0 5.290667-27.989334 124.586667 124.586667 0 0 0 0-25.258666c0-7.509333-1.536-12.970667-2.048-16.213334a100.522667 100.522667 0 0 1-2.901334-11.434666 17.066667 17.066667 0 0 1 1.194667-11.264 46.250667 46.250667 0 0 1 17.066667-19.968 136.533333 136.533333 0 0 1 27.136-14.165334A162.816 162.816 0 0 1 393.557333 136.533333a105.130667 105.130667 0 0 1 22.016-2.901333 20.821333 20.821333 0 0 1 17.066667 6.826667 39.424 39.424 0 0 1 8.533333 14.336 97.28 97.28 0 0 0 29.354667 38.570666 73.216 73.216 0 0 0 47.957333 17.066667 83.797333 83.797333 0 0 0 50.346667-15.872A85.333333 85.333333 0 0 0 599.210667 153.6a56.32 56.32 0 0 1 10.24-13.482667 19.626667 19.626667 0 0 1 14.165333-6.826666A102.4 102.4 0 0 1 648.533333 136.533333a172.032 172.032 0 0 1 26.453334 8.874667 103.253333 103.253333 0 0 1 23.893333 14.677333 81.237333 81.237333 0 0 1 17.066667 19.456 19.114667 19.114667 0 0 1 2.389333 14.336 51.2 51.2 0 0 1-3.242667 10.922667 86.528 86.528 0 0 0-6.485333 49.664 80.896 80.896 0 0 0 23.552 45.397333 73.045333 73.045333 0 0 0 47.957333 21.504 106.325333 106.325333 0 0 0 52.906667-9.216 23.722667 23.722667 0 0 1 15.701333-3.242666 24.576 24.576 0 0 1 15.872 7.168 96.768 96.768 0 0 1 21.674667 34.133333 193.706667 193.706667 0 0 1 12.458667 46.762667 27.648 27.648 0 0 1-4.437334 21.504 29.184 29.184 0 0 1-12.629333 10.069333 96.426667 96.426667 0 0 0-42.666667 32.256 78.677333 78.677333 0 0 0-17.066666 51.2 81.408 81.408 0 0 0 14.336 47.616 83.285333 83.285333 0 0 0 39.424 29.696 56.661333 56.661333 0 0 1 9.728 6.485333 36.522667 36.522667 0 0 1 12.117333 18.602667z m-378.026667 73.216a175.616 175.616 0 0 0 125.610667-51.2 180.565333 180.565333 0 0 0 37.546667-57.344 179.712 179.712 0 0 0 0-136.533333 177.152 177.152 0 0 0-163.498667-107.690667 170.666667 170.666667 0 0 0-68.266667 13.824 176.981333 176.981333 0 0 0-93.866666 93.866667 177.664 177.664 0 0 0 0 137.386666 183.125333 183.125333 0 0 0 37.717333 56.490667 175.274667 175.274667 0 0 0 56.149333 38.229333 170.666667 170.666667 0 0 0 68.266667 13.824z"></path></svg></span><b data-i18n="settings">基础设置</b></button>
+        <button id="revision-debug-nav" class="nav hidden" data-page="revision-debug"><span class="nav-ico revision-debug-nav-ico" aria-hidden="true"></span><b data-i18n="revisionDebugNav">Debug 高级设置</b></button>
         <button class="nav" data-page="logs"><span class="nav-ico"><svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M0 102.4v819.2a102.4 102.4 0 0 0 102.4 102.4h819.2a102.4 102.4 0 0 0 102.4-102.4V102.4a102.4 102.4 0 0 0-102.4-102.4H102.4a102.4 102.4 0 0 0-102.4 102.4z m114.5856 838.8096a31.232 31.232 0 0 1-31.232-31.0784V248.832H940.544v661.4016a30.976 30.976 0 0 1-31.1296 30.976H114.5856z"></path><path d="M372.4288 358.4h457.4208v82.7904H372.4288V358.4z m0 196.096h457.4208v82.7392H372.4288V554.496z m0 195.8912h457.4208v82.7904H372.4288v-82.7904zM274.2272 460.8v-18.2784H252.928V347.136h-16.7424a73.728 73.728 0 0 1-26.4192 9.5232v13.9776h20.5824v71.8848h-24.4224V460.8h68.352z m1.8432 186.368v-19.0464H251.392c-5.2224 0-12.7488 0.6144-18.432 1.2288 20.736-20.2752 37.7856-42.3936 37.7856-62.976 0-21.1968-14.2848-35.0208-35.7888-35.0208-15.5136 0-25.6 6.144-36.096 17.2032l12.288 12.288c5.6832-6.2976 12.5952-11.6736 20.8896-11.6736 10.752 0 17.0496 6.912 17.0496 18.432 0 17.5104-18.2784 38.912-49.152 66.56v13.0048h76.1856z m-39.936 199.424c21.6576 0 39.936-12.1344 39.936-33.024 0-14.8992-9.8304-24.4224-22.7328-27.9552v-0.768c12.1344-4.7616 19.0464-13.6704 19.0464-25.9584 0-19.5072-14.848-30.2592-36.864-30.2592-13.312 0-24.2688 5.376-34.0992 13.9776l11.52 13.824c6.7584-6.144 13.3632-9.984 21.504-10.1376 9.728 0.1536 15.2064 5.376 15.2064 14.2848 0 10.1376-6.7584 17.3568-27.648 17.3568v16.2816c24.7296 0 31.3344 6.912 31.3344 18.1248 0 10.1376-7.8336 15.8208-19.3536 15.8208-10.24 0-18.5856-5.0688-25.344-11.6736l-10.5984 14.2848c7.9872 9.0624 20.1216 15.8208 38.0928 15.8208z"></path></svg></span><b data-i18n="logs">日志与任务列表</b></button>
         <button class="nav" data-page="files"><span class="nav-ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6.5A2.5 2.5 0 0 1 5.5 4H10l2 2h6.5A2.5 2.5 0 0 1 21 8.5v8A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5v-10Z"></path></svg></span><b data-i18n="files">文件管理</b></button>
-      </nav>
+        <div id="database-type-nav" class="database-type-nav"></div>
+        </nav>
+      </div>
       <div class="sidebar-bottom">
         <button id="theme-toggle" class="nav"><span>☼</span><b data-i18n="theme">切换主题</b></button>
         <select id="language" aria-label="language">
@@ -75,8 +79,12 @@
           </div>
           <div class="row-actions">
             <button id="libraries-refresh" class="ghost" data-i18n="refresh">刷新</button>
-            <button id="library-create" class="primary" data-i18n="createLibrary">新增记忆库</button>
+            <button id="library-create" class="primary" data-i18n="createDatabase">新增数据库</button>
           </div>
+        </div>
+        <div class="database-category-tabs" role="tablist" aria-label="Database category">
+          <button class="database-category-tab active" type="button" data-database-category="memory" aria-selected="true" data-i18n="memoryLibraries">记忆库</button>
+          <button class="database-category-tab" type="button" data-database-category="knowledge" aria-selected="false" data-i18n="knowledgeLibraries">知识库</button>
         </div>
         <div id="library-cards" class="card-grid"></div>
       </section>
@@ -113,210 +121,22 @@
         <div id="provider-cards" class="card-grid provider-grid"></div>
       </section>
 
-      <section id="page-graph" class="page">
-        <div class="page-heading">
-          <div>
-            <h2 data-i18n="graph">知识图谱</h2>
-            <p data-i18n="graphPageHint">查看当前记忆库的关系网络，可手动刷新最新导入或重建后的图谱。</p>
-          </div>
-          <button id="graph-refresh" class="ghost" data-i18n="refresh">刷新</button>
-        </div>
-        <div id="graph-stats" class="stats four"></div>
-        <div class="panel graph-panel">
-          <div class="toolbar">
-            <input id="graph-query" data-i18n-placeholder="graphQuery" placeholder="输入人物、主题、事实或整句">
-            <input id="graph-memory-id" type="number" data-i18n-placeholder="memoryId" placeholder="记忆 ID">
-            <input id="graph-session" data-i18n-placeholder="sessionOptional" placeholder="session_id（可选）">
-            <button id="graph-search" class="primary" data-i18n="searchGraph">检索图谱</button>
-            <button id="graph-overview" class="ghost" data-i18n="overview">最近概览</button>
-          </div>
-          <div id="graph-canvas" class="graph-canvas"><div class="empty" data-i18n="loading">加载中…</div></div>
-          <div id="graph-legend" class="legend"></div>
-          <div id="graph-peek-overlay" class="graph-peek-overlay hidden"></div>
-          <aside id="graph-peek-panel" class="graph-peek-panel" aria-live="polite">
-            <button id="graph-peek-close" class="graph-peek-close" type="button" aria-label="关闭">×</button>
-            <span id="graph-peek-badge" class="graph-peek-badge">node</span>
-            <h3 id="graph-peek-title">节点详情</h3>
-            <div id="graph-peek-body" class="graph-peek-body"></div>
-          </aside>
-        </div>
-      </section>
-
-      <section id="page-memory" class="page">
-        <div class="panel">
-          <div class="toolbar memory-toolbar">
-            <input id="memory-keyword" data-i18n-placeholder="memorySearch" placeholder="搜索正文、元数据或 ID">
-            <input id="memory-persona" data-i18n-placeholder="personaOptional" placeholder="persona_id（可选）">
-            <input id="memory-session" data-i18n-placeholder="sessionOptional" placeholder="session_id（可选）">
-            <select id="memory-status">
-              <option value="" data-i18n="filterStatusAll">全部状态</option>
-              <option value="active" data-i18n="statusActive">正常</option>
-              <option value="archived" data-i18n="statusArchived">归档</option>
-              <option value="deleted" data-i18n="statusDeleted">删除</option>
-            </select>
-            <select id="memory-type">
-              <option value="" data-i18n="filterTypeAll">全部类型</option>
-              <option value="GENERAL" data-i18n="typeGeneral">通用</option>
-              <option value="FACT" data-i18n="typeFact">事实</option>
-              <option value="EVENT" data-i18n="typeEvent">事件</option>
-              <option value="PREFERENCE" data-i18n="typePreference">偏好</option>
-              <option value="OPINION" data-i18n="typeOpinion">观点</option>
-              <option value="FACTUAL" data-i18n="typeFactual">事实型</option>
-              <option value="EPISODIC" data-i18n="typeEpisodic">情节型</option>
-              <option value="RELATIONAL" data-i18n="typeRelational">关系型</option>
-              <option value="PLANNED" data-i18n="typePlanned">计划型</option>
-              <option value="GROUP_CHAT" data-i18n="typeGroupChat">群聊</option>
-              <option value="PRIVATE_CHAT" data-i18n="typePrivateChat">私聊</option>
-              <option value="MANUAL" data-i18n="typeManual">手动写入</option>
-            </select>
-            <select id="memory-sort">
-              <option value="updated_desc" data-i18n="sortUpdatedDesc">最近更新</option>
-              <option value="type_asc" data-i18n="sortTypeAsc">类型 A-Z</option>
-              <option value="created_desc" data-i18n="sortNewest">最新优先</option>
-              <option value="created_asc" data-i18n="sortOldest">最早优先</option>
-              <option value="importance_desc" data-i18n="sortImportanceDesc">重要性从高到低</option>
-              <option value="importance_asc" data-i18n="sortImportanceAsc">重要性从低到高</option>
-            </select>
-            <select id="memory-page-size">
-              <option value="20" data-i18n="perPage20">20 条/页</option>
-              <option value="50" data-i18n="perPage50">50 条/页</option>
-              <option value="100" data-i18n="perPage100">100 条/页</option>
-            </select>
-            <button id="memory-refresh" class="ghost" data-i18n="refresh">刷新</button>
-            <button id="memory-create" class="primary" data-i18n="createMemory">新增记忆</button>
-          </div>
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>ID</th>
-                  <th data-i18n="memorySummary">摘要</th>
-                  <th data-i18n="typeLabel">类型</th>
-                  <th data-i18n="importance">重要性</th>
-                  <th data-i18n="status">状态</th>
-                  <th data-i18n="createdAt">创建时间</th>
-                </tr>
-              </thead>
-              <tbody id="memory-rows"></tbody>
-            </table>
-          </div>
-          <div class="pagination">
-            <button id="memory-prev" class="ghost" data-i18n="previousPage">上一页</button>
-            <span id="memory-page-info"></span>
-            <button id="memory-next" class="ghost" data-i18n="nextPage">下一页</button>
-          </div>
-        </div>
-        <div id="memory-detail-overlay" class="memory-detail-overlay hidden"></div>
-        <aside id="memory-detail-panel" class="memory-detail-panel" aria-live="polite">
-          <button id="memory-detail-close" class="memory-detail-close" type="button" aria-label="关闭">×</button>
-          <span id="memory-detail-badge" class="memory-detail-badge">memory</span>
-          <h3 id="memory-detail-title">记忆详情</h3>
-          <div id="memory-detail-body" class="memory-detail-body"></div>
-        </aside>
-      </section>
-
-      <section id="page-recall" class="page">
-        <div class="page-heading">
-          <div>
-            <h2 data-i18n="recall">召回测试</h2>
-            <p data-i18n="recallPageHint">用当前记忆库执行混合召回，刷新会重新运行上一次查询。</p>
-          </div>
-          <button id="recall-refresh" class="ghost" data-i18n="refresh">刷新</button>
-        </div>
-        <div class="panel recall-form">
-          <textarea id="recall-query" rows="4" data-i18n-placeholder="recallQuery" placeholder="输入要回忆的问题、人物、关系或事件"></textarea>
-          <div class="toolbar recall-toolbar">
-            <label id="recall-k-control" class="recall-k-control">
-              <span data-i18n="topKLabel">嵌入召回条数</span>
-              <div class="recall-k-slider">
-                <input id="recall-k" type="range" min="1" max="50" value="5">
-                <output id="recall-k-value" for="recall-k">5</output>
-              </div>
-            </label>
-            <label id="recall-rerank-k-control" class="recall-k-control">
-              <span data-i18n="rerankKLabel">重排输出条数</span>
-              <div class="recall-k-slider">
-                <input id="recall-rerank-k" type="range" min="1" max="50" value="5">
-                <output id="recall-rerank-k-value" for="recall-rerank-k">5</output>
-              </div>
-            </label>
-            <input id="recall-persona" data-i18n-placeholder="personaOptional" placeholder="persona_id（可选）">
-            <input id="recall-session" data-i18n-placeholder="sessionRecallOptional" placeholder="session_id（当前配置不启用过滤）">
-            <button id="run-recall" class="primary" data-i18n="runRecall">执行召回</button>
-          </div>
-          <div class="recall-view-tabs log-filter-group" role="tablist" aria-label="Recall result view">
-            <button id="recall-view-embedding" class="log-filter active" type="button" data-recall-view="embedding" data-i18n="recallOnlyEmbedding">仅嵌入召回</button>
-            <button id="recall-view-rerank" class="log-filter" type="button" data-recall-view="rerank" data-i18n="recallWithRerank">重排后</button>
-          </div>
-        </div>
-        <div id="recall-summary" class="recall-summary"></div>
-        <div id="recall-results" class="result-list"></div>
-      </section>
 
       <section id="page-system" class="page">
         <div class="page-heading">
-          <div>
-            <h2 data-i18n="system">系统概览</h2>
-            <p data-i18n="systemPageHint">查看当前记忆库统计、索引代次、备份与完整性状态。</p>
-          </div>
-          <button id="system-refresh" class="ghost" data-i18n="refresh">刷新</button>
+          <div><h2 data-i18n="system">系统概览</h2><p data-i18n="globalSystemHint">查看服务状态、全局资源与运行时配置。</p></div>
+          <button id="global-system-refresh" class="ghost" data-i18n="refresh">刷新</button>
         </div>
-        <div id="system-version-stats" class="stats two"></div>
-        <section class="panel system-stats-panel">
-          <div class="panel-copy">
-            <h2 data-i18n="selectedLibraryStatsTitle">当前选中记忆库相关信息</h2>
-            <p class="panel-hint" data-i18n="selectedLibraryStatsHint">以下七项统计仅对应当前选中的记忆库，不代表全部记忆库总量。</p>
-          </div>
-          <div id="system-stats" class="stats seven"></div>
-        </section>
-        <div class="system-grid">
-          <div class="panel">
-            <div class="panel-title">
-              <h2 data-i18n="currentProviderBinding">当前模型绑定</h2>
-              <div class="row-actions">
-                <button id="go-providers" class="ghost" data-i18n="manageProviders">管理 Provider</button>
-              </div>
-            </div>
-            <div id="system-provider-panel" class="system-panel system-provider-panel system-panel-collapsed">
-              <div id="system-provider-primary" class="system-panel-primary system-provider-primary">
-                <pre id="provider-status" data-i18n="loading">加载中…</pre>
-              </div>
-              <button id="system-provider-toggle" class="library-expand-toggle system-panel-toggle system-provider-toggle hidden" type="button" title="展开更多信息" aria-label="展开更多信息" aria-expanded="false">
-                <svg viewBox="0 0 240 24" aria-hidden="true"><circle cx="24" cy="12" r="4.5"/><circle cx="120" cy="12" r="4.5"/><circle cx="216" cy="12" r="4.5"/></svg>
-              </button>
-            </div>
-          </div>
-          <div class="panel">
-            <div class="panel-title">
-              <h2 data-i18n="indexGeneration">索引代次</h2>
-            </div>
-            <div id="system-index-panel" class="system-panel system-index-panel system-panel-collapsed">
-              <div id="system-index-primary" class="system-panel-primary system-index-primary">
-                <pre id="index-status" data-i18n="loading">加载中…</pre>
-              </div>
-              <button id="system-index-toggle" class="library-expand-toggle system-panel-toggle system-index-toggle hidden" type="button" title="展开更多信息" aria-label="展开更多信息" aria-expanded="false">
-                <svg viewBox="0 0 240 24" aria-hidden="true"><circle cx="24" cy="12" r="4.5"/><circle cx="120" cy="12" r="4.5"/><circle cx="216" cy="12" r="4.5"/></svg>
-              </button>
-            </div>
-            <div id="job-progress" class="progress hidden"><div></div><span></span></div>
-          </div>
-          <div class="panel">
-            <h2 data-i18n="importanceDistribution">重要性分布</h2>
-            <div id="importance-chart" class="bars"></div>
-          </div>
-          <div class="panel">
-            <h2 data-i18n="atomTypes">原子类型</h2>
-            <div id="atom-chart" class="bars"></div>
-          </div>
-          <div class="panel wide">
-            <div class="panel-title">
-              <h2 data-i18n="backups">备份与迁移归档</h2>
-              <button id="integrity-check" class="ghost" data-i18n="integrity">完整性检查</button>
-            </div>
-            <div id="backup-list" class="backup-list"></div>
-            <pre id="integrity-result" class="hidden"></pre>
-          </div>
+        <div id="global-system-stats" class="stats four global-system-stats"></div>
+        <div class="system-grid global-system-grid">
+          <section class="panel global-system-panel global-system-service-panel"><h2 data-i18n="serviceOverview">服务概览</h2><div id="global-system-service"></div></section>
+          <section class="panel global-system-panel"><h2 data-i18n="globalResources">全局资源</h2><div id="global-system-resources"></div></section>
+          <section class="panel global-system-panel"><h2 data-i18n="runtimeConfig">运行时配置</h2><div id="global-system-runtime"></div></section>
         </div>
+      </section>
+
+      <section id="page-database" class="page database-type-page">
+        <div id="database-page-host"></div>
       </section>
 
       <section id="page-files" class="page file-page">
@@ -368,7 +188,7 @@
         <div class="page-heading">
           <div>
             <h2 data-i18n="settingsTitle">基础设置</h2>
-            <p data-i18n="settingsHint">管理 WebUI 登录方式、WebUI 端口和记忆库接入端口。端口修改会在下次启动生效；API Token 仍可作为脚本 Bearer 凭据。</p>
+            <p data-i18n="settingsHint">管理私有 WebUI、本机适配器接入端口和独立的公网 HTTPS 适配器地址。端口修改会在下次启动生效。</p>
           </div>
           <button id="settings-refresh" class="ghost" data-i18n="refresh">刷新</button>
         </div>
@@ -389,15 +209,17 @@
           </footer>
         </section>
         <dl class="panel settings-info-grid">
-          <dt data-i18n="currentAccessUrl">当前 WebUI 地址</dt><dd id="settings-access-url">—</dd>
+          <dt data-i18n="currentAccessUrl">本机 WebUI 地址</dt><dd id="settings-access-url">—</dd>
           <dt data-i18n="actualPort">WebUI 本次实际端口</dt><dd id="settings-actual-port">—</dd>
-          <dt data-i18n="currentApiAccessUrl">记忆库接入地址</dt><dd id="settings-api-access-url">—</dd>
-          <dt data-i18n="actualAccessPort">记忆库接入本次实际端口</dt><dd id="settings-actual-access-port">—</dd>
+          <dt data-i18n="currentApiAccessUrl">本机适配器接入地址</dt><dd id="settings-api-access-url">—</dd>
+          <dt data-i18n="actualAccessPort">适配器接入本次实际端口</dt><dd id="settings-actual-access-port">—</dd>
+          <dt data-i18n="publicAdapterUrl">公网适配器 URL</dt><dd id="settings-public-adapter-url-current">—</dd>
           <dt data-i18n="loginMode">登录方式</dt><dd id="settings-login-mode">—</dd>
         </dl>
         <form id="settings-form" class="panel settings-panel">
           <div class="settings-grid">
-            <label class="settings-wide"><span data-i18n="accessBaseUrl">服务接入端点 URL</span><input id="settings-access-base-url" type="url" spellcheck="false" autocomplete="off" inputmode="url" data-i18n-placeholder="accessBaseUrlPlaceholder" placeholder="http://127.0.0.1"></label>
+            <label class="settings-wide"><span data-i18n="accessBaseUrl">本机地址显示基址</span><input id="settings-access-base-url" type="url" spellcheck="false" autocomplete="off" inputmode="url" data-i18n-placeholder="accessBaseUrlPlaceholder" placeholder="http://127.0.0.1"><small data-i18n="accessBaseUrlHint">用于显示本机 WebUI 和接入端口，不代表反向代理后的公网地址。</small></label>
+            <label class="settings-wide"><span data-i18n="publicAdapterUrl">公网适配器 URL</span><input id="settings-public-adapter-url" type="url" spellcheck="false" autocomplete="off" inputmode="url" data-i18n-placeholder="publicAdapterUrlPlaceholder" placeholder="https://memory.example.com"><small data-i18n="publicAdapterUrlHint">可留空。仅接受 HTTPS 根地址，可带自定义端口；不会改变本机绑定地址或端口。</small></label>
             <label><span data-i18n="configuredPort">WebUI 配置端口</span><input id="settings-port" type="number" min="1" max="65535"></label>
             <label><span data-i18n="configuredAccessPort">记忆库接入配置端口</span><input id="settings-access-port" type="number" min="1" max="65535"></label>
             <label><span data-i18n="newLoginPassword">新登录密码</span><input id="settings-password" type="password" autocomplete="new-password" data-i18n-placeholder="passwordKeepPlaceholder" placeholder="留空保持不变"></label>
@@ -411,9 +233,11 @@
             <p class="form-help" data-i18n="runtimeResidencyHint">默认库永久常驻；非默认库会在空闲后释放索引和模型连接，并按最近最少使用顺序控制常驻数量。</p>
           </div>
           <div class="settings-grid">
+            <label class="settings-wide"><span data-i18n="performanceProfile">性能档位</span><select id="settings-performance-profile"><option value="adaptive" data-i18n="performanceProfileAdaptive">自适应平衡</option><option value="latency" data-i18n="performanceProfileLatency">低延迟</option><option value="memory" data-i18n="performanceProfileMemory">低内存</option></select><small data-i18n="performanceProfileHint">仅调整线程、连接池与运行时驻留预算，不改变检索或任务语义。</small></label>
             <label><span data-i18n="runtimeIdleMinutes">非默认库空闲回收分钟数</span><input id="settings-runtime-idle-minutes" type="number" min="1" step="1"></label>
             <label><span data-i18n="runtimeMaxNonDefault">非默认库最大常驻数量</span><input id="settings-runtime-max-non-default" type="number" min="1" step="1"></label>
           </div>
+          <div id="settings-effective-performance" class="effective-performance-grid"></div>
         </section>
         <section class="panel settings-panel backup-migration-panel">
           <div>
@@ -426,10 +250,64 @@
           </footer>
           <input id="backup-migration-import-file" class="hidden" type="file" accept=".prag">
         </section>
+        <section id="revision-debug-settings-card" class="panel settings-panel revision-debug-settings-card">
+          <div class="revision-debug-settings-copy">
+            <span class="revision-debug-settings-icon" aria-hidden="true"></span>
+            <div>
+              <p class="eyebrow">Developer Tools</p>
+              <h3 data-i18n="revisionDebugSettingsTitle">高级 Debug 设置</h3>
+              <p class="form-help" data-i18n="revisionDebugSettingsHint">仅供本机开发调试和二次开发。这里可以检查并修复 Provider revision、数据库绑定和索引代次元数据，错误操作可能导致索引不可用。</p>
+            </div>
+          </div>
+          <dl class="revision-debug-settings-status">
+            <div><dt data-i18n="revisionDebugPasswordState">WebUI 密码</dt><dd id="revision-debug-password-state">—</dd></div>
+            <div><dt data-i18n="revisionDebugUnlockState">Debug 会话</dt><dd id="revision-debug-unlock-state">—</dd></div>
+          </dl>
+          <p id="revision-debug-settings-note" class="revision-debug-warning" data-i18n="revisionDebugRiskNotice">Debug 会话固定有效 15 分钟且不会因刷新续期；危险操作仍需再次输入当前 WebUI 密码。</p>
+          <footer>
+            <button id="revision-debug-enter" class="primary" type="button" disabled data-i18n="revisionDebugVerifyEnter">验证密码并进入</button>
+          </footer>
+        </section>
         <div class="settings-primary-actions settings-page-actions">
           <button class="ghost" type="button" id="settings-restart" data-i18n="restartService">重启</button>
           <button class="primary" type="submit" form="settings-form" data-i18n="saveSettings">保存基础设置</button>
         </div>
+      </section>
+
+      <section id="page-revision-debug" class="page revision-debug-page">
+        <div class="page-heading revision-debug-heading">
+          <div>
+            <p class="eyebrow">PersonalityRAG Internal</p>
+            <h2 data-i18n="revisionDebugTitle">Debug 高级设置</h2>
+            <p data-i18n="revisionDebugPageHint">查看全部 Provider revision、类型化数据库绑定、索引代次与异常，并执行受保护的元数据修复。</p>
+          </div>
+          <div class="revision-debug-heading-actions">
+            <button id="revision-debug-refresh" class="ghost" type="button" data-i18n="refresh">刷新</button>
+            <button id="revision-debug-lock" class="danger-outline" type="button" data-i18n="revisionDebugLockNow">立即锁定</button>
+            <button id="revision-debug-back" class="ghost" type="button" data-i18n="revisionDebugBackSettings">返回基础设置</button>
+          </div>
+        </div>
+        <section class="panel revision-debug-session-hero">
+          <div>
+            <span class="revision-debug-session-label" data-i18n="revisionDebugRemaining">本次解锁剩余时间</span>
+            <strong id="revision-debug-countdown">15:00</strong>
+          </div>
+          <p data-i18n="revisionDebugSessionFixedHint">倒计时固定，不会因刷新页面或执行操作而延长。</p>
+        </section>
+        <div id="revision-debug-summary" class="revision-debug-summary"></div>
+        <section id="revision-debug-issues-panel" class="panel revision-debug-issues-panel hidden">
+          <header><h3 data-i18n="revisionDebugIssues">检测到的异常</h3><span id="revision-debug-issue-count" class="status-pill danger">0</span></header>
+          <div id="revision-debug-issues" class="revision-debug-issues"></div>
+        </section>
+        <section class="panel revision-debug-toolbar">
+          <div class="revision-debug-tabs" role="tablist">
+            <button class="log-filter active" type="button" data-revision-debug-view="providers" data-i18n="revisionDebugProviders">Provider revisions</button>
+            <button class="log-filter" type="button" data-revision-debug-view="databases" data-i18n="revisionDebugDatabases">数据库绑定</button>
+          </div>
+          <label class="revision-debug-filter"><span data-i18n="revisionDebugFilter">筛选</span><input id="revision-debug-filter" type="search" autocomplete="off" data-i18n-placeholder="revisionDebugFilterPlaceholder" placeholder="名称、ID、类型或异常"></label>
+          <span id="revision-debug-captured-at" class="muted"></span>
+        </section>
+        <div id="revision-debug-content" class="revision-debug-content"></div>
       </section>
 
       <section id="page-logs" class="page">
@@ -453,8 +331,12 @@
             </div>
           </div>
           <div id="task-history-panel" class="task-history-panel">
+            <button id="task-history-collapse-top" class="collapse-top-toggle hidden" type="button" aria-controls="task-history-primary">
+              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m6 15 6-6 6 6"></path></svg>
+            </button>
             <div id="task-history-primary" class="task-history-primary">
               <div id="task-list" class="task-list"></div>
+              <button id="tasks-load-more" class="ghost task-load-more hidden" type="button" data-i18n="taskLoadMore">加载更多</button>
             </div>
             <button id="task-history-toggle" class="library-expand-toggle task-history-toggle hidden" type="button" title="展开更多信息" aria-label="展开更多信息" aria-expanded="false">
               <svg viewBox="0 0 240 24" aria-hidden="true"><circle cx="24" cy="12" r="4.5"/><circle cx="120" cy="12" r="4.5"/><circle cx="216" cy="12" r="4.5"/></svg>
@@ -484,6 +366,17 @@
     </main>
   </div>
 
+  <div id="task-detail-overlay" class="task-detail-overlay hidden" aria-hidden="true"></div>
+  <aside id="task-detail-panel" class="task-detail-panel" role="dialog" aria-modal="true" aria-labelledby="task-detail-title" aria-hidden="true">
+    <button id="task-detail-close" class="task-detail-close" type="button" aria-label="关闭">×</button>
+    <header class="task-detail-heading">
+      <p class="eyebrow" data-i18n="taskDetailEyebrow">已结束任务记录</p>
+      <h2 id="task-detail-title" data-i18n="taskDetailTitle">任务详情</h2>
+      <div id="task-detail-subtitle" class="task-detail-subtitle"></div>
+    </header>
+    <div id="task-detail-body" class="task-detail-body" aria-live="polite"></div>
+  </aside>
+
   <div id="modal" class="modal-overlay hidden">
     <form id="memory-form" class="modal">
       <header><h2 id="modal-title">记忆详情</h2><button id="modal-close" type="button" class="icon">×</button></header>
@@ -494,7 +387,6 @@
         <label><span data-i18n="sessionField">会话 ID</span><input id="form-session"></label>
         <label><span data-i18n="importanceField">重要性</span><input id="form-importance" type="number" min="0" max="1" step="0.05" value="0.5"></label>
         <label><span data-i18n="statusField">状态</span><select id="form-status"><option value="active" data-i18n="statusActive">正常</option><option value="archived" data-i18n="statusArchived">归档</option><option value="deleted" data-i18n="statusDeleted">删除</option></select></label>
-        <label><span data-i18n="memoryTypeField">记忆类型</span><input id="form-type" value="GENERAL"></label>
         <label><span data-i18n="topicsField">主题</span><input id="form-topics" data-i18n-placeholder="commaSeparated" placeholder="逗号分隔"></label>
         <label><span data-i18n="participantsField">参与者</span><input id="form-participants" data-i18n-placeholder="commaSeparated" placeholder="逗号分隔"></label>
         <label><span data-i18n="factsField">关键事实</span><input id="form-facts" data-i18n-placeholder="commaSeparated" placeholder="逗号分隔"></label>
@@ -510,9 +402,10 @@
     <form id="library-form" class="modal compact-modal library-modal-panel">
       <header><h2 id="library-modal-title" data-i18n="createLibrary">新增记忆库</h2><button type="button" class="icon modal-dismiss">×</button></header>
       <input id="library-original-id" type="hidden">
+      <input id="library-database-type" type="hidden" value="livingmemory_v8">
       <div class="form-grid library-form-grid">
         <label><span data-i18n="libraryId">记忆库 ID</span><input id="library-id" required title="只能使用[a-zA-Z0-9_-]中的字符来命名ID" placeholder="例如 role_memory"><small id="library-id-readonly-note" class="form-help hidden" data-i18n="defaultLibraryIdLocked">默认记忆库 ID 已锁定，不可修改。</small></label>
-        <label><span data-i18n="displayName">显示名称</span><input id="library-name" required placeholder="例如 贝雷特"></label>
+        <label><span data-i18n="displayName">显示名称</span><input id="library-name" required placeholder="Default"></label>
         <label><span data-i18n="defaultPersonaOptional">默认人格 ID（可选）</span><input id="library-persona" placeholder="仅用于预填，不限制库内人格"></label>
         <label id="library-provider-field"><span data-i18n="embeddingProvider">嵌入模型提供商</span><select id="library-provider" required></select></label>
         <label id="library-rerank-provider-field" class="library-form-right"><span data-i18n="rerankProviderOptional">重排模型提供商（可选）</span><select id="library-rerank-provider"></select></label>
@@ -535,6 +428,11 @@
         <p class="form-help">控制当前记忆库的库级召回语义；适配器或 API 调用方可在请求时单独传入嵌入候选条数，本体侧不再持久化同名设置。</p>
         <div class="settings-rows">
           <label><span class="setting-copy"><strong>重要性权重</strong><small>混合评分中记忆重要性的占比系数。值越大，重要性高的记忆越优先被召回。</small></span><input id="library-importance-weight" type="number" min="0" max="10" step="0.1"></label>
+          <label><span class="setting-copy"><strong data-i18n="minImportanceRetrieval">最低召回重要性</strong><small data-i18n="minImportanceRetrievalHint">低于该重要性的记忆不会进入召回结果。设为 0 表示不限制。</small></span><input id="library-min-importance-retrieval" type="number" min="0" max="1" step="0.05"></label>
+          <label><span class="setting-copy"><strong data-i18n="minSimilarityRetrieval">最低向量相似度</strong><small data-i18n="minSimilarityRetrievalHint">取文档路和图路向量信号中的较大值；纯关键词命中不会因缺少向量分数被误过滤。</small></span><input id="library-min-similarity-retrieval" type="number" min="0" max="1" step="0.05"></label>
+          <label><span class="setting-copy"><strong data-i18n="recentMemoryCount">近期记忆补位数量</strong><small data-i18n="recentMemoryCountHint">按相同会话和人格补入近期正常记忆。设为 0 关闭近期补位。</small></span><input id="library-recent-memory-count" type="number" min="0" max="100" step="1"></label>
+          <label><span class="setting-copy"><strong data-i18n="recentMemoryMaxAge">近期记忆最大年龄（小时）</strong><small data-i18n="recentMemoryMaxAgeHint">仅补入该时间窗口内的近期记忆；设为 0 表示不补入。</small></span><input id="library-recent-memory-max-age" type="number" min="0" max="8760" step="1"></label>
+          <label><span class="setting-copy"><strong data-i18n="memoryTypeFilter">记忆类型过滤</strong><small data-i18n="memoryTypeFilterHint">“仅事件”会排除可明确识别为纯偏好或纯关系的记录，并保留没有类型元数据的旧记忆。</small></span><select id="library-memory-type-filter"><option value="all" data-i18n="memoryTypeAll">全部记忆</option><option value="event_only" data-i18n="memoryTypeEventOnly">仅事件记忆</option></select></label>
           <label class="switch-row"><span class="setting-copy"><strong>启用短期检索缓存</strong><small>短时间内相同会话和相同查询会复用检索结果，降低连续追问时的 SQLite/FAISS 开销。</small></span><span class="switch"><input id="library-search-cache-enabled" type="checkbox"><i></i></span></label>
           <label><span class="setting-copy"><strong>检索缓存 TTL 秒数</strong><small>缓存保留时间。写入、更新、删除记忆时会自动失效。设为 0 可关闭缓存。</small></span><input id="library-search-cache-ttl" type="number" min="0" max="600" step="1"></label>
           <label><span class="setting-copy"><strong>检索缓存最大条目数</strong><small>限制内存中保留的检索结果数量。超过上限时自动淘汰最久未使用的结果。</small></span><input id="library-search-cache-max-size" type="number" min="0" max="10000" step="1"></label>
@@ -599,8 +497,10 @@
         <p class="form-help" data-i18n="cleanupSettingsHint">定期清理时间久远且重要性低的旧记忆，控制记忆库规模</p>
         <div class="settings-rows">
           <label class="switch-row"><span class="setting-copy"><strong data-i18n="autoCleanupEnabled">启用每日自动清理</strong><small>每日重要性衰减后自动清理符合条件的旧记忆。</small></span><span class="switch"><input id="library-auto-cleanup-enabled" type="checkbox"><i></i></span></label>
+          <label class="switch-row"><span class="setting-copy"><strong data-i18n="autoArchiveEnabled">以归档代替删除</strong><small data-i18n="autoArchiveEnabledHint">开启后，自动清理会保留正文与原文并移除派生索引，之后可恢复；关闭时维持物理删除语义。</small></span><span class="switch"><input id="library-auto-archived-enabled" type="checkbox"><i></i></span></label>
           <label><span class="setting-copy"><strong data-i18n="cleanupDaysThreshold">清理天数阈值（天）</strong><small>记忆创建超过该天数后进入清理候选。需同时满足重要性低于阈值才会被删除。</small></span><input id="library-cleanup-days-threshold" type="number" min="1" step="1"></label>
           <label><span class="setting-copy"><strong data-i18n="cleanupImportanceThreshold">清理重要性阈值</strong><small>重要性低于该值的旧记忆才会被清理。0.3 表示重要性低于 30% 的记忆。</small></span><input id="library-cleanup-importance-threshold" type="number" min="0" max="1" step="0.05"></label>
+          <label><span class="setting-copy"><strong data-i18n="protectedImportanceThreshold">衰减保护重要性阈值</strong><small data-i18n="protectedImportanceThresholdHint">达到该阈值的记忆不会参与每日重要性衰减。设为 1 仅保护最高重要性的记忆。</small></span><input id="library-protected-importance-threshold" type="number" min="0" max="1" step="0.05"></label>
         </div>
       </section>
       <footer>
@@ -610,6 +510,30 @@
     </form>
   </div>
 
+  <div id="database-type-modal" class="modal-overlay hidden">
+    <div class="modal provider-type-modal database-type-modal">
+      <header><h2 data-i18n="selectDatabaseType">选择数据库类型</h2><button type="button" class="icon modal-dismiss">×</button></header>
+      <div id="database-type-cards" class="database-type-grid"></div>
+      <footer><button type="button" class="ghost modal-dismiss" data-i18n="cancel">取消</button></footer>
+    </div>
+  </div>
+
+  <div id="text-media-create-modal" class="modal-overlay hidden">
+    <form id="text-media-create-form" class="modal compact-modal text-media-create-modal">
+      <header><h2 data-i18n="textMediaCreateTitle">新增文本媒体知识库</h2><button type="button" class="icon modal-dismiss">×</button></header>
+      <div class="info-banner" data-i18n="textMediaCreateHint">文本用于分块与检索，图片以关联附件保存并随命中结果输出。</div>
+      <div class="form-grid">
+        <label><span data-i18n="knowledgeId">知识库 ID</span><input id="text-media-create-id" required pattern="[a-zA-Z0-9_\-]+" placeholder="character_art"></label>
+        <label><span data-i18n="displayName">显示名称</span><input id="text-media-create-name" required></label>
+        <label class="wide"><span data-i18n="embeddingProvider">嵌入模型提供商</span><select id="text-media-create-provider" required></select></label>
+        <label class="wide"><span data-i18n="rerankProvider">Rerank Provider</span><select id="text-media-create-rerank-provider"></select><small data-i18n="rerankProviderOptionalHint">可选；绑定后检索默认启用 Rerank。</small></label>
+        <label class="wide"><span data-i18n="description">描述</span><textarea id="text-media-create-description" rows="3"></textarea></label>
+      </div>
+      <footer><button type="button" class="ghost modal-dismiss" data-i18n="cancel">取消</button><button class="primary" data-i18n="createKnowledge">创建知识库</button></footer>
+    </form>
+  </div>
+
+
   <div id="library-psk-modal" class="modal-overlay hidden">
     <form id="library-psk-form" class="modal compact-modal">
       <header><h2 id="library-psk-title">记忆库接入密钥</h2><button type="button" class="icon modal-dismiss">×</button></header>
@@ -617,7 +541,14 @@
       <p id="library-psk-hint" class="form-help">输入鉴权密码后生成该记忆库专属的 psk- 密钥。密钥由记忆库 ID 派生，ID 改变后会自动变化。</p>
       <label id="library-psk-password-row"><span>鉴权密码</span><input id="library-psk-password" type="password" autocomplete="current-password" required></label>
       <div id="library-psk-result" class="psk-result hidden">
-        <span>记忆库 ID</span>
+        <span data-i18n="adapterConnectionUrl">适配器连接 URL</span>
+        <div class="psk-value-row">
+          <code id="library-psk-url"></code>
+          <button id="library-psk-url-copy" type="button" class="ghost icon-copy-btn" title="复制 URL" aria-label="复制 URL">
+            <svg viewBox="0 0 1024 1024" aria-hidden="true"><path d="M704 384v512H192V384h512m32-64h-576a32 32 0 0 0-32 32v576a32 32 0 0 0 32 32h576a32 32 0 0 0 32-32v-576a32 32 0 0 0-32-32z"/><path d="M320 512m32 0l192 0q32 0 32 32l0 0q0 32-32 32l-192 0q-32 0-32-32l0 0q0-32 32-32Z"/><path d="M320 704m32 0l192 0q32 0 32 32l0 0q0 32-32 32l-192 0q-32 0-32-32l0 0q0-32 32-32Z"/><path d="M928 128h-576a32 32 0 0 0-32 32V256h64V192h512v576h-64v64h96a32 32 0 0 0 32-32v-640a32 32 0 0 0-32-32z"/></svg>
+          </button>
+        </div>
+        <span data-i18n="databaseId">数据库 ID</span>
         <div class="psk-value-row">
           <code id="library-psk-libid"></code>
           <button id="library-psk-libid-copy" type="button" class="ghost icon-copy-btn" title="复制 ID" aria-label="复制 ID">
@@ -808,6 +739,24 @@
     <div class="file-image-stage"><img id="file-image-viewer-image" alt=""></div>
     <button id="file-image-next" class="file-image-nav file-image-next" type="button" aria-label="下一张">›</button>
   </div>
+  <div id="revision-debug-unlock-modal" class="modal-overlay hidden">
+    <form id="revision-debug-unlock-form" class="modal compact-modal revision-debug-unlock-modal">
+      <header><h2 data-i18n="revisionDebugUnlockTitle">解锁高级 Debug 设置</h2><button type="button" class="icon modal-dismiss">×</button></header>
+      <p class="form-help" data-i18n="revisionDebugUnlockHint">请输入当前 WebUI 登录密码。解锁只对当前管理员会话有效，并将在 15 分钟后自动失效。</p>
+      <label><span data-i18n="revisionDebugPasswordLabel">当前 WebUI 密码</span><input id="revision-debug-unlock-password" type="password" autocomplete="current-password" maxlength="512" required></label>
+      <footer><button type="button" class="ghost modal-dismiss" data-i18n="cancel">取消</button><button class="primary" data-i18n="revisionDebugUnlock">解锁并进入</button></footer>
+    </form>
+  </div>
+  <div id="revision-debug-action-modal" class="modal-overlay hidden">
+    <form id="revision-debug-action-form" class="modal compact-modal revision-debug-action-modal">
+      <header><div><p id="revision-debug-action-eyebrow" class="eyebrow">Revision Debug</p><h2 id="revision-debug-action-title">—</h2></div><button type="button" class="icon modal-dismiss">×</button></header>
+      <p id="revision-debug-action-message" class="form-help"></p>
+      <div id="revision-debug-action-fields" class="revision-debug-action-fields"></div>
+      <label id="revision-debug-action-password-row" class="hidden"><span data-i18n="revisionDebugPasswordAgain">再次输入当前 WebUI 密码</span><input id="revision-debug-action-password" type="password" autocomplete="current-password" maxlength="512"></label>
+      <label id="revision-debug-action-risk-row" class="revision-debug-risk-check hidden"><input id="revision-debug-action-risk" type="checkbox"><span data-i18n="revisionDebugRiskConfirm">我已理解风险，并确认此次人工修复的兼容性。</span></label>
+      <footer><button type="button" class="ghost modal-dismiss" data-i18n="cancel">取消</button><button id="revision-debug-action-submit" class="danger-button" data-i18n="confirmAction">确认</button></footer>
+    </form>
+  </div>
   <div id="confirm-modal" class="modal-overlay hidden">
     <div class="modal compact-modal confirm-modal">
       <header><h2 id="confirm-title">请确认</h2><button type="button" class="icon" id="confirm-close">×</button></header>
@@ -916,6 +865,7 @@
     </section>
   </div>
   <div id="toast" class="toast"></div>
+  <script src="/static/modules/livingmemory-253-graph-2d.js"></script>
   <script type="module" src="/static/app.js"></script>
 </body>
 </html>

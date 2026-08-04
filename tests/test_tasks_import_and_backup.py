@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import shutil
 import sqlite3
@@ -129,7 +130,7 @@ async def test_backup_contains_livingmemory_and_conversations_db(
         lambda config: FakeProvider(config),
     )
     monkeypatch.setattr(
-        "personalityrag.libraries.build_provider",
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider",
         lambda config: FakeProvider(config),
     )
     manager = LibraryManager(root, AppConfig(provider=provider_config))
@@ -179,7 +180,7 @@ async def test_library_disallows_import_after_first_memory_write(
         lambda config: FakeProvider(config),
     )
     monkeypatch.setattr(
-        "personalityrag.libraries.build_provider",
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider",
         lambda config: FakeProvider(config),
     )
     manager = LibraryManager(root, AppConfig(provider=provider_config))
@@ -225,7 +226,7 @@ async def test_rebuild_library_recovers_missing_graph_entries(
         lambda config: FakeProvider(config),
     )
     monkeypatch.setattr(
-        "personalityrag.libraries.build_provider",
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider",
         lambda config: FakeProvider(config),
     )
     manager = LibraryManager(root, AppConfig(provider=provider_config))
@@ -248,8 +249,11 @@ async def test_rebuild_library_recovers_missing_graph_entries(
 
         assert result["graph_recovery"]["rebuilt"] is True
         assert stats["graph_entries"] > 0
+        runtime = await manager.get_runtime("Default")
         assert runtime.indexes.status()["document_vectors"] == stats["total_memories"]
-        assert runtime.indexes.status()["graph_vectors"] == stats["graph_entries"]
+        assert runtime.indexes.status()["graph_vectors"] == len(
+            await runtime.storage.graph_memory_ids()
+        )
     finally:
         await manager.close()
 
@@ -265,7 +269,7 @@ async def test_rebuild_graph_forces_graph_entry_backfill_and_index_rebuild(
         lambda config: FakeProvider(config),
     )
     monkeypatch.setattr(
-        "personalityrag.libraries.build_provider",
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider",
         lambda config: FakeProvider(config),
     )
     manager = LibraryManager(root, AppConfig(provider=provider_config))
@@ -291,7 +295,10 @@ async def test_rebuild_graph_forces_graph_entry_backfill_and_index_rebuild(
         assert stats["graph_entries"] > 0
         assert result["manifest"]["document_count"] == stats["total_memories"]
         assert result["manifest"]["graph_entry_count"] == stats["graph_entries"]
-        assert runtime.indexes.status()["graph_vectors"] == stats["graph_entries"]
+        runtime = await manager.get_runtime("Default")
+        assert runtime.indexes.status()["graph_vectors"] == len(
+            await runtime.storage.graph_memory_ids()
+        )
     finally:
         await manager.close()
 
@@ -327,7 +334,7 @@ async def test_daily_maintenance_applies_access_aware_decay_once(
     try:
         now = time.time()
         memory_id = await service.storage.create_memory(
-            {"content": "高访问记忆", "importance": 1.0},
+            {"content": "高访问记忆", "importance": 0.9},
             service.text.tokenize,
             service.graph_builder.build,
         )
@@ -335,7 +342,7 @@ async def test_daily_maintenance_applies_access_aware_decay_once(
             memory_id,
             {
                 "metadata": {
-                    "importance": 1.0,
+                        "importance": 0.9,
                     "access_count": 10,
                     "last_access_time": now,
                     "create_time": now - 3 * 86400,
@@ -349,14 +356,14 @@ async def test_daily_maintenance_applies_access_aware_decay_once(
         assert result["daily_maintenance_ran"] is True
         updated = await service.storage.get_document(memory_id)
         assert updated is not None
-        assert updated["metadata"]["importance"] == pytest.approx(0.95)
+        assert updated["metadata"]["importance"] == pytest.approx(0.855)
         assert updated["metadata"]["access_count"] == 5
 
         second_result = await service.run_maintenance()
         assert second_result["daily_maintenance_ran"] is False
         unchanged = await service.storage.get_document(memory_id)
         assert unchanged is not None
-        assert unchanged["metadata"]["importance"] == pytest.approx(0.95)
+        assert unchanged["metadata"]["importance"] == pytest.approx(0.855)
         assert unchanged["metadata"]["access_count"] == 5
     finally:
         await service.close()
@@ -533,6 +540,17 @@ async def test_import_livingmemory_db_requires_empty_library_and_rebuilds(
             "metadata": {"pending_summary": True},
         }
     )
+    await source_storage.update_conversation_metadata(
+        "astrbot:group:new",
+        {
+            "last_summarized_index": 0,
+            "pending_summary": {
+                "start_index": 0,
+                "end_index": 3,
+                "retry_count": 2,
+            },
+        },
+    )
     upload_db = tmp_path / "upload" / "livingmemory.db"
     upload_conversations_db = tmp_path / "upload" / "conversations.db"
     upload_db.parent.mkdir(parents=True)
@@ -545,7 +563,7 @@ async def test_import_livingmemory_db_requires_empty_library_and_rebuilds(
         lambda config: FakeProvider(config),
     )
     monkeypatch.setattr(
-        "personalityrag.libraries.build_provider",
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider",
         lambda config: FakeProvider(config),
     )
     manager = LibraryManager(root, AppConfig(provider=provider_config))
@@ -557,6 +575,15 @@ async def test_import_livingmemory_db_requires_empty_library_and_rebuilds(
         assert result["stats"]["total_memories"] == 1
         assert result["conversations_source"]["counts"]["sessions"] == 1
         assert result["conversations_source"]["counts"]["messages"] == 1
+        assert result["conversations_source"]["counts"]["pending_messages"] == 1
+        assert result["conversations_source"]["counts"]["pending_summaries"] == 1
+        assert result["conversations_source"]["validation"][
+            "pending_ranges_out_of_range"
+        ] == 1
+        assert (
+            result["conversations_source"]["normalized_hashes"]
+            == result["conversations_target"]["normalized_hashes"]
+        )
         assert result["stats"]["conversation_counts"]["sessions"] == 1
         assert result["stats"]["conversation_counts"]["messages"] == 1
         assert result["stats"]["conversation_counts"]["pending_messages"] == 1
@@ -566,8 +593,18 @@ async def test_import_livingmemory_db_requires_empty_library_and_rebuilds(
         conversation = await runtime.storage.get_conversation("astrbot:group:new")
         assert conversation is not None
         assert conversation["messages"][0]["content"] == "这条消息还没有被总结。"
+        assert conversation["session"]["metadata"] == {
+            "last_summarized_index": 0,
+            "pending_summary": {
+                "start_index": 0,
+                "end_index": 3,
+                "retry_count": 2,
+            },
+        }
         assert runtime.indexes.status()["document_vectors"] == 1
-        assert runtime.indexes.status()["graph_vectors"] == result["stats"]["graph_entries"]
+        assert runtime.indexes.status()["graph_vectors"] == len(
+            await runtime.storage.graph_memory_ids()
+        )
         assert not upload_db.exists()
         assert not upload_conversations_db.exists()
 
@@ -576,5 +613,82 @@ async def test_import_livingmemory_db_requires_empty_library_and_rebuilds(
         shutil.copy2(source_dir / "livingmemory.db", second_upload)
         with pytest.raises(ValueError, match="只有全新空记忆库"):
             await manager.import_livingmemory_db("Default", second_upload)
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_single_livingmemory_db_import_rebuilds_identical_indexes_repeatedly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "single-db-source"
+    source_storage = Storage(source_dir)
+    await source_storage.initialize()
+    for content, topic in (
+        ("Alice maintains the compatibility checklist", "compatibility"),
+        ("Bob verifies the deterministic rebuild", "verification"),
+    ):
+        await source_storage.create_memory(
+            {"content": content, "topics": [topic]},
+            TextProcessor().tokenize,
+            GraphBuilder().build,
+        )
+    assert not await source_storage.has_memory_sources_table()
+    await source_storage.close()
+
+    upload_db = tmp_path / "upload-single" / "livingmemory.db"
+    upload_db.parent.mkdir(parents=True)
+    shutil.copy2(source_dir / "livingmemory.db", upload_db)
+    assert not (upload_db.parent / "conversations.db").exists()
+
+    provider_config = ProviderConfig(id="single_db_fake", dimensions=8)
+    monkeypatch.setattr(
+        "personalityrag.service.build_provider",
+        lambda config: FakeProvider(config),
+    )
+    monkeypatch.setattr(
+        "personalityrag.library_types.livingmemory_v8.manager.build_provider",
+        lambda config: FakeProvider(config),
+    )
+    manager = LibraryManager(
+        tmp_path / "single-db-core",
+        AppConfig(provider=provider_config),
+    )
+    await manager.initialize()
+    try:
+        imported = await manager.import_livingmemory_db("Default", upload_db)
+        assert imported["conversations_source"] is None
+        assert imported["conversations_target"] is None
+        assert imported["stats"]["total_memories"] == 2
+        assert imported["stats"]["conversation_counts"] == {
+            "sessions": 0,
+            "messages": 0,
+            "pending_messages": 0,
+        }
+
+        runtime = await manager.get_runtime("Default")
+        observed: list[tuple[str, str, str, str]] = []
+
+        def index_sha256(path: Path) -> str:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+
+        for _ in range(3):
+            status = runtime.indexes.status()
+            manifest = dict(status["manifest"])
+            generation_dir = runtime.indexes.root / str(status["generation"])
+            observed.append(
+                (
+                    index_sha256(generation_dir / "documents.index"),
+                    index_sha256(generation_dir / "graph.index"),
+                    str(manifest["document_ids_sha256"]),
+                    str(manifest["graph_vector_content_sha256"]),
+                )
+            )
+            await manager.rebuild_library("Default", provider_config.id)
+
+        assert len(set(observed)) == 1
+        assert runtime.indexes.indexed_ids() == ({1, 2}, {1, 2})
+        assert (await runtime.storage.statistics())["graph_entries"] > 0
     finally:
         await manager.close()

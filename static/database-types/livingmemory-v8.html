@@ -1,0 +1,233 @@
+      <section id="page-graph" class="page">
+        <div class="page-heading graph-page-heading">
+          <div>
+            <h2 data-i18n="graph">知识图谱</h2>
+            <p data-i18n="graphPageHint">查看当前记忆库的关系网络，可手动刷新最新导入或重建后的图谱。</p>
+          </div>
+          <div class="graph-page-actions">
+            <input id="graph-session" data-i18n-placeholder="sessionOptional" placeholder="session_id（可选）">
+            <button id="graph-overview" class="ghost" data-i18n="fullGraph">全量图谱</button>
+            <button id="graph-refresh" class="ghost" data-i18n="refresh">刷新</button>
+          </div>
+        </div>
+        <div id="graph-stats" class="stats four"></div>
+        <div class="panel graph-panel">
+          <div class="graph-canvas-container">
+            <div class="graph-canvas-coordinate" aria-hidden="true">LIVE GRAPH / XY</div>
+            <div id="graph-canvas-state" class="graph-canvas-state" data-i18n="graphLoadingOverview">正在加载图谱概览…</div>
+            <div id="graph-canvas" class="graph-canvas"></div>
+          </div>
+          <div id="graph-legend" class="graph-legend"></div>
+          <div class="graph-toolbar">
+            <input id="graph-query" data-i18n-placeholder="graphQuery" placeholder="输入人物、主题、事实或整句">
+            <input id="graph-memory-id" type="number" data-i18n-placeholder="memoryId" placeholder="记忆 ID">
+            <button id="graph-search" class="primary" data-i18n="searchGraph">检索图谱</button>
+            <button id="graph-focus" class="ghost" data-i18n="focusGraph">聚焦记忆</button>
+          </div>
+          <div id="graph-peek-overlay" class="graph-peek-overlay hidden"></div>
+          <aside id="graph-peek-panel" class="graph-peek-panel" aria-live="polite">
+            <button id="graph-peek-close" class="graph-peek-close" type="button" aria-label="关闭">×</button>
+            <span id="graph-peek-badge" class="graph-peek-badge">node</span>
+            <h3 id="graph-peek-title">节点详情</h3>
+            <div id="graph-peek-body" class="graph-peek-body"></div>
+          </aside>
+        </div>
+      </section>
+
+      <section id="page-memory" class="page">
+        <div class="panel">
+          <div class="toolbar memory-toolbar">
+            <input id="memory-keyword" data-i18n-placeholder="memorySearch" placeholder="搜索正文、元数据或 ID">
+            <input id="memory-persona" data-i18n-placeholder="personaOptional" placeholder="persona_id（可选）">
+            <input id="memory-session" data-i18n-placeholder="sessionOptional" placeholder="session_id（可选）">
+            <select id="memory-status">
+              <option value="" data-i18n="filterStatusAll">全部状态</option>
+              <option value="active" data-i18n="statusActive">正常</option>
+              <option value="archived" data-i18n="statusArchived">归档</option>
+              <option value="deleted" data-i18n="statusDeleted">删除</option>
+            </select>
+            <select id="memory-sort">
+              <option value="updated_desc" data-i18n="sortUpdatedDesc">最近更新</option>
+              <option value="created_desc" data-i18n="sortNewest">最新优先</option>
+              <option value="created_asc" data-i18n="sortOldest">最早优先</option>
+              <option value="importance_desc" data-i18n="sortImportanceDesc">重要性从高到低</option>
+              <option value="importance_asc" data-i18n="sortImportanceAsc">重要性从低到高</option>
+            </select>
+            <select id="memory-page-size">
+              <option value="20" data-i18n="perPage20">20 条/页</option>
+              <option value="50" data-i18n="perPage50">50 条/页</option>
+              <option value="100" data-i18n="perPage100">100 条/页</option>
+            </select>
+            <button id="memory-refresh" class="ghost" data-i18n="refresh">刷新</button>
+            <button id="memory-create" class="primary" data-i18n="createMemory">新增记忆</button>
+          </div>
+          <div class="memory-selection-bar">
+            <label><input id="memory-select-page" type="checkbox"><span data-i18n="selectCurrentPage">选择当前页</span></label>
+            <span id="memory-selected-count" class="pill"></span>
+            <label class="memory-batch-importance"><span data-i18n="batchImportance">批量重要性</span><input id="memory-batch-importance" type="number" min="0" max="10" step="0.1" value="5.0"></label>
+            <button id="memory-batch-importance-apply" type="button" class="ghost" disabled data-i18n="applyBatchImportance">应用重要性</button>
+            <button id="memory-batch-archive" type="button" class="ghost" disabled data-i18n="archiveSelected">归档所选</button>
+            <button id="memory-batch-restore" type="button" class="ghost" disabled data-i18n="restoreSelected">恢复所选</button>
+            <button id="memory-batch-delete" type="button" class="ghost danger" disabled data-i18n="deleteSelectedMemories">删除所选</button>
+          </div>
+          <div class="table-wrap memory-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th class="memory-select-column"><span class="sr-only" data-i18n="selectMemory">选择记忆</span></th>
+                  <th>ID</th>
+                  <th data-i18n="memorySummary">摘要</th>
+                  <th data-i18n="importance">重要性</th>
+                  <th data-i18n="status">状态</th>
+                  <th data-i18n="createdAt">创建时间</th>
+                </tr>
+              </thead>
+              <tbody id="memory-rows"></tbody>
+            </table>
+          </div>
+          <div class="pagination">
+            <button id="memory-prev" class="ghost" data-i18n="previousPage">上一页</button>
+            <span id="memory-page-info"></span>
+            <button id="memory-next" class="ghost" data-i18n="nextPage">下一页</button>
+          </div>
+        </div>
+        <section class="panel memory-transfer-panel">
+          <div class="panel-title">
+            <div>
+              <h2 data-i18n="memoryTransferTitle">便携迁移</h2>
+              <p class="panel-hint" data-i18n="memoryTransferHint">使用 PersonalityRAG 原生 JSON 或 CSV 导入、导出记忆；向量和图索引不会从外部文件复用。</p>
+            </div>
+            <div class="row-actions">
+              <select id="memory-transfer-export-format" aria-label="Export format"><option value="json">JSON</option><option value="csv">CSV</option></select>
+              <button id="memory-transfer-export" type="button" class="ghost" data-i18n="exportMemories">导出记忆</button>
+            </div>
+          </div>
+          <div class="memory-transfer-import-grid">
+            <label id="memory-transfer-drop-zone" class="drop-zone">
+              <span data-i18n="dropMemoryTransfer">拖入 JSON 或 CSV 文件，或点击选择</span>
+              <input id="memory-transfer-file" type="file" accept=".json,.csv,application/json,text/csv">
+            </label>
+            <div class="memory-transfer-options">
+              <label><span data-i18n="duplicatePolicy">重复项策略</span><select id="memory-transfer-duplicate-mode"><option value="skip" data-i18n="skipDuplicates">跳过重复项</option><option value="allow" data-i18n="allowDuplicates">允许重复项</option></select></label>
+              <button id="memory-transfer-preview" type="button" class="primary" data-i18n="previewImport">预检导入</button>
+            </div>
+          </div>
+          <div id="memory-transfer-preview-result" class="memory-transfer-preview hidden" aria-live="polite"></div>
+        </section>
+        <div id="memory-detail-overlay" class="memory-detail-overlay hidden"></div>
+        <aside id="memory-detail-panel" class="memory-detail-panel" aria-live="polite" aria-hidden="true" inert>
+          <button id="memory-detail-close" class="memory-detail-close" type="button" aria-label="关闭">×</button>
+          <h3 id="memory-detail-title">记忆详情</h3>
+          <div id="memory-detail-body" class="memory-detail-body"></div>
+        </aside>
+      </section>
+
+      <section id="page-recall" class="page">
+        <div class="page-heading">
+          <div>
+            <h2 data-i18n="recall">召回测试</h2>
+            <p data-i18n="recallPageHint">用当前记忆库执行混合召回；刷新会保留查询、清空结果并恢复默认请求参数，不会执行召回。</p>
+          </div>
+          <button id="recall-refresh" class="ghost" data-i18n="refresh">刷新</button>
+        </div>
+        <div class="panel recall-form">
+          <textarea id="recall-query" rows="4" data-i18n-placeholder="recallQuery" placeholder="输入要回忆的问题、人物、关系或事件"></textarea>
+          <div class="toolbar recall-toolbar">
+            <label id="recall-k-control" class="recall-k-control">
+              <span data-i18n="topKLabel">嵌入召回条数</span>
+              <div class="recall-k-slider">
+                <input id="recall-k" type="range" min="1" max="50" value="5">
+                <output id="recall-k-value" for="recall-k">5</output>
+              </div>
+            </label>
+            <label id="recall-rerank-k-control" class="recall-k-control">
+              <span data-i18n="rerankKLabel">重排输出条数</span>
+              <div class="recall-k-slider">
+                <input id="recall-rerank-k" type="range" min="1" max="50" value="5">
+                <output id="recall-rerank-k-value" for="recall-rerank-k">5</output>
+              </div>
+            </label>
+            <input id="recall-persona" data-i18n-placeholder="personaOptional" placeholder="persona_id（可选）">
+            <input id="recall-session" data-i18n-placeholder="sessionRecallOptional" placeholder="session_id（当前配置不启用过滤）">
+            <button id="run-recall" class="primary" data-i18n="runRecall">执行召回</button>
+          </div>
+          <div class="recall-view-tabs log-filter-group" role="tablist" aria-label="Recall result view">
+            <button id="recall-view-embedding" class="log-filter active" type="button" data-recall-view="embedding" data-i18n="recallOnlyEmbedding">仅嵌入召回</button>
+            <button id="recall-view-rerank" class="log-filter" type="button" data-recall-view="rerank" data-i18n="recallWithRerank">重排后</button>
+          </div>
+        </div>
+        <div id="recall-summary" class="recall-summary"></div>
+        <div id="recall-results" class="result-list"></div>
+      </section>
+
+      <section id="page-library-overview" class="page">
+        <div class="page-heading">
+          <div>
+            <h2 data-i18n="libraryOverview">库概览</h2>
+            <p data-i18n="systemPageHint">查看当前记忆库统计、索引代次、备份与完整性状态。</p>
+          </div>
+          <button id="system-refresh" class="ghost" data-i18n="refresh">刷新</button>
+        </div>
+        <div id="system-version-stats" class="stats two"></div>
+        <section class="panel system-stats-panel">
+          <div class="panel-copy">
+            <h2 data-i18n="selectedLibraryStatsTitle">当前选中记忆库相关信息</h2>
+            <p class="panel-hint" data-i18n="selectedLibraryStatsHint">以下七项统计仅对应当前选中的记忆库，不代表全部记忆库总量。</p>
+          </div>
+          <div id="system-stats" class="stats seven"></div>
+        </section>
+        <div class="system-grid">
+          <div class="panel">
+            <div class="panel-title">
+              <h2 data-i18n="currentProviderBinding">当前模型绑定</h2>
+              <div class="row-actions">
+                <button id="go-providers" class="ghost" data-i18n="manageProviders">管理 Provider</button>
+              </div>
+            </div>
+            <div id="system-provider-panel" class="system-panel system-provider-panel system-panel-collapsed">
+              <button id="system-provider-collapse-top" class="collapse-top-toggle hidden" type="button" aria-controls="system-provider-primary">
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m6 15 6-6 6 6"></path></svg>
+              </button>
+              <div id="system-provider-primary" class="system-panel-primary system-provider-primary">
+                <pre id="provider-status" data-i18n="loading">加载中…</pre>
+              </div>
+              <button id="system-provider-toggle" class="library-expand-toggle system-panel-toggle system-provider-toggle hidden" type="button" title="展开更多信息" aria-label="展开更多信息" aria-expanded="false">
+                <svg viewBox="0 0 240 24" aria-hidden="true"><circle cx="24" cy="12" r="4.5"/><circle cx="120" cy="12" r="4.5"/><circle cx="216" cy="12" r="4.5"/></svg>
+              </button>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-title">
+              <h2 data-i18n="indexGeneration">索引代次</h2>
+            </div>
+            <div id="system-index-panel" class="system-panel system-index-panel system-panel-collapsed">
+              <button id="system-index-collapse-top" class="collapse-top-toggle hidden" type="button" aria-controls="system-index-primary">
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m6 15 6-6 6 6"></path></svg>
+              </button>
+              <div id="system-index-primary" class="system-panel-primary system-index-primary">
+                <pre id="index-status" data-i18n="loading">加载中…</pre>
+              </div>
+              <button id="system-index-toggle" class="library-expand-toggle system-panel-toggle system-index-toggle hidden" type="button" title="展开更多信息" aria-label="展开更多信息" aria-expanded="false">
+                <svg viewBox="0 0 240 24" aria-hidden="true"><circle cx="24" cy="12" r="4.5"/><circle cx="120" cy="12" r="4.5"/><circle cx="216" cy="12" r="4.5"/></svg>
+              </button>
+            </div>
+            <div id="job-progress" class="progress hidden"><div></div><span></span></div>
+          </div>
+          <div class="panel">
+            <h2 data-i18n="importanceDistribution">重要性分布</h2>
+            <div id="importance-chart" class="bars"></div>
+          </div>
+          <div class="panel">
+            <h2 data-i18n="atomTypes">原子类型</h2>
+            <div id="atom-chart" class="bars"></div>
+          </div>
+          <div class="panel wide">
+            <div class="panel-title">
+              <h2 data-i18n="backups">备份与迁移归档</h2>
+              <button id="integrity-check" class="ghost" data-i18n="integrity">完整性检查</button>
+            </div>
+            <div id="backup-list" class="backup-list"></div>
+            <pre id="integrity-result" class="hidden"></pre>
+          </div>
+        </div>
+      </section>

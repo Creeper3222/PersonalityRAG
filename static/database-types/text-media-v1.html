@@ -1,0 +1,304 @@
+  <div id="text-media-workspace-modal" class="modal-overlay text-media-workspace-overlay hidden">
+    <section class="modal text-media-workspace-modal" role="dialog" aria-modal="true" aria-labelledby="text-media-workspace-title">
+      <header class="text-media-workspace-header">
+        <div><p class="eyebrow" data-i18n="textMediaTypeName">文本媒体知识库 v1</p><h2 id="text-media-workspace-title"></h2><small id="text-media-workspace-id"></small></div>
+        <div class="row-actions text-media-page-actions"><button id="text-media-page-refresh" type="button" class="ghost" data-i18n="refresh">刷新</button></div>
+        <button type="button" class="icon modal-dismiss" aria-label="Close">×</button>
+      </header>
+      <nav class="text-media-tabs" role="tablist">
+        <button type="button" class="text-media-tab active" data-text-media-tab="content" data-i18n="knowledgeContentManagement">内容管理</button>
+        <button type="button" class="text-media-tab" data-text-media-tab="search" data-i18n="knowledgeSearchTest">检索测试</button>
+        <button type="button" class="text-media-tab" data-text-media-tab="settings" data-i18n="settings">设置</button>
+      </nav>
+      <div class="text-media-workspace-body">
+        <section class="text-media-view active" data-text-media-view="content">
+          <section class="panel text-media-upload-bar">
+            <div><span class="eyebrow" data-i18n="batchContentIngest">批次内容导入</span><h3 data-i18n="uploadDocumentsAndMedia">上传文档与图片</h3><p data-i18n="batchContentIngestHint">同一批次统一完成文本分块、Embedding 与图片关联，任一步失败都会完整回滚。</p></div>
+            <button id="text-media-ingest-open" type="button" class="primary" data-i18n="openBatchUpload">上传</button>
+          </section>
+          <section class="panel text-media-content-system" aria-labelledby="text-media-text-module-title">
+            <header class="text-media-section-heading">
+              <div><span class="eyebrow" data-i18n="textManagement">文本管理</span><h3 id="text-media-text-module-title" data-i18n="documentAndChunkReview">文档与分块审阅</h3><p data-i18n="documentAndChunkReviewHint">按源文档管理内容，或只读检查索引分块及其媒体证据。</p></div>
+              <div class="text-media-mode-switch" role="tablist"><button id="text-media-document-mode" type="button" class="active" role="tab" aria-selected="true" data-i18n="documents">文档</button><button id="text-media-chunk-mode" type="button" role="tab" aria-selected="false" data-i18n="chunks">分块</button></div>
+            </header>
+            <div id="text-media-document-review" class="text-media-review-view active">
+              <div class="text-media-review-toolbar"><input id="text-media-document-search" type="search" data-i18n-placeholder="searchDocuments" placeholder="搜索文档名称"><select id="text-media-document-sort" aria-label="Sort documents"><option value="created_desc" data-i18n="newestFirst">最新上传</option><option value="created_asc" data-i18n="oldestFirst">最早上传</option><option value="title_asc" data-i18n="nameAscending">名称升序</option><option value="title_desc" data-i18n="nameDescending">名称降序</option></select><select id="text-media-document-page-size" aria-label="Page size"><option value="10">10 / 页</option><option value="20" selected>20 / 页</option><option value="50">50 / 页</option></select></div>
+              <div class="text-media-selection-bar"><label><input id="text-media-document-select-page" type="checkbox"><span data-i18n="selectCurrentPage">选择当前页</span></label><span id="text-media-document-selected-count" class="pill"></span><button id="text-media-document-batch-delete" type="button" class="ghost danger" disabled data-i18n="deleteSelectedDocuments">删除所选文档</button></div>
+              <div id="text-media-document-list" class="text-media-review-list"></div><nav id="text-media-document-pagination" class="text-media-pagination" aria-label="Document pages"></nav>
+            </div>
+            <div id="text-media-chunk-review" class="text-media-review-view">
+              <div class="text-media-review-toolbar text-media-chunk-toolbar"><input id="text-media-chunk-search" type="search" data-i18n-placeholder="searchChunks" placeholder="搜索分块正文或标题"><select id="text-media-chunk-document-filter" aria-label="Filter chunks by document"></select><select id="text-media-chunk-sort" aria-label="Sort chunks"><option value="ordinal_asc" data-i18n="documentOrder">文档顺序</option><option value="ordinal_desc" data-i18n="reverseDocumentOrder">文档倒序</option><option value="id_desc" data-i18n="newestChunkFirst">最新分块</option></select><select id="text-media-chunk-page-size" aria-label="Page size"><option value="10">10 / 页</option><option value="20" selected>20 / 页</option><option value="50">50 / 页</option></select></div>
+              <div id="text-media-chunk-list" class="text-media-review-list"></div><nav id="text-media-chunk-pagination" class="text-media-pagination" aria-label="Chunk pages"></nav>
+            </div>
+            <section class="text-media-media-module" aria-labelledby="text-media-media-module-title"><div class="text-media-section-heading text-media-media-heading"><div><span class="eyebrow" data-i18n="mediaManagement">媒体管理</span><h3 id="text-media-media-module-title" data-i18n="imageAssets">图片资源</h3><p data-i18n="knowledgeMediaModuleHint">管理图片资源，并检查其文档、条目或分块关系。</p></div></div><div id="text-media-asset-grid" class="text-media-asset-grid"></div></section>
+          </section>
+        </section>
+
+        <section class="text-media-view" data-text-media-view="search">
+          <form id="text-media-search-form" class="panel text-media-search-form">
+            <div class="text-media-retrieval-mode-switch log-filter-group" role="tablist" aria-label="Retrieval mode"><button id="text-media-search-mode-standard" class="log-filter active" type="button" data-text-media-retrieval-mode="standard" aria-selected="true" data-i18n="standardMultimodalRetrieval">常规图文检索</button><button id="text-media-search-mode-text-only" class="log-filter" type="button" data-text-media-retrieval-mode="text_only" aria-selected="false" data-i18n="textOnlyRetrieval">纯文本检索</button><button id="text-media-search-mode-media-only" class="log-filter" type="button" data-text-media-retrieval-mode="media_only" aria-selected="false" data-i18n="mediaOnlyRetrieval">纯媒体检索</button></div>
+            <label class="text-media-search-query"><span data-i18n="searchQuery">检索问题</span><textarea id="text-media-search-query" rows="4" data-i18n-placeholder="knowledgeSearchPlaceholder" placeholder="输入知识问题" required></textarea></label>
+            <div class="text-media-search-parameter-grid">
+              <label class="text-media-search-parameter text-media-search-text-parameter"><span data-i18n="embeddingResultCount">Embedding 检索条数</span><input id="text-media-search-top-k" type="number" min="1" max="50" value="10"></label>
+              <label class="text-media-search-parameter text-media-search-media-parameter"><span data-i18n="mediaOutputConfidenceThreshold">媒体输出置信阈值</span><input id="text-media-search-confidence-threshold" type="number" min="0" max="1" step="0.01" value="0.6"></label>
+              <label class="text-media-search-parameter text-media-search-media-parameter"><span data-i18n="mediaRelevancePivot">媒体相关性枢轴</span><input id="text-media-search-score-threshold" type="number" min="0" max="1" step="0.01" value="0.35"></label>
+              <label class="text-media-search-parameter text-media-search-media-parameter"><span data-i18n="maxMediaOutputs">最大媒体输出数量</span><input id="text-media-search-max-outputs" type="number" min="0" max="20" value="5"></label>
+              <div class="text-media-search-action-row">
+                <label class="text-media-search-rerank-toggle">
+                  <strong data-i18n="useRerank">使用 Rerank</strong>
+                  <span class="switch"><input id="text-media-search-rerank" type="checkbox" role="switch"><i></i></span>
+                </label>
+                <button class="primary text-media-search-submit" data-i18n="search">检索</button>
+              </div>
+            </div>
+            <div class="text-media-search-meta-row">
+              <small id="text-media-search-rerank-hint" class="text-media-search-rerank-hint" data-i18n="rerankUnavailableHint">当前知识库未绑定可用的 Rerank Provider。</small>
+              <output id="text-media-search-rerank-status" class="text-media-search-rerank-status" aria-live="polite"></output>
+            </div>
+          </form>
+          <section id="text-media-search-media-section" class="panel text-media-search-section"><div class="panel-title"><div><h3 data-i18n="mediaOutputs">媒体输出</h3><p data-i18n="mediaOutputsHint">绑定媒体由分块证据与融合关联分数阈值调整置信度；无绑定媒体由媒体简述直接相关度与同类竞争计算。两类媒体最终均由输出置信阈值与数量上限决定是否输出。</p></div></div><div id="text-media-search-media" class="text-media-search-media"></div></section>
+          <section id="text-media-search-decisions-section" class="panel text-media-search-section text-media-search-decisions-panel">
+            <div class="panel-title"><h3 data-i18n="mediaDecisionDetails">媒体判定诊断</h3></div>
+            <button id="text-media-search-decisions-collapse-top" type="button" class="collapse-top-toggle hidden" aria-controls="text-media-search-decisions">
+              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m6 15 6-6 6 6"></path></svg>
+            </button>
+            <div id="text-media-search-decisions" class="text-media-search-decisions"></div>
+            <button id="text-media-search-decisions-toggle" type="button" class="library-expand-toggle text-media-search-decisions-toggle hidden" title="展开更多信息" aria-label="展开更多信息" aria-controls="text-media-search-decisions" aria-expanded="false">
+              <svg viewBox="0 0 240 24" aria-hidden="true" focusable="false"><circle cx="92" cy="12" r="3"></circle><circle cx="120" cy="12" r="3"></circle><circle cx="148" cy="12" r="3"></circle></svg>
+            </button>
+          </section>
+          <section id="text-media-search-chunks-section" class="text-media-search-section">
+            <div class="panel-title text-media-search-results-heading">
+              <h3 data-i18n="retrievedChunks">检索分块</h3>
+              <div class="text-media-search-view-tabs log-filter-group" role="tablist" aria-label="Retrieval result view">
+                <button id="text-media-search-view-embedding" class="log-filter active" type="button" data-text-media-search-view="embedding" aria-selected="true" data-i18n="recallOnlyEmbedding">仅嵌入召回</button>
+                <button id="text-media-search-view-rerank" class="log-filter" type="button" data-text-media-search-view="rerank" aria-selected="false" data-i18n="recallWithRerank">重排后</button>
+              </div>
+            </div>
+            <div id="text-media-search-results" class="text-media-search-results"></div>
+          </section>
+        </section>
+
+        <section class="text-media-view" data-text-media-view="settings">
+          <p class="warning-copy" data-i18n="tmkbAllPlaintextWarning">.tmkb 与 .tmkbs 均未加密；嵌入 .prag 时才由外层密码保护。</p>
+          <div class="text-media-transfer-grid">
+            <section class="panel text-media-tool text-media-transfer-panel">
+              <header><div><span class="eyebrow" data-i18n="singleLibraryTransfer">单库迁移</span><h3 data-i18n="singleLibraryTmkb">单知识库 .tmkb</h3></div></header>
+              <label><span data-i18n="chooseKnowledgeLibrary">选择知识库</span><select id="text-media-single-export-library"></select></label>
+              <button id="text-media-single-export" type="button" class="ghost" data-i18n="exportSelectedTmkb">导出所选 .tmkb</button>
+              <form id="text-media-import-form">
+                <label class="text-media-drop"><input id="text-media-import-file" type="file" accept=".tmkb,application/zip" required><strong data-i18n="chooseTmkb">选择 .tmkb</strong><small id="text-media-import-name"></small></label>
+                <button class="ghost" data-i18n="inspectTmkb">检查封包</button>
+              </form>
+              <div id="text-media-import-preview" class="text-media-import-preview hidden"></div>
+            </section>
+            <section class="panel text-media-tool text-media-transfer-panel">
+              <header><div><span class="eyebrow" data-i18n="batchLibraryTransfer">批量迁移</span><h3 data-i18n="batchLibraryTmkbs">多知识库 .tmkbs</h3></div><span id="text-media-batch-selected-count" class="pill"></span></header>
+              <div class="text-media-batch-toolbar"><button id="text-media-batch-select-all" type="button" class="ghost" data-i18n="selectAll">全选</button><button id="text-media-batch-clear" type="button" class="ghost" data-i18n="clearSelection">取消全选</button></div>
+              <div id="text-media-batch-library-list" class="text-media-batch-library-list"></div>
+              <button id="text-media-batch-export" type="button" class="ghost" data-i18n="exportSelectedLibraries">导出所选知识库</button>
+              <form id="text-media-batch-import-form">
+                <label class="text-media-drop"><input id="text-media-batch-import-file" type="file" accept=".tmkbs,application/zip" required><strong data-i18n="chooseTmkbs">选择 .tmkbs</strong><small id="text-media-batch-import-name"></small></label>
+                <button class="ghost" data-i18n="inspectTmkbs">检查批量封包</button>
+              </form>
+              <div id="text-media-batch-import-preview" class="text-media-import-preview hidden"></div>
+            </section>
+          </div>
+        </section>
+      </div>
+    </section>
+  </div>
+  <div id="text-media-detail-overlay" class="memory-detail-overlay hidden" aria-hidden="true"></div>
+  <aside id="text-media-detail-panel" class="memory-detail-panel" aria-hidden="true" aria-labelledby="text-media-detail-title">
+    <button id="text-media-detail-close" type="button" class="memory-detail-close" aria-label="Close">&times;</button>
+    <h3 id="text-media-detail-title"></h3>
+    <div id="text-media-detail-body" class="memory-detail-body"></div>
+  </aside>
+  <div id="text-media-ingest-modal" class="modal-overlay hidden">
+    <form id="text-media-ingest-form" class="modal text-media-ingest-modal">
+      <header><div><p class="eyebrow" data-i18n="batchContentIngest">批次内容导入</p><h2 data-i18n="uploadDocumentsAndMedia">上传文档与图片</h2></div><button type="button" class="icon modal-dismiss" aria-label="Close">×</button></header>
+      <div class="text-media-ingest-body">
+        <output id="text-media-ingest-mode" class="pill text-media-ingest-mode" aria-live="polite"></output>
+        <div class="text-media-ingest-intro">
+          <span class="text-media-upload-icon" aria-hidden="true"></span>
+          <div><strong data-i18n="chooseUploadContent">选择本批次要导入的内容</strong><small data-i18n="chooseUploadContentHint">文档与图片可以分开添加；确认清单和关联范围后再统一构建索引。</small></div>
+        </div>
+        <div class="text-media-ingest-pickers">
+          <button id="text-media-ingest-document-picker" type="button" class="text-media-ingest-picker" data-ingest-picker="documents">
+            <span class="text-media-upload-icon" aria-hidden="true"></span>
+            <span><strong data-i18n="chooseBatchDocuments">选择 1–10 篇 TXT / Markdown / PDF / DOCX</strong><small data-i18n="batchDocumentsHint">文档会在同一原子任务中解析、分块并向量化。</small></span>
+            <em id="text-media-ingest-document-picker-count" class="pill" data-i18n="notSelected">未选择</em>
+          </button>
+          <button id="text-media-ingest-image-picker" type="button" class="text-media-ingest-picker" data-ingest-picker="images">
+            <span class="text-media-upload-icon" aria-hidden="true"></span>
+            <span><strong data-i18n="chooseBatchImages">选择 1–10 张 PNG / JPEG / WebP</strong><small data-i18n="batchImagesHint">可单独导入图片；媒体简述始终会被向量化。</small></span>
+            <em id="text-media-ingest-image-picker-count" class="pill" data-i18n="notSelected">未选择</em>
+          </button>
+          <input id="text-media-ingest-documents" class="text-media-ingest-native-input" type="file" accept=".txt,.md,.markdown,.pdf,.docx,text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" multiple>
+          <input id="text-media-ingest-images" class="text-media-ingest-native-input" type="file" accept="image/png,image/jpeg,image/webp" multiple>
+        </div>
+        <section class="text-media-ingest-parameter-section"><div class="panel-title"><h3 data-i18n="batchParameters">本次批次参数</h3></div><div class="text-media-ingest-parameters">
+          <label><span data-i18n="chunkSize">最大分块大小</span><input id="text-media-ingest-chunk-target" data-ingest-parameter="chunk-target" type="number" min="200" max="4000" value="1200" required></label>
+          <label><span data-i18n="chunkOverlap">最大语义重叠</span><input id="text-media-ingest-chunk-overlap" data-ingest-parameter="chunk-overlap" type="number" min="0" max="2000" value="150" required></label>
+          <label><span data-i18n="embeddingBatchSize">Embedding 批处理大小</span><input id="text-media-ingest-batch-size" data-ingest-parameter="batch-size" type="number" min="1" max="128" value="32" required></label>
+          <label><span data-i18n="concurrencyLimit">并发任务限制</span><input id="text-media-ingest-concurrency" data-ingest-parameter="concurrency" type="number" min="1" max="8" value="3" required></label>
+          <label><span data-i18n="maxRetries">最大重试次数</span><input id="text-media-ingest-retries" data-ingest-parameter="retries" type="number" min="1" max="8" value="3" required></label>
+        </div><output id="text-media-ingest-progress" class="text-media-ingest-progress" aria-live="polite"></output></section>
+        <section><div class="panel-title"><h3 data-i18n="selectedDocuments">已选文档</h3><span id="text-media-ingest-document-count" class="pill">0 / 10</span></div><div id="text-media-ingest-document-list" class="text-media-ingest-file-list"></div></section>
+        <section id="text-media-ingest-semantic-section" class="text-media-semantic-toggle"><label><input id="text-media-ingest-semantic-enabled" type="checkbox"><span><strong data-i18n="enableMediaSecondaryEmbedding">启用媒体连接二次嵌入</strong><small data-i18n="mediaSecondaryEmbeddingHint">使用每张图片的媒体简述校准分块连接强度；关闭时使用当前知识库设置的默认强度。</small></span></label></section>
+        <section><div class="panel-title"><h3 data-i18n="selectedImages">已选图片及关联范围</h3><span id="text-media-ingest-image-count" class="pill">0 / 10</span></div><div id="text-media-ingest-image-list" class="text-media-ingest-image-list"></div></section>
+      </div>
+      <footer><button type="button" class="ghost modal-dismiss" data-i18n="cancel">取消</button><button class="primary" data-i18n="startBatchIngest">开始上传并构建索引</button></footer>
+    </form>
+  </div>
+  <div id="text-media-upload-picker-modal" class="modal-overlay text-media-upload-picker-overlay hidden">
+    <section class="modal text-media-upload-picker-modal" role="dialog" aria-modal="true" aria-labelledby="text-media-upload-picker-title">
+      <header>
+        <div><p class="eyebrow" data-i18n="addBatchFiles">添加批次文件</p><h2 id="text-media-upload-picker-title"></h2></div>
+        <button id="text-media-upload-picker-close" type="button" class="icon" aria-label="Close">×</button>
+      </header>
+      <div class="text-media-upload-picker-body">
+        <div id="text-media-upload-drop-zone" class="text-media-upload-drop-zone" role="button" tabindex="0">
+          <span class="text-media-upload-icon text-media-upload-icon-large" aria-hidden="true"></span>
+          <strong id="text-media-upload-drop-title"></strong>
+          <small id="text-media-upload-drop-hint"></small>
+        </div>
+        <section class="text-media-upload-parameter-panel">
+          <div class="panel-title"><div><h3 data-i18n="batchParameters">本次批次参数</h3><small data-i18n="batchParametersSyncedHint">这里的调整会同步到本次批次上传。</small></div></div>
+          <div class="text-media-upload-parameters">
+            <label><span data-i18n="chunkSize">最大分块大小</span><input data-ingest-parameter="chunk-target" type="number" min="200" max="4000" value="1200"></label>
+            <label><span data-i18n="chunkOverlap">最大语义重叠</span><input data-ingest-parameter="chunk-overlap" type="number" min="0" max="2000" value="150"></label>
+            <label><span data-i18n="embeddingBatchSize">Embedding 批处理大小</span><input data-ingest-parameter="batch-size" type="number" min="1" max="128" value="32"></label>
+            <label><span data-i18n="concurrencyLimit">并发任务限制</span><input data-ingest-parameter="concurrency" type="number" min="1" max="8" value="3"></label>
+            <label><span data-i18n="maxRetries">最大重试次数</span><input data-ingest-parameter="retries" type="number" min="1" max="8" value="3"></label>
+          </div>
+        </section>
+      </div>
+      <div class="text-media-upload-picker-actions">
+        <span id="text-media-upload-picker-limit"></span>
+        <button id="text-media-upload-browse" type="button" class="primary" data-i18n="chooseFromFileManager">从文件管理器选择</button>
+      </div>
+    </section>
+  </div>
+  <div id="text-media-edit-modal" class="modal-overlay hidden">
+    <form id="text-media-edit-form" class="modal compact-modal library-modal-panel text-media-edit-modal">
+      <header><h2 data-i18n="editKnowledgeLibrary">编辑知识库</h2><button type="button" class="icon modal-dismiss">×</button></header>
+      <input id="text-media-edit-original-id" type="hidden">
+      <input id="text-media-edit-original-provider" type="hidden">
+      <div class="form-grid library-form-grid">
+        <label><span data-i18n="knowledgeId">知识库 ID</span><input id="text-media-edit-id" required pattern="[a-zA-Z0-9_\-]+"></label>
+        <label><span data-i18n="displayName">显示名称</span><input id="text-media-edit-name" required></label>
+        <label><span data-i18n="embeddingProvider">嵌入模型提供商</span><select id="text-media-edit-provider" required></select><small data-i18n="textMediaProviderSwitchEditHint">切换后会启动文本媒体知识库专用的全量重建，并在成功前继续使用原索引。</small></label>
+        <label><span data-i18n="rerankProvider">Rerank Provider</span><select id="text-media-edit-rerank-provider"></select><small id="text-media-edit-rerank-status"></small></label>
+        <label><span data-i18n="uniformMediaStrengthSetting">关闭二次嵌入时的默认强度</span><input id="text-media-edit-uniform-strength" type="number" min="0" max="1" step="0.01" required><small data-i18n="uniformMediaStrengthSettingHint">用于未启用智能校准的新连接，不会自动改写已有显式强度。</small></label>
+        <label class="library-form-wide"><span data-i18n="description">描述</span><textarea id="text-media-edit-description" rows="5"></textarea></label>
+        <section id="text-media-retrieval-settings" class="library-form-wide library-settings-section text-media-retrieval-settings" data-layout="compact">
+          <div class="panel-title text-media-retrieval-heading">
+            <div><h3 data-i18n="retrievalFusionStrategy">检索融合策略</h3><p class="form-help" data-i18n="retrievalFusionStrategyHint">这些参数仅作用于当前知识库；媒体相关性枢轴可由请求显式覆盖，缺失或 null 时使用兜底值。</p></div>
+            <div class="text-media-retrieval-actions">
+              <div class="text-media-mode-switch text-media-retrieval-layout-switch" role="group" data-i18n-aria-label="retrievalLayoutLabel" aria-label="检索融合策略布局">
+                <button type="button" class="active" data-retrieval-layout="compact" aria-pressed="true" data-i18n="retrievalLayoutCompact">紧凑</button>
+                <button type="button" data-retrieval-layout="detailed" aria-pressed="false" data-i18n="retrievalLayoutDetailed">详细</button>
+              </div>
+              <button id="text-media-retrieval-reset" type="button" class="ghost danger" data-i18n="restoreRetrievalDefaults">恢复为默认值</button>
+            </div>
+          </div>
+          <button id="text-media-retrieval-collapse-top" type="button" class="collapse-top-toggle hidden" aria-controls="text-media-retrieval-primary">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m6 15 6-6 6 6"></path></svg>
+          </button>
+          <div id="text-media-retrieval-primary" class="text-media-retrieval-primary">
+            <div class="text-media-retrieval-settings-grid">
+              <h4 class="text-media-retrieval-group-title" data-i18n="retrievalCoreTextGroup">核心文本检索</h4>
+              <label><span data-i18n="rrfK">RRF K</span><input id="text-media-edit-rrf-k" type="number" min="1" max="1000" required><small data-i18n="rrfKHint">控制多路文本排名融合的平滑程度；值越大，前后名次差异越小。</small></label>
+              <label><span data-i18n="textLexicalBoost">文本词法证据加成</span><input id="text-media-edit-text-lexical-boost" type="number" min="0" max="1" step="0.01" required><small data-i18n="textLexicalBoostHint">为查询词直接命中的文本分块增加额外相关性。</small></label>
+
+              <h4 class="text-media-retrieval-group-title" data-i18n="retrievalMediaGroup">媒体检索</h4>
+              <label><span data-i18n="mediaCandidateLimit">媒体候选窗口</span><input id="text-media-edit-candidate-limit" type="number" min="10" max="500" required><small data-i18n="mediaCandidateLimitHint">进入媒体证据判定的文本关联候选最大数量。</small></label>
+              <label><span data-i18n="unboundMediaCandidateLimit">无绑定媒体候选窗口</span><input id="text-media-edit-unbound-candidate-limit" type="number" min="10" max="500" required><small data-i18n="unboundMediaCandidateLimitHint">进入判定的无分块绑定媒体候选最大数量。</small></label>
+              <label><span data-i18n="mediaRelevancePivotFallback">媒体相关性枢轴兜底值</span><input id="text-media-edit-score-threshold-fallback" type="number" min="0" max="1" step="0.01" required><small data-i18n="mediaRelevancePivotFallbackHint">请求未指定媒体相关性枢轴时使用的基准线。</small></label>
+              <label><span data-i18n="mediaThresholdEvidenceLimit">阈值证据固定窗口</span><input id="text-media-edit-threshold-evidence-limit" type="number" min="1" max="100" required><small data-i18n="mediaThresholdEvidenceLimitHint">最多使用多少条高位证据校准媒体相关性枢轴。</small></label>
+              <label><span data-i18n="mediaThresholdRankDecayExponent">阈值排名衰减指数</span><input id="text-media-edit-threshold-rank-exponent" type="number" min="0" max="4" step="0.1" required><small data-i18n="mediaThresholdRankDecayExponentHint">控制低排名证据在枢轴校准中衰减的速度。</small></label>
+              <label><span data-i18n="mediaThresholdNegativeReliabilityExponent">低分证据可靠性指数</span><input id="text-media-edit-threshold-negative-exponent" type="number" min="1" max="4" step="0.1" required><small data-i18n="mediaThresholdNegativeReliabilityExponentHint">控制低分证据施加负向压力时的可靠性折减。</small></label>
+              <label><span data-i18n="mediaPivotPositiveBlend">枢轴正向融合权重</span><input id="text-media-edit-threshold-reinforcement-weight" type="number" min="0" max="1" step="0.01" required><small data-i18n="mediaPivotPositiveBlendHint">控制高质量证据将相关性枢轴向正向结果拉近的程度。</small></label>
+              <label><span data-i18n="mediaPivotNegativeWeight">枢轴负向压力权重</span><input id="text-media-edit-threshold-weakening-weight" type="number" min="0" max="1" step="0.01" required><small data-i18n="mediaPivotNegativeWeightHint">控制低质量证据降低媒体输出置信度的力度。</small></label>
+              <label><span data-i18n="mediaPivotNegativeFloor">负向最低保留因数</span><input id="text-media-edit-pivot-negative-floor" type="number" min="0.001" max="1" step="0.001" required><small data-i18n="mediaPivotNegativeFloorHint">负向压力生效后仍保留的最低证据比例。</small></label>
+              <label><span data-i18n="mediaFormatMismatchFactor">格式不匹配因数</span><input id="text-media-edit-format-mismatch-factor" type="number" min="0.001" max="1" step="0.001" required><small data-i18n="mediaFormatMismatchFactorHint">查询所需媒体格式与候选不一致时的保留比例。</small></label>
+              <label><span data-i18n="mediaContentMismatchFactor">内容锚点不足因数</span><input id="text-media-edit-content-mismatch-factor" type="number" min="0.001" max="1" step="0.001" required><small data-i18n="mediaContentMismatchFactorHint">候选缺少查询主体或内容锚点时的保留比例。</small></label>
+              <label class="text-media-retrieval-toggle"><span data-i18n="visualIntentGate">启用视觉意图门控</span><span class="switch text-media-intent-gate-switch"><input id="text-media-edit-intent-gate" type="checkbox" role="switch"><i></i></span><small data-i18n="visualIntentGateHint">仅在查询明确需要查看既有媒体时允许输出媒体结果。</small></label>
+              <label><span data-i18n="mediaSemanticFloor">媒体语义下限</span><input id="text-media-edit-semantic-floor" type="number" min="0" max="0.99" step="0.01" required><small data-i18n="mediaSemanticFloorHint">低于此相似度的媒体语义信号按零处理。</small></label>
+              <label><span data-i18n="mediaSemanticWeight">媒体语义权重</span><input id="text-media-edit-semantic-weight" type="number" min="0" max="1" step="0.01" required><small data-i18n="mediaSemanticWeightHint">控制媒体语义相似度在直接媒体证据中的占比。</small></label>
+              <label><span data-i18n="mediaLexicalBoost">关键词命中加成</span><input id="text-media-edit-lexical-boost" type="number" min="0" max="1" step="0.01" required><small data-i18n="mediaLexicalBoostHint">为媒体描述中的查询关键词命中增加额外分数。</small></label>
+              <label><span data-i18n="mediaLexicalExponent">词法覆盖指数</span><input id="text-media-edit-lexical-exponent" type="number" min="0.1" max="4" step="0.1" required><small data-i18n="mediaLexicalExponentHint">控制查询词覆盖率对媒体词法证据的放大或压缩。</small></label>
+              <label><span data-i18n="mediaLexicalCommonFloor">常见描述词最低贡献</span><input id="text-media-edit-lexical-common-floor" type="number" min="0" max="1" step="0.01" required><small data-i18n="mediaLexicalCommonFloorHint">为常见描述词命中保留的最低词法贡献。</small></label>
+              <label><span data-i18n="mediaLexicalOovPenalty">语料外查询词权重</span><input id="text-media-edit-lexical-oov-penalty" type="number" min="0" max="2" step="0.01" required><small data-i18n="mediaLexicalOovPenaltyHint">控制知识库语料中未出现的查询词对词法分数的影响。</small></label>
+              <label><span data-i18n="mediaDistinctiveRarityExponent">显著特征词稀有度指数</span><input id="text-media-edit-distinctive-rarity-exponent" type="number" min="0.25" max="4" step="0.05" required><small data-i18n="mediaDistinctiveRarityExponentHint">控制稀有特征词比常见词获得更高权重的程度。</small></label>
+              <label><span data-i18n="unboundMediaDistinctiveBoost">无绑定媒体显著特征词加成</span><input id="text-media-edit-unbound-distinctive-boost" type="number" min="0" max="1" step="0.01" required><small data-i18n="unboundMediaDistinctiveBoostHint">无绑定媒体命中稀有且明确的特征词时增加的分数。</small></label>
+              <label><span data-i18n="unboundMediaCollectionBoost">无绑定媒体集合词加成</span><input id="text-media-edit-unbound-collection-boost" type="number" min="0" max="1" step="0.01" required><small data-i18n="unboundMediaCollectionBoostHint">查询表达一组或多张媒体时对无绑定媒体的额外加成。</small></label>
+              <label><span data-i18n="unboundMediaCompetitionFloor">无绑定媒体软竞争底座</span><input id="text-media-edit-unbound-competition-floor" type="number" min="0" max="1" step="0.01" required><small data-i18n="unboundMediaCompetitionFloorHint">保留非第一名无绑定媒体自身直接相关信号的一部分，避免候选被强制归零。</small></label>
+              <label><span data-i18n="unboundMediaReliabilityTarget">无绑定媒体可靠性目标</span><input id="text-media-edit-unbound-reliability-target" type="number" min="0.01" max="1" step="0.01" required><small data-i18n="unboundMediaReliabilityTargetHint">直接相关分达到该值时视为具备充分可靠性。</small></label>
+              <label><span data-i18n="unboundMediaSpecificityExponent">无绑定媒体特异度指数</span><input id="text-media-edit-unbound-specificity-exponent" type="number" min="0.25" max="4" step="0.05" required><small data-i18n="unboundMediaSpecificityExponentHint">控制候选领先竞争者的优势对置信度的影响曲线。</small></label>
+              <label><span data-i18n="unboundMediaAdvantageTarget">无绑定媒体优势目标</span><input id="text-media-edit-unbound-advantage-target" type="number" min="0.01" max="1" step="0.01" required><small data-i18n="unboundMediaAdvantageTargetHint">候选领先最强竞争者达到该差值时视为优势充分。</small></label>
+              <label><span data-i18n="mediaBoundDistinctiveBoost">绑定媒体显著特征词加成</span><input id="text-media-edit-bound-distinctive-boost" type="number" min="0" max="1" step="0.01" required><small data-i18n="mediaBoundDistinctiveBoostHint">已绑定分块的媒体命中显著特征词时增加的分数。</small></label>
+              <label><span data-i18n="mediaBoundDistinctiveRescueMin">绑定媒体显著候选补充下限</span><input id="text-media-edit-bound-distinctive-rescue-min" type="number" min="0" max="1" step="0.01" required><small data-i18n="mediaBoundDistinctiveRescueMinHint">显著词命中达到此值时，可将绑定媒体补入候选集。</small></label>
+              <label><span data-i18n="mediaRankDecayExponent">排名衰减指数</span><input id="text-media-edit-rank-exponent" type="number" min="0" max="4" step="0.1" required><small data-i18n="mediaRankDecayExponentHint">控制低排名分块对关联媒体贡献的衰减速度。</small></label>
+              <label><span data-i18n="mediaCorroborationWeight">多证据佐证权重</span><input id="text-media-edit-corroboration-weight" type="number" min="0" max="1" step="0.01" required><small data-i18n="mediaCorroborationWeightHint">控制除最强证据外，其他一致证据带来的加成。</small></label>
+              <label><span data-i18n="mediaCorroborationLimit">佐证证据数量</span><input id="text-media-edit-corroboration-limit" type="number" min="1" max="50" required><small data-i18n="mediaCorroborationLimitHint">参与媒体多证据合并的证据最大数量。</small></label>
+
+              <h4 class="text-media-retrieval-group-title" data-i18n="retrievalRerankGroup">Rerank 重排</h4>
+              <label><span data-i18n="rerankCandidateLimit">Rerank 候选窗口</span><input id="text-media-edit-rerank-candidate-limit" type="number" min="10" max="200" required><small data-i18n="rerankCandidateLimitHint">送入 Rerank 模型重新排序的候选最大数量。</small></label>
+              <label><span data-i18n="rerankFusionWeight">Rerank 融合权重</span><input id="text-media-edit-rerank-fusion-weight" type="number" min="0" max="1" step="0.00001" required><small data-i18n="rerankFusionWeightHint">控制 Rerank 绝对相关性在最终融合分中的影响。</small></label>
+              <label><span data-i18n="rerankRankBonusWeight">Rerank 排名加成权重</span><input id="text-media-edit-rerank-rank-bonus-weight" type="number" min="0" max="1" step="0.01" required><small data-i18n="rerankRankBonusWeightHint">控制 Rerank 名次本身为高位候选提供的额外加成。</small></label>
+              <label><span data-i18n="rerankRankReliabilityExponent">Rerank 排名可靠性指数</span><input id="text-media-edit-rerank-reliability-exponent" type="number" min="0.5" max="4" step="0.1" required><small data-i18n="rerankRankReliabilityExponentHint">控制 Rerank 相关性概率对排名加成可信度的约束强度。</small></label>
+            </div>
+          </div>
+          <output id="text-media-retrieval-status" class="form-help" aria-live="polite"></output>
+          <button id="text-media-retrieval-toggle" type="button" class="library-expand-toggle text-media-retrieval-toggle-button hidden" title="展开更多信息" aria-label="展开更多信息" aria-controls="text-media-retrieval-primary" aria-expanded="false">
+            <svg viewBox="0 0 240 24" aria-hidden="true" focusable="false"><circle cx="92" cy="12" r="3"></circle><circle cx="120" cy="12" r="3"></circle><circle cx="148" cy="12" r="3"></circle></svg>
+          </button>
+        </section>
+        <section class="library-form-wide library-settings-section text-media-visual-intent-policy">
+          <div class="panel-title text-media-policy-heading">
+            <div><h3 data-i18n="visualIntentPolicy">视觉意图策略</h3><p class="form-help" data-i18n="visualIntentPolicyHint">这些词表只更新查询意图与参考对象解析，不重建索引，也不会调用模型提供商。</p></div>
+            <div class="text-media-policy-actions">
+              <input id="text-media-visual-policy-import-file" class="hidden" type="file" accept=".csv,text/csv">
+              <button id="text-media-visual-policy-import" type="button" class="ghost" data-i18n="importLexicon">导入词表</button>
+              <button id="text-media-visual-policy-export" type="button" class="ghost" data-i18n="exportLexicon">导出词表</button>
+              <button id="text-media-visual-policy-reset" type="button" class="ghost" data-i18n="restoreTypeDefaults">恢复类型默认值</button>
+            </div>
+          </div>
+          <div id="text-media-visual-policy-groups" class="text-media-visual-policy-groups">
+            <article data-visual-policy-category="visual_object_terms"><header><div><h4 data-i18n="visualObjectTerms">视觉对象词</h4><small data-i18n="visualObjectTermsHint">描述已有媒体对象，例如立绘、头像、场景和表情包。</small></div><button type="button" class="ghost text-media-policy-add" data-policy-add="visual_object_terms"><span aria-hidden="true">＋</span><span data-i18n="addTerm">添加词条</span></button></header><div class="text-media-policy-term-list" data-policy-list="visual_object_terms"></div></article>
+            <article data-visual-policy-category="lookup_action_terms"><header><div><h4 data-i18n="lookupActionTerms">查看动作词</h4><small data-i18n="lookupActionTermsHint">表达查看、展示或发送已有媒体的动作。</small></div><button type="button" class="ghost text-media-policy-add" data-policy-add="lookup_action_terms"><span aria-hidden="true">＋</span><span data-i18n="addTerm">添加词条</span></button></header><div class="text-media-policy-term-list" data-policy-list="lookup_action_terms"></div></article>
+            <article data-visual-policy-category="generation_action_terms"><header><div><h4 data-i18n="generationActionTerms">生成动作词</h4><small data-i18n="generationActionTermsHint">表达画、生成、重绘或风格转换的动作。</small></div><button type="button" class="ghost text-media-policy-add" data-policy-add="generation_action_terms"><span aria-hidden="true">＋</span><span data-i18n="addTerm">添加词条</span></button></header><div class="text-media-policy-term-list" data-policy-list="generation_action_terms"></div></article>
+            <article data-visual-policy-category="reference_connector_terms"><header><div><h4 data-i18n="referenceConnectorTerms">参考连接词</h4><small data-i18n="referenceConnectorTermsHint">连接已有参考对象与新生成目标，例如根据、参考、基于。</small></div><button type="button" class="ghost text-media-policy-add" data-policy-add="reference_connector_terms"><span aria-hidden="true">＋</span><span data-i18n="addTerm">添加词条</span></button></header><div class="text-media-policy-term-list" data-policy-list="reference_connector_terms"></div></article>
+          </div>
+          <details class="text-media-protected-blockers"><summary data-i18n="protectedVisualBlockers">系统保护的阻断词</summary><p class="form-help" data-i18n="protectedVisualBlockersHint">作者来源、上传失败和战斗策略等管理或非索图语境始终优先阻断，不能在单库中删除。</p><div id="text-media-protected-blocker-list" class="text-media-policy-readonly-terms"></div></details>
+          <output id="text-media-visual-policy-status" class="form-help" aria-live="polite"></output>
+        </section>
+      </div>
+      <p class="form-help" data-i18n="knowledgeRenameKeyHint">修改 ID 后原 pkb- 接入密钥将失效；存在活动适配器连接或运行中任务时不能修改 ID。</p>
+      <footer><button type="button" class="ghost modal-dismiss" data-i18n="cancel">取消</button><button class="primary" data-i18n="savePlain">保存</button></footer>
+    </form>
+  </div>
+  <div id="text-media-visual-policy-export-modal" class="modal-overlay hidden">
+    <form id="text-media-visual-policy-export-form" class="modal compact-modal text-media-policy-transfer-modal" role="dialog" aria-modal="true" aria-labelledby="text-media-visual-policy-export-title">
+      <header><div><p class="eyebrow" data-i18n="visualIntentPolicy">视觉意图策略</p><h2 id="text-media-visual-policy-export-title" data-i18n="exportLexicon">导出词表</h2></div><button type="button" class="icon" data-policy-modal-close="text-media-visual-policy-export-modal" aria-label="Close">×</button></header>
+      <p class="form-help" data-i18n="exportLexiconHint">选择要写入 CSV 的词表分类；导出内容来自当前尚未保存的界面草稿。</p>
+      <div class="text-media-policy-category-picker">
+        <label><input type="checkbox" data-policy-export-category="visual_object_terms" checked><span><strong data-i18n="visualObjectTerms">视觉对象词</strong><small data-i18n="visualObjectTermsHint">描述已有媒体对象，例如立绘、头像、场景和表情包。</small></span></label>
+        <label><input type="checkbox" data-policy-export-category="lookup_action_terms" checked><span><strong data-i18n="lookupActionTerms">查看动作词</strong><small data-i18n="lookupActionTermsHint">表达查看、展示或发送已有媒体的动作。</small></span></label>
+        <label><input type="checkbox" data-policy-export-category="generation_action_terms" checked><span><strong data-i18n="generationActionTerms">生成动作词</strong><small data-i18n="generationActionTermsHint">表达画、生成、重绘或风格转换的动作。</small></span></label>
+        <label><input type="checkbox" data-policy-export-category="reference_connector_terms" checked><span><strong data-i18n="referenceConnectorTerms">参考连接词</strong><small data-i18n="referenceConnectorTermsHint">连接已有参考对象与新生成目标，例如根据、参考、基于。</small></span></label>
+      </div>
+      <footer><button type="button" class="ghost" data-policy-modal-close="text-media-visual-policy-export-modal" data-i18n="cancel">取消</button><button id="text-media-visual-policy-export-confirm" class="primary" data-i18n="exportCsv">导出 CSV</button></footer>
+    </form>
+  </div>
+  <div id="text-media-visual-policy-import-modal" class="modal-overlay hidden">
+    <form id="text-media-visual-policy-import-form" class="modal compact-modal text-media-policy-transfer-modal" role="dialog" aria-modal="true" aria-labelledby="text-media-visual-policy-import-title">
+      <header><div><p class="eyebrow" data-i18n="visualIntentPolicy">视觉意图策略</p><h2 id="text-media-visual-policy-import-title" data-i18n="importPreview">导入预览</h2></div><button type="button" class="icon" data-policy-modal-close="text-media-visual-policy-import-modal" aria-label="Close">×</button></header>
+      <p id="text-media-visual-policy-import-summary" class="form-help"></p>
+      <div id="text-media-visual-policy-import-categories" class="text-media-policy-category-picker"></div>
+      <p class="form-help" data-i18n="importLexiconHint">确认后仅替换所选分类的当前草稿；未选分类保持不变，仍需点击编辑页“保存”才会生效。</p>
+      <footer><button type="button" class="ghost" data-policy-modal-close="text-media-visual-policy-import-modal" data-i18n="cancel">取消</button><button id="text-media-visual-policy-import-confirm" class="primary" data-i18n="applyToDraft">应用到草稿</button></footer>
+    </form>
+  </div>

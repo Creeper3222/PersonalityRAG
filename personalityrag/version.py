@@ -6,7 +6,7 @@ PLATFORM_NAME = "linux-docker"
 RELEASE_ROOT_NAME = "PersonalityRAG-linux"
 RELEASE_ASSET_PREFIX = "PersonalityRAG-linux"
 DOCKER_REPOSITORY = "138763327/personalityrag-linux"
-VERSION = "0.1.0"
+VERSION = "0.1.2"
 TAG_NAME = f"v{VERSION}"
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from fastapi import BackgroundTasks, HTTPException
+from fastapi import BackgroundTasks, HTTPException, Response
 
 from personalityrag.backup_migration import export_prag_package, import_prag_package
 from personalityrag.application_context import ApplicationContext, set_default_context
@@ -20,7 +20,7 @@ from personalityrag.routes import auth_settings
 from personalityrag.schemas import SettingsUpdate
 
 
-def test_docker_load_config_enforces_network_and_initial_provider(
+def test_docker_load_config_enforces_network_without_seeding_provider(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("PERSONALITYRAG_DEPLOYMENT", "docker")
@@ -33,7 +33,10 @@ def test_docker_load_config_enforces_network_and_initial_provider(
     assert config.host == DOCKER_HOST
     assert config.port == DOCKER_WEBUI_PORT
     assert config.access_port == DOCKER_ACCESS_PORT
-    assert config.provider.api_base == "http://host.docker.internal:9001/v1"
+    assert config.bootstrap_provider_enabled is False
+    raw = (tmp_path / "config" / "config.json").read_text(encoding="utf-8")
+    assert '"provider"' not in raw
+    assert "host.docker.internal:9001" not in raw
 
 
 def test_docker_existing_provider_is_not_overwritten(
@@ -59,6 +62,27 @@ def test_docker_existing_provider_is_not_overwritten(
     assert loaded.provider.api_base == "http://embedding:8001/v1"
 
 
+def test_docker_logging_defaults_to_stdout_and_bounded_web_buffer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PERSONALITYRAG_DEPLOYMENT", "docker")
+    captured: dict[str, object] = {}
+
+    def capture_logging(*args, **kwargs) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "personalityrag.application_context.configure_logging",
+        capture_logging,
+    )
+    ApplicationContext.create(state_root=tmp_path)
+
+    assert captured["file_enabled"] is False
+    assert captured["web_max_entries"] == 500
+    assert captured["web_max_bytes"] == 1024 * 1024
+    assert captured["web_max_entry_bytes"] == 16 * 1024
+
+
 @pytest.mark.asyncio
 async def test_docker_settings_reject_managed_port_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -68,7 +92,7 @@ async def test_docker_settings_reject_managed_port_changes(
         ApplicationContext.create(state_root=tmp_path, configure_logs=False)
     )
     with pytest.raises(HTTPException) as caught:
-        await auth_settings.update_settings(SettingsUpdate(port=9876))
+        await auth_settings.update_settings(SettingsUpdate(port=9876), Response())
 
     assert caught.value.status_code == 409
     assert caught.value.detail["code"] == "docker_managed_settings"

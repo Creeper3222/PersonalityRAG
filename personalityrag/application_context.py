@@ -7,10 +7,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .auth import AuthManager
-from .config import AppConfig, load_config
+from .config import AppConfig, is_docker_deployment, load_config
+from .database_types import DatabaseRef
 from .file_manager import FileManager
-from .libraries import LibraryManager
+from .libraries import DatabaseManager
 from .logger import configure_logging
+from .revision_debug import RevisionDebugSessionManager
 from .updates import UpdateService
 
 
@@ -28,21 +30,24 @@ _runtime_lease_scope: ContextVar[RuntimeLeaseScope | None] = ContextVar(
 
 @dataclass(slots=True)
 class RuntimeLeaseScope:
-    manager: LibraryManager
-    leases: dict[str, bool]
+    manager: DatabaseManager
+    leases: dict[DatabaseRef, bool]
 
-    async def acquire(self, library_id: str, *, touch: bool = True):
-        if library_id not in self.leases:
-            runtime = await self.manager.acquire_runtime(library_id, touch=touch)
-            self.leases[library_id] = touch
+    async def acquire(
+        self, database: str | DatabaseRef, *, touch: bool = True
+    ):
+        ref = self.manager._database_ref(database)
+        if ref not in self.leases:
+            runtime = await self.manager.acquire_runtime(database, touch=touch)
+            self.leases[ref] = touch
             return runtime
-        return self.manager.runtimes[library_id]
+        return self.manager.runtimes[ref]
 
     async def release_all(self) -> None:
         leases = list(self.leases.items())
         self.leases.clear()
-        for library_id, touch in reversed(leases):
-            await self.manager.release_runtime(library_id, touch=touch)
+        for ref, touch in reversed(leases):
+            await self.manager.release_runtime(ref, touch=touch)
 
 
 @dataclass(slots=True)
@@ -54,9 +59,10 @@ class ApplicationContext:
     assets_dir: Path
     config: AppConfig
     auth: AuthManager
-    manager: LibraryManager
+    manager: DatabaseManager
     file_manager: FileManager
     updates: UpdateService
+    revision_debug: RevisionDebugSessionManager
     process_shutdown_callback: Callable[[], None] | None = None
     restart_in_progress: bool = False
 
@@ -77,14 +83,28 @@ class ApplicationContext:
         config_path = state / "config" / "config.json"
         app_config = config or load_config(config_path)
         if configure_logs:
+            docker_logs = is_docker_deployment()
             configure_logging(
                 state / "data" / "logs" / "personalityrag.log",
                 level_name=app_config.logging.level,
                 file_max_bytes=app_config.logging.file_max_bytes,
                 file_backup_count=app_config.logging.file_backup_count,
-                web_max_entries=app_config.logging.web_max_entries,
-                web_max_bytes=app_config.logging.web_max_bytes,
-                web_max_entry_bytes=app_config.logging.web_max_entry_bytes,
+                web_max_entries=(
+                    min(500, app_config.logging.web_max_entries)
+                    if docker_logs
+                    else app_config.logging.web_max_entries
+                ),
+                web_max_bytes=(
+                    min(1024 * 1024, app_config.logging.web_max_bytes)
+                    if docker_logs
+                    else app_config.logging.web_max_bytes
+                ),
+                web_max_entry_bytes=(
+                    min(16 * 1024, app_config.logging.web_max_entry_bytes)
+                    if docker_logs
+                    else app_config.logging.web_max_entry_bytes
+                ),
+                file_enabled=not docker_logs,
             )
         auth = AuthManager(
             app_config.api_key,
@@ -100,9 +120,10 @@ class ApplicationContext:
             assets_dir=source / "assets",
             config=app_config,
             auth=auth,
-            manager=LibraryManager(state, app_config),
+            manager=DatabaseManager(state, app_config),
             file_manager=file_manager,
             updates=UpdateService(source, state),
+            revision_debug=RevisionDebugSessionManager(),
         )
 
 
@@ -126,7 +147,7 @@ def reset_context(token: Token) -> None:
     _current_context.reset(token)
 
 
-def activate_runtime_lease_scope(manager: LibraryManager) -> Token:
+def activate_runtime_lease_scope(manager: DatabaseManager) -> Token:
     return _runtime_lease_scope.set(RuntimeLeaseScope(manager=manager, leases={}))
 
 

@@ -6,6 +6,7 @@ from fastapi import (
     Depends,
     HTTPException,
     Query,
+    Request,
 )
 
 from ..application_context import manager
@@ -21,6 +22,7 @@ from ..schemas import (
     ProviderCreate,
     ProviderUpdate,
 )
+from .revision_debug import verify_debug_password
 
 
 router = APIRouter()
@@ -30,7 +32,7 @@ async def provider_types(kind: str | None = Query(default=None, pattern="^(embed
 
 @router.get("/api/v1/providers", dependencies=[Depends(require_auth)])
 async def providers(kind: str | None = Query(default=None, pattern="^(embedding|rerank)$")):
-    return {"items": await manager.control.list_providers(kind)}
+    return {"items": await manager.list_providers(kind)}
 
 @router.post("/api/v1/providers", dependencies=[Depends(require_auth)])
 async def create_provider(payload: ProviderCreate):
@@ -181,7 +183,12 @@ async def detect_existing_provider_context_length(
 @router.post("/api/v1/providers/test", dependencies=[Depends(require_auth)])
 async def provider_test_compat():
     library = await manager.control.default_library()
-    logger.info("测试默认记忆库当前模型提供商：library_id=%s provider=%s revision=%s", library.id, library.provider_id, library.provider_revision)
+    logger.info(
+        "测试默认记忆库当前模型提供商：memory_store_id=%s provider=%s revision=%s",
+        library.id,
+        library.provider_id,
+        library.provider_revision,
+    )
     return await manager.test_provider(
         library.provider_id, revision=library.provider_revision
     )
@@ -192,7 +199,7 @@ async def provider_test_compat():
 )
 async def debug_provider_revisions(provider_id: str):
     try:
-        return await manager.control.debug_provider_revisions(provider_id)
+        return await manager.debug_provider_revisions(provider_id)
     except KeyError as exc:
         raise HTTPException(404, "provider not found") from exc
 
@@ -204,7 +211,14 @@ async def debug_patch_provider_revision(
     provider_id: str,
     revision: int,
     payload: DebugProviderRevisionPatch,
+    request: Request,
 ):
+    await verify_debug_password(
+        request,
+        password=payload.password,
+        purpose="provider_revision_patch",
+        risk_confirmed=payload.risk_confirmed,
+    )
     logger.warning(
         "debug provider revision patch requested: provider_id=%s revision=%s fields=%s",
         provider_id,
@@ -212,7 +226,7 @@ async def debug_patch_provider_revision(
         sorted(payload.patch.keys()),
     )
     try:
-        return await manager.control.debug_patch_provider_revision(
+        return await manager.debug_patch_provider_revision(
             provider_id,
             revision,
             payload.patch,
@@ -229,7 +243,17 @@ async def debug_patch_provider_revision(
 async def debug_reset_provider_revisions(
     provider_id: str,
     payload: DebugProviderRevisionReset,
+    request: Request,
 ):
+    allow_dangerous = bool(payload.force_non_equivalent and payload.risk_confirmed)
+    if payload.delete_revisions_after_latest or payload.force_non_equivalent:
+        await verify_debug_password(
+            request,
+            password=payload.password,
+            purpose="provider_revision_reset",
+            risk_confirmed=payload.risk_confirmed,
+        )
+        allow_dangerous = True
     logger.warning(
         "debug provider revision reset requested: provider_id=%s latest=%s "
         "bind_libraries=%s delete_after=%s library_overrides=%s",
@@ -240,12 +264,13 @@ async def debug_reset_provider_revisions(
         sorted(payload.library_revisions.keys()),
     )
     try:
-        return await manager.control.debug_reset_provider_revisions(
+        return await manager.debug_reset_provider_revisions(
             provider_id,
             latest_revision=payload.latest_revision,
             bind_libraries_to_latest=payload.bind_libraries_to_latest,
             library_revisions=payload.library_revisions,
             delete_revisions_after_latest=payload.delete_revisions_after_latest,
+            allow_non_equivalent=allow_dangerous,
         )
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
