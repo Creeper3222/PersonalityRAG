@@ -12,8 +12,8 @@ RUN python -m pip install --upgrade pip \
 
 FROM base AS test
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends git nodejs \
+RUN apt-get -o Acquire::Retries=3 update \
+    && apt-get -o Acquire::Retries=3 install -y --no-install-recommends git nodejs \
     && rm -rf /var/lib/apt/lists/*
 COPY requirements-dev.txt pyproject.toml ./
 RUN pip install -r requirements-dev.txt
